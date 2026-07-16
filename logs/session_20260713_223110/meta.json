@@ -1,0 +1,16 @@
+{
+  "cam": 1,
+  "hfov": 60.0,
+  "yaw_offset": 0.0,
+  "metal_db": 45.0,
+  "fabric_db": 32.0,
+  "cfg": "iwr1843_live.cfg",
+  "no_radar": false,
+  "label": null,
+  "start_time": 1783971070.5383425,
+  "start_stamp": "20260713_223110",
+  "end_time": 1783971306.375843,
+  "radar_frames": 2338,
+  "fusion_frames": 3140,
+  "snapshots": 47
+}
