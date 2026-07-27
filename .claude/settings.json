@@ -1,0 +1,78 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_invariants.py -q)",
+      "Bash(python -c \"import json;json.load\\(open\\('.claude/settings.json'\\)\\);print\\('OK'\\)\")",
+      "Bash(python -m pytest -q)",
+      "Bash(python -c \"import yaml; print\\('pyyaml', yaml.__version__\\)\")",
+      "Bash(python -c \"import numpy; print\\('numpy', numpy.__version__\\)\")",
+      "Bash(python -m pytest tests/test_timing.py -q)",
+      "Bash(python -c ' *)",
+      "Bash(python -m pytest tests/test_fusion_contracts.py -q)",
+      "Bash(python -c \"import socket; print\\('host', socket.gethostname\\(\\)\\)\")",
+      "Bash(python -)",
+      "Bash(python -m mpremote --help)",
+      "Bash(mkdir -p logs)",
+      "Bash(:)",
+      "Bash(python -u live_radar_camera.py)",
+      "Bash(python -u view_thermal_rgb.py)",
+      "Bash(python -m py_compile view_thermal_rgb.py)",
+      "Bash(python -m py_compile n6_dual_stream.py)",
+      "Bash(powershell -NoProfile -Command 'Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -like '\\\\''192.168.33.*'\\\\'' } | Select-Object IPAddress, InterfaceAlias | Format-Table -AutoSize')",
+      "Bash(ping -n 1 -w 800 192.168.33.180)",
+      "Bash(python -m pytest tests/test_vitals.py -q)",
+      "Bash(python -m pytest tests/test_vitals.py tests/test_vitals_adapter.py -q)",
+      "Bash(python -m pytest tests/test_timesync.py -q)",
+      "Bash(python -m py_compile fusion/radar.py)",
+      "Bash(python -c \"import fusion.radar; print\\('imports OK, uses core.timesync:', hasattr\\(fusion.radar,'sensor_time_from_frame'\\)\\)\")",
+      "Bash(python -m py_compile view_fusion_n6.py)",
+      "Bash(python view_fusion_n6.py --selftest)",
+      "Bash(timeout 60 python -m mpremote connect COM12 mount . run n6_selftest_radar.py)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(python -m py_compile n6_radar_bridge.py bridge_radar_to_n6.py)",
+      "Bash(python -m mpremote connect COM12 cp iwr1843_uart.py :iwr1843_uart.py)",
+      "Bash(python -m mpremote connect COM12 cp radar_classify_n6.py :radar_classify_n6.py)",
+      "Bash(python -m mpremote connect COM12 cp core/radar_gate/gate.py :radar_gate.py)",
+      "Bash(python -m mpremote connect COM12 cp n6_radar_bridge.py :main.py)",
+      "Bash(python -m mpremote connect COM12 fs ls)",
+      "Bash(python -m mpremote connect COM12 reset)",
+      "Bash(timeout 30 python bridge_radar_to_n6.py --synthetic --frames 5)",
+      "Bash(python -m mpremote connect COM12 exec \"import os; print\\('has main.py:', 'main.py' in os.listdir\\(\\)\\)\")",
+      "Bash(python -m mpremote connect COM12 exec \"import iwr1843_uart, radar_classify_n6, radar_gate; print\\('IMPORTS_OK'\\)\")",
+      "Bash(python -m py_compile n6_radar_bridge.py)",
+      "Bash(timeout 30 python bridge_radar_to_n6.py --synthetic --frames 6)",
+      "Bash(python -m mpremote connect COM12 exec \"import sys; print\\('has_buffer:', hasattr\\(sys.stdin,'buffer'\\)\\)\")",
+      "Bash(python -m mpremote connect COM12 exec 'print\\('\\\\''pyb:'\\\\'', end='\\\\'' '\\\\''\\) *)",
+      "Bash(python -m mpremote connect COM12 exec \"import sys; print\\('modules:'\\); print\\([m for m in \\('pyb','machine','uselect','select','os','time'\\) ]\\)\")",
+      "Bash(python -m mpremote connect COM12 cp /tmp/trivial_main.py :main.py)",
+      "Bash(python -m py_compile bridge_radar_to_n6.py)",
+      "Bash(timeout 40 python bridge_radar_to_n6.py --synthetic --frames 6)",
+      "Bash(python -m mpremote connect COM12 exec \"import os; print\\([f for f in os.listdir\\(\\) if f.endswith\\('.py'\\)]\\)\")",
+      "Bash(python -m mpremote connect COM12 exec \"import os; print\\('reprogrammable:', 'main.py' in os.listdir\\(\\)\\)\")",
+      "Bash(timeout 45 python bridge_radar_to_n6.py --synthetic --frames 4)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python scripts/physics_lint.py"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python -m pytest tests/test_invariants.py -q"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -67,6 +67,29 @@ POINT_WINDOW_S = 0.5     # aggregate radar points over this window (stabilises
 EMA_ALPHA = 0.35         # per-object range smoothing
 
 
+def _cfg_lines(path):
+    """Command lines of the chirp config, for embedding into meta.json —
+    the cfg NAME alone stops meaning anything once configs/*.cfg is edited."""
+    try:
+        with open(path) as f:
+            return [l.strip() for l in f
+                    if l.strip() and not l.strip().startswith("%")]
+    except OSError:
+        return None
+
+
+def _git_rev():
+    """Short git commit of the code that recorded the session (best-effort)."""
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stderr=subprocess.DEVNULL, timeout=5).decode().strip()
+    except Exception:
+        return None
+
+
 class Detector:
     """YOLOv4-tiny, loaded once (photo_to_radar.detect_objects reloads per call)."""
 
@@ -99,7 +122,10 @@ class Detector:
             for det in out:
                 scores = det[5:]
                 cid = int(np.argmax(scores))
-                conf = float(scores[cid])
+                # P(class AND object) = class score * objectness; class score
+                # alone overstates confidence, worst in the dark where the
+                # threshold is already relaxed to DARK_CONF_THR
+                conf = float(scores[cid]) * float(det[4])
                 if conf < conf_thr:
                     continue
                 cx, cy, bw, bh = det[0] * W, det[1] * H, det[2] * W, det[3] * H
@@ -144,7 +170,16 @@ class SessionLogger:
         self.lock = threading.Lock()
         self.snapshot_every_s = snapshot_every_s
         self._last_snap = 0.0
+        # write meta NOW, not only on clean shutdown — a hard exit used to
+        # leave sessions with data but no meta.json at all
+        self.write_meta()
         print("Logging session to:", self.dir)
+
+    def write_meta(self):
+        if not self.enabled:
+            return
+        with open(os.path.join(self.dir, "meta.json"), "w") as f:
+            json.dump(self.meta, f, indent=2)
 
     def log_radar(self, t, frame_no, points):
         if not self.enabled:
@@ -200,8 +235,7 @@ class SessionLogger:
             return
         self.meta.update(end_time=time.time(), radar_frames=self.n_radar,
                          fusion_frames=self.n_fusion, snapshots=self.n_snap)
-        with open(os.path.join(self.dir, "meta.json"), "w") as f:
-            json.dump(self.meta, f, indent=2)
+        self.write_meta()
         self.radar_f.close()
         self.fusion_f.close()
         print("Session saved: %s  (radar %d | fusion %d | snapshots %d)" %
@@ -224,7 +258,16 @@ class RadarThread(threading.Thread):
 
     def run(self):
         while self.running:
-            data = self.ser.read(4096)
+            try:
+                data = self.ser.read(4096)
+            except OSError:            # SerialException is an OSError
+                # USB unplug / port closed mid-read: a daemon thread dying
+                # silently leaves the app blind with "radar: OK" on screen
+                if self.running:
+                    print("Radar UART read failed - radar thread stopped "
+                          "(unplugged?)")
+                self.running = False
+                break
             for fr in self.reader.feed(data):
                 now = time.time()
                 # attach per-point SNR + noise (TLV 7) -> 6-tuples; snr+noise
@@ -330,6 +373,8 @@ class OverlayRenderer:
                 prev = self.ranges_ema.get(key)
                 rng = cl["range_m"] if prev is None else \
                     (1 - EMA_ALPHA) * prev + EMA_ALPHA * cl["range_m"]
+                if len(self.ranges_ema) > 256:   # bound the smoothing cache
+                    self.ranges_ema.clear()      # (slow leak on long runs)
                 self.ranges_ema[key] = rng
                 txt = "%s->%s %.1fm" % (d["label"], state, rng)
                 mat = cl.get("material")
@@ -378,6 +423,8 @@ class LiveApp:
                   "fabric_db": args.fabric_db,
                   "material_max_range": args.material_max_range,
                   "cfg": os.path.basename(args.cfg),
+                  "cfg_lines": _cfg_lines(args.cfg),
+                  "git_rev": _git_rev(),
                   "no_radar": args.no_radar, "label": args.label,
                   "radar_height": args.radar_height},
             enabled=not args.no_log,
@@ -410,9 +457,19 @@ class LiveApp:
                 sys.exit("CONFIG port not found; pass --cfg-port or "
                          "--no-send-cfg.")
             cs = serial.Serial(cfg_port, 115200, timeout=0.3)
-            print("Sending chirp config: %s" % a.cfg)
-            send_config(cs, a.cfg, line_map=line_map)
-            cs.close()
+            try:
+                # record the firmware version — a session is not reproducible
+                # without knowing what firmware produced it
+                cs.write(b"version\n")
+                time.sleep(0.4)
+                ver = cs.read(512).decode("ascii", "ignore").strip()
+                if ver and self.logger.enabled:
+                    self.logger.meta["radar_firmware"] = " ".join(ver.split())
+                    self.logger.write_meta()
+                print("Sending chirp config: %s" % a.cfg)
+                send_config(cs, a.cfg, line_map=line_map)
+            finally:
+                cs.close()
         self.radar = RadarThread(data_port, logger=self.logger)
         self.radar.start()
 
@@ -454,7 +511,10 @@ class LiveApp:
         a = self.args
         img, gamma, mean_b = self.night.enhance(img)
 
-        if frame_i % max(a.detect_every, 1) == 1 or not dets:
+        # N=1 must run every frame: frame_i % 1 is always 0, never 1, so
+        # compare against 1 % N (0 when N=1, 1 otherwise)
+        de = max(a.detect_every, 1)
+        if frame_i % de == 1 % de or not dets:
             dets = self.detector.detect(
                 img, self.night.conf_threshold(mean_b, CONF_THR))
 
@@ -509,6 +569,7 @@ class LiveApp:
         self.open_camera()
         dets = []
         frame_i, t_last, fps, last_rx = 0, time.time(), 0.0, 0
+        last_rx_t = 0.0                 # when the frame counter last advanced
         print("Running. q = quit, s = save screenshot.")
         t_start = time.time()
         try:
@@ -527,11 +588,13 @@ class LiveApp:
                     self.process_frame(img, dets, frame_i)
                 self._debug_refl(tclusters, frame_i)
 
-                radar_ok = self.radar is not None and rx > last_rx
-                if self.radar is not None:
-                    last_rx = max(last_rx, rx - 1)  # fresh data since last frame
-
                 now = time.time()
+                # "radar: OK" means frames arrived within the last second —
+                # a latched counter comparison stays green forever after the
+                # first frame, even with the USB cable pulled
+                if self.radar is not None and rx > last_rx:
+                    last_rx, last_rx_t = rx, now
+                radar_ok = self.radar is not None and now - last_rx_t < 1.0
                 fps = 0.9 * fps + 0.1 * (1.0 / max(now - t_last, 1e-3))
                 t_last = now
                 self.logger.log_fusion(now, dets, tclusters, assigned)
@@ -571,8 +634,10 @@ class LiveApp:
             self.dca_cap.stop()
             self.dca.close()
             s = self.dca_cap.stats()
-            print("FPGA raw capture: %d packets, %d drop gaps, %.2f MB"
-                  % (s["packets"], s["drop_gaps"], s["bytes"] / 1e6))
+            print("FPGA raw capture: %d packets, %d drop gaps "
+                  "(%d repaired late), %.2f MB"
+                  % (s["packets"], s["drop_gaps"],
+                     s.get("late_backfilled", 0), s["bytes"] / 1e6))
             if self.logger.enabled:
                 self.logger.meta["adc_capture"] = s
         self.logger.log_tracks(self.pipeline.signatures())

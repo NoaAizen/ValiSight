@@ -20,7 +20,15 @@ CLUSTER_EPS = 1.2       # metres: points within this join the same cluster
                         #    to keep a nearby pedestrian separate)
 CLUSTER_MIN_PTS = 2     # clusters smaller than this are dropped as noise
 STATIC_V = 0.25         # |Doppler| below this ~ static  (raise if platform moves)
+                        # CAVEAT: with the default 3-TX configs the unambiguous
+                        # Doppler is only ~±0.65 m/s — a person walking head-on
+                        # at 1.2 m/s ALIASES to ~-0.1 m/s and lands below this
+                        # threshold. Doppler alone must not decide "static";
+                        # the tracker's displacement logic is the safety net.
 VEH_EXTENT = 1.5        # metres: bounding extent above this leans "vehicle"
+                        # NOTE: extent is computed over a 0.5 s point window,
+                        # so it convolves SIZE with MOTION (v*0.5 m of smear);
+                        # partially, "fast" reads as "large"
 VEH_MIN_PTS = 6         # vehicles return more points than pedestrians
 PED_VSPREAD = 0.5       # micro-Doppler spread (limbs) hint for pedestrian
 

@@ -15,6 +15,14 @@ import numpy as np
 Box = collections.namedtuple("Box", "x y w h label score")
 
 # --- thermal segmentation (mirrors thermal_heatmap_n6.py) -----------------------
+# VALIDITY CAVEAT: absolute temperature windows assume the background is
+# cooler than a body. On a hot day (ambient 33-40 C) walls/asphalt enter the
+# "human" band, and at thermal crossover contrast is simply zero — no
+# threshold fixes that (see the radar-physics corpus). Apparent temperature
+# also drops with range (sub-pixel fill), so a distant person falls below the
+# band. Absolute segmentation is valid only when the scene is cooler than
+# skin; a relative-to-background scheme is the upgrade path. Note engines/
+# exhaust are far hotter than MAX_C and saturate at the top of the scale.
 MIN_C = 15.0                    # radiometric window mapped to 0..255
 MAX_C = 45.0
 THERMAL_CLASSES = [             # (label, tmin_c, tmax_c); bodies ~30-38 C
@@ -38,8 +46,12 @@ def thermal_detections(gray):
     """Radiometric gray frame -> [{'label','rect','cx','cy','t_mean','t_max'}]
     — same record shape as the on-device thermal_heatmap_n6.py emits."""
     out = []
-    for label, lo, hi in THERMAL_CLASSES:
-        mask = cv2.inRange(gray, temp_to_g(lo), temp_to_g(hi))
+    for i, (label, lo, hi) in enumerate(THERMAL_CLASSES):
+        g_lo, g_hi = temp_to_g(lo), temp_to_g(hi)
+        if i < len(THERMAL_CLASSES) - 1:
+            g_hi -= 1        # half-open bands: a boundary pixel (e.g. exactly
+                             # 30 C) must not double-detect as warm AND human
+        mask = cv2.inRange(gray, g_lo, g_hi)
         n, _, stats, cents = cv2.connectedComponentsWithStats(mask)
         for i in range(1, n):
             x, y, w, h, area = stats[i]

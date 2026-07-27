@@ -45,13 +45,22 @@ def map_g_to_temp(g):
 
 
 # --- temperature classes -> grayscale windows -------------------------------
-# (label, tmin_c, tmax_c). Bodies ~30-37 C; engines/exhaust/fire hotter.
+# (label, tmin_c, tmax_c). Bodies ~30-37 C; engines/exhaust/fire hotter (they
+# saturate above MAX_C at the top of the scale).
+# VALIDITY CAVEAT: absolute bands assume the background is cooler than a
+# body. On a hot day walls/asphalt enter the "human" band, and at thermal
+# crossover contrast is zero — no threshold fixes that. Apparent temperature
+# also drops with range (sub-pixel fill). Valid for scenes cooler than skin.
 CLASSES = [
     ("warm", 25.0, 30.0),
     ("human", 30.0, 38.0),
     ("hot", 38.0, 45.0),
 ]
-BANDS = [(lbl, [(temp_to_g(a), temp_to_g(b))]) for (lbl, a, b) in CLASSES]
+# upper bound exclusive (except the last band) so a boundary pixel — exactly
+# 30 C, say — is counted once, not detected as both warm AND human
+BANDS = [(lbl, [(temp_to_g(a),
+                 temp_to_g(b) - (0 if i == len(CLASSES) - 1 else 1))])
+         for i, (lbl, a, b) in enumerate(CLASSES)]
 
 clock = time.clock()
 

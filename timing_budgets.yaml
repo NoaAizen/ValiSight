@@ -1,0 +1,60 @@
+# Real-time latency budgets, per pipeline stage.
+#
+# Each stage declares a p99 budget in milliseconds and a target rate in Hz.
+# Rules (see CLAUDE.md and core/timing):
+#   * The metric is p99, never the mean. The mean hides the tail that kills a
+#     real-time system.
+#   * p99_ms/target_hz == null means "declared but not yet measured" — the bench
+#     harness fills it from a first clean, context-tagged measurement.
+#   * A stage that gets measured but is ABSENT from this file is a finding, not
+#     a default. Add the stage here (with null) before trusting its numbers.
+#   * Any number recorded against a budget is only valid with full measurement
+#     context (nvpmodel + jetson_clocks + SoC temps + cold-vs-saturated +
+#     concurrent load). See core/timing/context.py.
+
+stages:
+  # --- known budget --------------------------------------------------------
+  osm_extrude.refine:
+    p99_ms: 50            # p99 = 50 ms on a 201x201 grid, zero network I/O
+    target_hz: null
+    grid: "201x201"
+    network_io: forbidden
+    notes: "refine over the 201x201 ENU grid; must not touch the network"
+
+  # --- radar front end (to be measured) ------------------------------------
+  radar.parse_tlv:
+    p99_ms: null
+    target_hz: null
+  radar.cluster:
+    p99_ms: null
+    target_hz: null
+  radar.features:
+    p99_ms: null
+    target_hz: null
+  radar.classify:
+    p99_ms: null
+    target_hz: null
+
+  # --- thermal + projection (to be measured) -------------------------------
+  thermal.detect:
+    p99_ms: null
+    target_hz: null
+  projection.point_to_pixel:
+    p99_ms: null
+    target_hz: null
+  heatmap.render:
+    p99_ms: null
+    target_hz: null
+
+  # --- fusion + tracking (to be measured) ----------------------------------
+  fusion.associate:
+    p99_ms: null
+    target_hz: null
+  tracking.update:
+    p99_ms: null
+    target_hz: null
+
+  # --- map / prior (to be measured) ----------------------------------------
+  geoid.transform:
+    p99_ms: null
+    target_hz: null

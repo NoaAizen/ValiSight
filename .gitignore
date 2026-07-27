@@ -1,0 +1,11 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Recorded sessions and run logs (heavy, not code)
+logs/
+
+# OS / editor
+.DS_Store
+Thumbs.db

@@ -18,6 +18,11 @@ Usage in the live loop:
 import math
 
 # --- geometry tunables --------------------------------------------------------
+# Accuracy caveat: the IWR1843 has only 2 elevation channels, so per-point z
+# is coarse (a few degrees of elevation error is 0.3-0.5 m at 5 m range —
+# the size of GROUND_Z_TOL) and ground-bounce multipath plants ghosts at
+# wrong heights. Treat ground/tree as low-confidence heuristics beyond
+# ~3-4 m. Thresholds below are uncalibrated engineering guesses.
 GROUND_Z_TOL = 0.35     # |z_world| below this counts as floor level (m)
 GROUND_MAX_EXT_Z = 0.5  # ground is flat: little vertical spread
 GROUND_MIN_RANGE = 0.8  # too-close low returns are usually the rig itself
@@ -94,7 +99,10 @@ def resolve_semantics(tclusters, img, hfov_deg, yaw_offset_deg, radar_height):
         sem = semantic_from_geometry(c, radar_height)
         if sem == "tree?":
             x, y, z = c["centroid"]
-            az = math.atan2(-y, max(x, 0.01)) - math.radians(yaw_offset_deg)
+            # camera azimuth = radar azimuth + yaw_offset — same convention as
+            # fusion_core.CameraGeometry, or the green patch is sampled at
+            # 2*yaw away from where the matcher/renderer put the cluster
+            az = math.atan2(-y, max(x, 0.01)) + math.radians(yaw_offset_deg)
             el = math.atan2(z, max(math.sqrt(x * x + y * y), 0.01))
             px = int(W / 2.0 + fx * math.tan(az))
             py = int(H / 2.0 - fx * math.tan(el))

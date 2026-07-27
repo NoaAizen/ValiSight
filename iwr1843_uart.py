@@ -100,6 +100,11 @@ class RadarReader:
                     snr.append(s * 0.1)
                     noise.append(nz * 0.1)
             off += tlv_len
+        # a truncated TLV1 with a full TLV7 would misalign snr[i] <-> point[i]
+        # downstream (feeding material scoring) — trim side-info to the points
+        if snr is not None and len(snr) > len(points):
+            snr = snr[:len(points)]
+            noise = noise[:len(points)]
         return {"frame": frame_no, "n_obj": n_obj, "points": points,
                 "snr": snr, "noise": noise}
 
@@ -143,7 +148,9 @@ def send_config(cfg_serial, cfg_path, verbose=True, retries=2,
                 line = line_map(line)
             resp = send_line(line)
             attempt = 0
-            while "Error" in resp and attempt < retries:
+            # an empty response (timeout) is NOT success: a lost cfarCfg means
+            # the radar silently runs with the previous config's thresholds
+            while ("Error" in resp or not resp) and attempt < retries:
                 attempt += 1
                 time.sleep(0.3)
                 resp = send_line(line)
@@ -154,6 +161,9 @@ def send_config(cfg_serial, cfg_path, verbose=True, retries=2,
                 print("  cfg> %-58s %s%s" % (line, short[:90], note))
             if "Error" in resp:
                 raise RuntimeError("Radar rejected: %s -> %s" % (line, resp))
+            if not resp:
+                raise RuntimeError("Radar did not respond to: %s (check the "
+                                   "CONFIG port and baud rate)" % line)
     return log
 
 

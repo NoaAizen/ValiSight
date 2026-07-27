@@ -131,6 +131,10 @@ def main():
         print("reflectivity %-7s: n=%-5d median %.1f dB  (p10 %.1f / p90 %.1f)"
               % (m, len(vs), vs[len(vs) // 2], vs[len(vs) // 10],
                  vs[len(vs) * 9 // 10]))
+    if refl_by_mat:
+        print("  (CFAR-censored sample: only returns above the detection "
+              "threshold are logged, so these medians are biased high — "
+              "same trap as quoting med-err without missed%)")
 
     # ---- object tracks (signatures) --------------------------------------
     tracks = load_jsonl(os.path.join(sdir, "tracks.jsonl"))

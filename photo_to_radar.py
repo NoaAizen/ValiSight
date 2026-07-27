@@ -67,6 +67,14 @@ COCO = [
 # n_pts   : typical detected-points count at ~5 m (scaled by 1/range)
 # speed   : typical radial speed if moving (m/s); 0 = always static
 # vspread : micro-Doppler spread (m/s) — limbs/wheels
+#
+# SYNTHETIC-MODEL CAVEATS (this is a preview tool, not a measurement):
+# 1. speeds above ~0.65 m/s exceed the default configs' unambiguous Doppler —
+#    the REAL radar reports them aliased (folded modulo ~1.3 m/s), so e.g. a
+#    6 m/s car will NOT show 6 m/s on hardware.
+# 2. n ~ 1/range is a crude stand-in: real CFAR detection counts fall off a
+#    cliff when SNR crosses the threshold, they do not decay linearly.
+# All values here are invented plausible numbers, not calibrated.
 PROFILES = {
     "person":     dict(real_h=1.70, extent=0.6, n_pts=8,  speed=1.2, vspread=0.9),
     "cat":        dict(real_h=0.30, extent=0.4, n_pts=3,  speed=0.8, vspread=0.4),
@@ -114,7 +122,7 @@ def detect_objects(img):
         for det in out:
             scores = det[5:]
             cid = int(np.argmax(scores))
-            conf = float(scores[cid])
+            conf = float(scores[cid]) * float(det[4])   # class * objectness
             if conf < CONF_THR:
                 continue
             cx, cy, bw, bh = det[0] * W, det[1] * H, det[2] * W, det[3] * H

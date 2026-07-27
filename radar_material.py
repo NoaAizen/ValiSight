@@ -22,9 +22,17 @@ few strong specular glints; the median dilutes them with edge points):
   peak >= METAL_DB    -> "metal"    (strong glint above the local norm)
   peak <= FABRIC_DB   -> "fabric"   (even the best return is near the floor)
   in between          -> "mid"      (wood, drywall, plastic, body)
-  range > max_range   -> "unknown"  (beyond ~4 m the CFAR keeps only ~1.5 dB
-                                     of dynamic range — honest answer is
-                                     "can't tell", not a guess)
+  range > max_range   -> "unknown"  (in our session logs, beyond ~4 m the
+                                     CFAR-censored returns keep only ~1-2 dB
+                                     of usable dynamic range — honest answer
+                                     is "can't tell", not a guess)
+
+HONESTY CAVEAT: a monostatic amplitude measurement senses a REFLECTIVITY
+class, not a material. "metal" really means "strong specular/retro reflector"
+— smooth dielectrics at normal incidence (glass, wet wall) can score like
+metal, and a human body at 77 GHz returns fairly strongly too. The 10/4 dB
+thresholds are uncalibrated placeholders until measured against known objects
+(see the calibrate note below). Keep the class names as UI shorthand only.
 
 Calibrate: point the rig at a known metal and a known fabric object at 1-3 m,
 run live_radar_camera.py --debug-refl, read the peak scores, set

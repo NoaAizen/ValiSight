@@ -53,6 +53,10 @@ FALLBACK_MPP = 0.20                # rough guess (m/px) until --calibrate is run
 MAT_COLOR = {                      # BGR
     "metal":   (0, 100, 255),      # orange
     "fabric":  (60, 200, 60),      # green
+    "mid":     (0, 200, 200),      # yellow — wood/drywall/plastic/body, the
+                                   #          most common class; without its
+                                   #          own color it masquerades as
+                                   #          "unknown" gray on the map
     "unknown": (170, 170, 170),    # gray
 }
 MOVING_COLOR = (255, 0, 255)       # magenta ring for non-static clusters
@@ -215,6 +219,7 @@ def main():
 
         # legend (fixed size, canvas corner)
         items = [("metal", MAT_COLOR["metal"]), ("fabric", MAT_COLOR["fabric"]),
+                 ("mid", MAT_COLOR["mid"]),
                  ("unknown", MAT_COLOR["unknown"]), ("moving", MOVING_COLOR),
                  ("sensor", SENSOR_COLOR)]
         cv2.rectangle(canvas, (10, 10), (150, 22 + 22 * len(items)),

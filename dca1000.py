@@ -160,7 +160,7 @@ class RawCapture(threading.Thread):
         self.sock.bind((pc_ip, DATA_PORT))
         self.sock.settimeout(0.5)
         self.running = True
-        self.packets = self.dropped = self.bytes = 0
+        self.packets = self.dropped = self.bytes = self.late = 0
 
     def run(self):
         with open(self.out_path, "wb") as f:
@@ -180,7 +180,18 @@ class RawCapture(threading.Thread):
                     f.write(b"\x00" * (byte_count - self.bytes))
                     self.dropped += 1
                     self.bytes = byte_count
-                elif byte_count < self.bytes:     # late duplicate, skip
+                elif byte_count < self.bytes:
+                    # late reordered packet: its slot was already zero-filled,
+                    # so write it back into place instead of losing it (UDP
+                    # reorder is routine at ~470 Mbps burst). True duplicates
+                    # rewrite identical bytes — harmless.
+                    n = min(len(payload), self.bytes - byte_count)
+                    if n > 0:
+                        f.seek(byte_count)
+                        f.write(payload[:n])
+                        f.seek(self.bytes)
+                        self.late += 1
+                        self.packets += 1
                     continue
                 f.write(payload)
                 self.bytes += len(payload)
@@ -195,8 +206,10 @@ class RawCapture(threading.Thread):
             pass
 
     def stats(self):
+        # drop_gaps counts zero-filled GAPS, not lost packets; gaps later
+        # repaired by a reordered packet are counted in late_backfilled
         return {"packets": self.packets, "drop_gaps": self.dropped,
-                "bytes": self.bytes}
+                "late_backfilled": self.late, "bytes": self.bytes}
 
 
 def frame_bytes_from_cfg(cfg_path):
@@ -287,8 +300,9 @@ def main():
         dca.stop_record()
         cap.stop()
         s = cap.stats()
-        print("Done: %d packets, %d drop gaps, %.2f MB"
-              % (s["packets"], s["drop_gaps"], s["bytes"] / 1e6))
+        print("Done: %d packets, %d drop gaps (%d repaired late), %.2f MB"
+              % (s["packets"], s["drop_gaps"], s["late_backfilled"],
+                 s["bytes"] / 1e6))
         if s["bytes"] == 0:
             print("No data received — is the radar running with "
                   "lvdsStreamCfg -1 0 1 0 ?")

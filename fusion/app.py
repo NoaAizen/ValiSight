@@ -24,6 +24,7 @@ from fusion.camera import make_camera
 from fusion.detector import detect
 from fusion.fuse import fuse, FusedObject
 from fusion.radar import RadarSource
+from radar_tracker import Tracker
 
 WIN_TITLE = "VailSight fusion"
 
@@ -133,8 +134,9 @@ def main(argv=None):
                                  send_cfg=not args.no_send_cfg)
 
     selector = ModeSelector(thermal_available=thermal.available())
+    tracker = Tracker()          # persistent identity across frames/modes
     boxes = []
-    frame_i, t0 = 0, time.time()
+    frame_i, t0, last_mode = 0, time.time(), None
     print("Running. q = quit.")
     try:
         while True:
@@ -145,12 +147,23 @@ def main(argv=None):
                 break
             frame_i += 1
             mode = selector.update(float(frame[::4, ::4].mean()))
+            if mode != last_mode:
+                # thermal boxes (warm/human/hot) must not survive into rgb
+                # frames (and vice versa) — wrong labels AND wrong calibration
+                boxes, last_mode = [], mode
 
             pts = radar.latest_points() if radar else []
-            clusters = radar.clusters() if radar else []
+            clusters = radar.clusters(include_points=True) if radar else []
+            # tracks, not raw clusters, feed radar-only output: a person who
+            # stops moving has ~0 Doppler and would re-classify as "static"
+            # every frame — exactly the dark-scene failure the tracker's
+            # person-stickiness exists to prevent
+            tclusters = [tr.as_cluster()
+                         for tr in tracker.update(clusters, time.time())]
 
             if mode == "rgb":
-                if frame_i % max(args.detect_every, 1) == 1 or not boxes:
+                de = max(args.detect_every, 1)   # N=1 -> 1 % N == 0 == i % 1
+                if frame_i % de == 1 % de or not boxes:
                     boxes = detect(frame, "rgb")
                 cam_calib, view = calib, frame
             elif mode == "thermal":
@@ -164,7 +177,7 @@ def main(argv=None):
             if mode != "radar-only" and boxes:
                 objects = fuse(boxes, pts, cam_calib, clusters)
             else:
-                objects = radar_only_objects(clusters)
+                objects = radar_only_objects(tclusters)
                 for o in objects:                   # no box -> emit as text
                     print("  radar: %-10s %5.1fm %+5.1fm/s (%d pts)"
                           % (o["radar_class"], o["range_m"],

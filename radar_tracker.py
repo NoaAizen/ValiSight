@@ -44,6 +44,10 @@ PERSON_TIMEOUT_S = 3.0  # person-locked tracks survive longer gaps — a still
                         # means losing the identity right when it matters
 
 # micro-Doppler histogram bin edges (m/s) -> len-1 bins
+# NOTE: with the default 3-TX chirp configs the unambiguous Doppler is only
+# ~±0.65 m/s (extendedMaxVelocity is off) — reported velocities are aliased
+# modulo ~1.3 m/s, so the outer bins can only be populated by wrap-around.
+# Motion classification therefore leans on displacement, not Doppler alone.
 DOPPLER_EDGES = (-6.0, -3.0, -1.5, -0.5, -0.15, 0.15, 0.5, 1.5, 3.0, 6.0)
 
 # fixed feature order for the ML vector (append-only — models depend on it)
@@ -89,7 +93,9 @@ class Track(object):
         self.id = Track._next_id
         Track._next_id += 1
         self.pos = list(cluster["centroid"])
-        self.vel = [0.0, 0.0, 0.0]           # from centroid deltas (m/s)
+        self.vel = [0.0, 0.0, 0.0]           # vs SMOOTHED pos — see update()
+        self.vel_raw = [0.0, 0.0, 0.0]       # vs raw centroids — true speed
+        self._raw = list(cluster["centroid"])
         self.first_pos = tuple(self.pos)
         self.t_start = t
         self.t_last = t
@@ -117,9 +123,18 @@ class Track(object):
         dt = max(t - self.t_last, 1e-3)
         cx, cy, cz = cluster["centroid"]
         for i, c in enumerate((cx, cy, cz)):
+            # vel is measured against the SMOOTHED pos, which lags the target;
+            # in steady state that inflates it by ~1/POS_ALPHA — deliberately,
+            # because predict() = pos + vel*dt then lands on the true next
+            # position (lag and inflation cancel). It is an association aid,
+            # NOT a speed estimate.
             v_inst = (c - self.pos[i]) / dt
             self.vel[i] += 0.2 * (v_inst - self.vel[i])
+            # vel_raw is measured raw-centroid-to-raw-centroid: unbiased, the
+            # one to report/train on (speed_est in the signature)
+            self.vel_raw[i] += 0.2 * ((c - self._raw[i]) / dt - self.vel_raw[i])
             self.pos[i] += POS_ALPHA * (c - self.pos[i])
+        self._raw = [cx, cy, cz]
         self.t_last = t
         self.hits += 1
         self._absorb(cluster)
@@ -169,6 +184,7 @@ class Track(object):
     def motion_class(self):
         """Track-level motion label — steadier than per-frame votes."""
         # angular noise grows with range -> displacement threshold scales too
+        # (0.08 rad-equivalent slope is an engineering guess, not measured)
         moved_gate = MOVED_M + 0.08 * self.range_m()
         if self.v_abs.mean < STATIC_V and self.displacement() < moved_gate:
             # sticky person: standing still zeroes the Doppler, but a person
@@ -217,7 +233,9 @@ class Track(object):
         """Full characterization: named features + fixed-order ML vector."""
         med, p90, rstd = self.refl_stats()
         x, y, z = self.pos
-        speed = math.sqrt(sum(v * v for v in self.vel))
+        # raw-delta velocity: self.vel is inflated ~1/POS_ALPHA by design
+        # (see update()) and must not leak into training data
+        speed = math.sqrt(sum(v * v for v in self.vel_raw))
         feats = {
             "range_m": round(self.range_m(), 2),
             "az_deg": round(math.degrees(math.atan2(-y, max(x, 0.01))), 1),
