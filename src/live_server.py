@@ -51,8 +51,43 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 from core.detect import thermal as thermal_detect            # noqa: E402
+from core.detect import merge as detect_merge                # noqa: E402
 from core.fusion import azimuth as az_fuse                   # noqa: E402
 from PIL import ImageDraw                                    # noqa: E402
+
+# Learned person detector (adapter, heavy): runs in its OWN thread at its own
+# pace (~105 ms/frame on CPU) so the 8.8 fps capture loop never blocks on it.
+# The worker always consumes the LATEST frame and drops the rest; the fusion
+# step merges whatever AI boxes are freshest. Model missing -> silently off.
+AI = {"frame": None, "boxes": [], "on": False}
+ai_cv = threading.Condition()
+
+
+def ai_worker():
+    import thermal_ai
+    try:
+        thermal_ai._load()
+    except Exception as e:                          # noqa: BLE001
+        print("thermal AI : disabled (%s)" % e)
+        with lock:
+            state["ai"] = "disabled: %s" % e
+        return
+    with ai_cv:
+        AI["on"] = True
+    with lock:
+        state["ai"] = "on"
+    print("thermal AI : YOLOv4-tiny person detector on")
+    while True:
+        with ai_cv:
+            while AI["frame"] is None:
+                ai_cv.wait()
+            frame, AI["frame"] = AI["frame"], None
+        try:
+            boxes = thermal_ai.detect_person(frame)
+        except Exception:                           # noqa: BLE001
+            boxes = []
+        with ai_cv:
+            AI["boxes"] = boxes
 
 BY_ID = "/dev/serial/by-id"
 PROMPT = b">>> "
@@ -90,6 +125,7 @@ state = {
     "attitude": None,
     "radar": {"frames": 0, "raw": 0, "kept": 0, "clusters": [], "fps": 0.0},
     "fusion": [],             # thermal x radar fused objects (decision path)
+    "ai": "off",              # learned person detector: off / on / disabled
     "radar_error": None,
 }
 desired = {"camera": "rgb", "palette": "blackhot"}
@@ -408,9 +444,9 @@ def draw_fusion_overlay(rgb_img, objects, clusters):
         x, y, w, h = [v * s for v in o["box"]]
         color = SENSOR_COLORS.get(o["contributing_sensor"], (200, 200, 200))
         d.rectangle([x, y, x + w, y + h], outline=color, width=2)
-        line1 = "conf %.2f  s=%.2f  [%s]" % (o["confidence"],
-                                             o["uncertainty"],
-                                             o["contributing_sensor"])
+        line1 = "%sconf %.2f  s=%.2f  [%s]" % (
+            ("%s  " % o["label"]) if o.get("label") else "",
+            o["confidence"], o["uncertainty"], o["contributing_sensor"])
         line2 = ("%.1fm  %+.1fm/s  %s" % (o["range_m"], o["doppler_mps"],
                                           o["radar_class"])
                  if o["range_m"] is not None else "camera only")
@@ -654,6 +690,12 @@ def camera_thread(port, opts):
                     objects, clus = None, []
                     if dframe is not None and not opts.no_fusion:
                         boxes = thermal_detect.detect(dframe, bad[0])
+                        with ai_cv:
+                            if AI["on"]:
+                                AI["frame"] = dframe
+                                ai_cv.notify()
+                                boxes = detect_merge.merge_thermal_boxes(
+                                    boxes, AI["boxes"])
                         with lock:
                             clus = [dict(c)
                                     for c in state["radar"]["clusters"]]
@@ -1364,6 +1406,10 @@ def main():
     ap.add_argument("--no-fusion", action="store_true",
                     help="skip thermal x radar fusion overlay (detection, "
                          "azimuth association, uncertainty) on the thermal view")
+    ap.add_argument("--no-ai", action="store_true",
+                    help="skip the learned person detector on thermal frames "
+                         "(runs in its own thread; merged with the warm-blob "
+                         "detector, never replacing it)")
     ap.add_argument("--no-repair", action="store_true",
                     help="show the dead rows instead of interpolating them")
     ap.add_argument("--cfg",
@@ -1428,6 +1474,8 @@ def main():
         threading.Thread(target=camera_thread, args=(cam, args), daemon=True).start()
     if radar_data:
         threading.Thread(target=radar_thread, args=(radar_data,), daemon=True).start()
+    if not args.no_ai and not args.no_fusion:
+        threading.Thread(target=ai_worker, daemon=True).start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.port), Handler)
     print("\nserving on http://0.0.0.0:%d  (Ctrl-C to stop)" % args.port)
