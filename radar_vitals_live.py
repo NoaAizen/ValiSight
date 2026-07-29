@@ -148,6 +148,12 @@ def main():
     ap.add_argument("--from-bin", metavar="ADC.bin",
                     help="analyze an existing raw capture instead of going live")
     ap.add_argument("--cfg-port", help="radar CONFIG COM port (else auto)")
+    ap.add_argument("--chest-range", nargs=2, type=float, metavar=("LO", "HI"),
+                    default=CHEST_RANGE_M,
+                    help="restrict the chest search to this range window (m). "
+                         "Narrow it around the subject when a strong wall "
+                         "behind them wins the bin selection (default %s %s)"
+                         % CHEST_RANGE_M)
     args = ap.parse_args()
 
     if args.from_bin:
@@ -156,7 +162,8 @@ def main():
     else:
         adc = capture_live(args.cfg, args.seconds, args.cfg_port)
 
-    est, chest_range_m = analyze(adc, args.cfg)
+    est, chest_range_m = analyze(adc, args.cfg,
+                                 chest_range_m=tuple(args.chest_range))
     report(est, chest_range_m)
     return 0 if est.ok else 1
 
