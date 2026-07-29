@@ -9,3 +9,6 @@ logs/
 # OS / editor
 .DS_Store
 Thumbs.db
+
+# Machine-local Claude settings
+.claude/settings.local.json

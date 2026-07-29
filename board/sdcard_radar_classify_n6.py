@@ -20,11 +20,23 @@ CLUSTER_EPS = 1.2       # metres: points within this join the same cluster
                         #    to keep a nearby pedestrian separate)
 CLUSTER_MIN_PTS = 2     # clusters smaller than this are dropped as noise
 STATIC_V = 0.25         # |Doppler| below this ~ static  (raise if platform moves)
-                        # CAVEAT: with the default 3-TX configs the unambiguous
-                        # Doppler is only ~±0.65 m/s — a person walking head-on
-                        # at 1.2 m/s ALIASES to ~-0.1 m/s and lands below this
-                        # threshold. Doppler alone must not decide "static";
-                        # the tracker's displacement logic is the safety net.
+                        # CAVEAT, corrected 2026-07: no config in this repo
+                        # produces the ±0.65 m/s this note used to claim. That
+                        # number belongs to the TI out-of-box profile (idleTime
+                        # 429 us); stock_iwr1843.cfg cut idle to 267 us and the
+                        # note never followed. Measured v_max per config:
+                        #   stock / odom_b / odom_c   0.974 m/s
+                        #   odom_d / odom_e           1.947 m/s
+                        #   odom_f (2 TX)             2.920 m/s
+                        # The failure is real but has a DIFFERENT signature than
+                        # documented. On stock, a walker head-on at 1.2 m/s does
+                        # not fold to ~0 and read "static" -- it folds to
+                        # 1.2 - 2*0.974 = -0.75 m/s, three times STATIC_V, with
+                        # the SIGN REVERSED: it reads as a receding target.
+                        # That is worse: "static" would at least be visibly
+                        # wrong, a confident wrong velocity is not.
+                        # Doppler alone must still not decide "static"; the
+                        # tracker's displacement logic is the safety net.
 VEH_EXTENT = 1.5        # metres: bounding extent above this leans "vehicle"
                         # NOTE: extent is computed over a 0.5 s point window,
                         # so it convolves SIZE with MOTION (v*0.5 m of smear);
@@ -99,8 +111,13 @@ def classify(f):
 
 def cluster_dict(grp, include_points=False):
     """Point group -> the standard cluster dict (features + label).
-    Also used to rebuild clusters after reflectivity-based splitting
-    (radar_material.split_mixed_clusters)."""
+
+    Also intended for rebuilding clusters after reflectivity-based splitting.
+    NOTE: `radar_material` does not exist. It is planned work, not a module you
+    can import -- and the plan it was named for (peak snr+noise -> material) is
+    the one the literature reports at 0.67 accuracy cross-floor against 0.92 for
+    the SHAPE of the range-profile bins around the peak. If it is ever written,
+    it should take the TLV 2 range profile, not the peak level."""
     f = features(grp)
     c = {
         "label": classify(f),
@@ -108,8 +125,6 @@ def cluster_dict(grp, include_points=False):
         "doppler_mps": round(f["v_mean"], 2),
         "extent_m": round(f["extent"], 2),
         "n_points": f["n"],
-        "v_abs": round(f["v_abs"], 3),
-        "v_spread": round(f["v_spread"], 3),
         "centroid": (round(f["cx"], 2), round(f["cy"], 2), round(f["cz"], 2)),
     }
     if include_points:
@@ -121,8 +136,8 @@ def classify_frame(points, include_points=False):
     """Full frame: cluster -> features -> label. Returns list of dicts.
 
     Points may be (x,y,z,v) or (x,y,z,v,snr_db) — extra fields pass through.
-    include_points=True attaches the member points to each cluster (needed by
-    radar_material for reflectivity/material estimation).
+    include_points=True attaches the member points to each cluster (for the
+    planned reflectivity/material estimation -- see cluster_dict).
     """
     return [cluster_dict(grp, include_points) for grp in cluster(points)]
 

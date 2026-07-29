@@ -175,7 +175,7 @@ def main(argv=None):
                 boxes, cam_calib, view = [], None, frame
 
             if mode != "radar-only" and boxes:
-                objects = fuse(boxes, pts, cam_calib, clusters)
+                objects = fuse(boxes, pts, cam_calib, clusters, kind=mode)
             else:
                 objects = radar_only_objects(tclusters)
                 for o in objects:                   # no box -> emit as text
