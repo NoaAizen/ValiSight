@@ -81,6 +81,16 @@ python radar_vitals_live.py --seconds 25        # נבדק יושב, ~0.3-1מ', 
 python radar_vitals_live.py --from-bin cap.bin  # ניתוח הקלטה בלי חומרה
 ```
 
+על ה-**Jetson** (2026-07: הצינור מאומת אופליין ב-`tests/test_vitals_adapter.py`;
+חי — ברגע שה-DCA1000 מחובר):
+1. ‏DCA1000 על מחבר ה-LVDS ‏(60-pin) של ה-IWR1843BOOST; מתג SW2.5 = SW_CONFIG.
+2. אתרנט DCA1000 → ‏Jetson. ה-NIC כבר משמש את ה-LAN, אז או מתג קטן, או IP משני:
+   `sudo ip addr add 192.168.33.30/24 dev enP8p1s0`
+3. `python3 radar_vitals_live.py --seconds 25` — איתור הפורטים אוטומטי
+   ‏(‏`/dev/ttyACM*`; אם המספור זז — `--cfg-port /dev/ttyACM1`).
+4. הראדר מודאלי: קונפיג ה-vitals מחליף את קונפיג הזיהוי — לא בו-זמנית עם ‏fusion.
+   הצינור מסרב ביושר ("no reliable pulse") כשהנבדק זז או ה-SNR נמוך — זה פיצ'ר.
+
 ---
 
 ## כלל הזהב ל-N6

@@ -28,7 +28,7 @@ writes that register; the AGC itself stays on, because it is what gives the
 image its contrast. See lepton_fix.py for both, and for what was tried first
 and did not work.
 """
-import argparse, base64, glob, hashlib, io, json, os, struct, sys, threading, time
+import argparse, base64, glob, hashlib, io, json, math, os, struct, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -45,6 +45,14 @@ import lepton_fix
 import recorder as recorder_mod
 import radar_gate
 import radar_classify_n6
+
+# The pure fusion layer lives at the repo root (core/), one level up.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+from core.detect import thermal as thermal_detect            # noqa: E402
+from core.fusion import azimuth as az_fuse                   # noqa: E402
+from PIL import ImageDraw                                    # noqa: E402
 
 BY_ID = "/dev/serial/by-id"
 PROMPT = b">>> "
@@ -81,6 +89,7 @@ state = {
     "imu": None,
     "attitude": None,
     "radar": {"frames": 0, "raw": 0, "kept": 0, "clusters": [], "fps": 0.0},
+    "fusion": [],             # thermal x radar fused objects (decision path)
     "radar_error": None,
 }
 desired = {"camera": "rgb", "palette": "blackhot"}
@@ -361,39 +370,94 @@ def grab_payload(ser, grab, with_imu=True):
         return Grab(error="bad frame header (%s)" % e, wire_len=len(out))
 
 
-def thermal_to_jpeg(buf, bad, regain, opts, dt):
-    """Raw Lepton bytes -> displayable JPEG.
+def repair_thermal(buf, bad, opts):
+    """Raw Lepton bytes -> the DECISION-PATH frame (repaired, pre-regain).
 
     Order is not arbitrary. Level-correct first, because several offset rows sit
     directly beside a dead one and would otherwise poison its interpolation.
-    Fill the dead rows next. Reclaim the range last, once no row that carries
-    scene data is still at the wrong level and no row that carries none is still
-    setting the endpoints.
+    Fill the dead rows next. Regain is display-only and deliberately NOT here:
+    detection runs on this frame, and a per-frame display stretch has no place
+    in the decision path.
     """
     dead, offset = bad
     frame = lepton_fix.decode(buf)
+    if frame is None or opts.no_repair:
+        return frame
+    frame = lepton_fix.destripe(frame, dead, offset)
+    frame = lepton_fix.repair(frame, dead)
+    # Per-pixel correction goes AFTER the row work and BEFORE regain. After,
+    # because dead rows are invented by repair() and have no sensor pattern
+    # to correct. Before, because regain multiplies by ~4.4 and correcting a
+    # stretched frame would need a stretched map -- one that goes stale the
+    # moment the scene's span changes.
+    return lepton_fix.apply_pixel_offsets(frame, FPN["map"])
+
+
+OVERLAY_SCALE = 3           # 160x120 -> 480x360 so overlay text is readable
+SENSOR_COLORS = {"thermal": (255, 170, 40), "radar": (60, 220, 230)}
+
+
+def draw_fusion_overlay(rgb_img, objects, clusters):
+    """Draw fused objects + radar azimuth ticks on the (already colourised)
+    display image. Display only — nothing here feeds back into detection."""
+    img = rgb_img.resize((rgb_img.width * OVERLAY_SCALE,
+                          rgb_img.height * OVERLAY_SCALE), Image.NEAREST)
+    d = ImageDraw.Draw(img)
+    s = OVERLAY_SCALE
+    for o in objects or []:
+        x, y, w, h = [v * s for v in o["box"]]
+        color = SENSOR_COLORS.get(o["contributing_sensor"], (200, 200, 200))
+        d.rectangle([x, y, x + w, y + h], outline=color, width=2)
+        line1 = "conf %.2f  s=%.2f  [%s]" % (o["confidence"],
+                                             o["uncertainty"],
+                                             o["contributing_sensor"])
+        line2 = ("%.1fm  %+.1fm/s  %s" % (o["range_m"], o["doppler_mps"],
+                                          o["radar_class"])
+                 if o["range_m"] is not None else "camera only")
+        tx = min(x + 2, img.width - 150)      # keep labels inside the frame
+        d.text((tx, max(0, y - 22)), line1, fill=color)
+        d.text((tx, max(10, y - 11)), line2, fill=color)
+    # radar presence ticks along the bottom edge, matched or not: the dark /
+    # thermal-blind beats must still show where the radar sees something
+    for c in clusters or []:
+        az = az_fuse.cluster_azimuth_deg(c["centroid"])
+        fx = az_fuse.focal_px(rgb_img.width)
+        u = rgb_img.width / 2.0 + fx * math.tan(math.radians(az))
+        if 0 <= u < rgb_img.width:
+            u *= s
+            d.line([u, img.height - 14, u, img.height], fill=(60, 220, 230),
+                   width=2)
+            d.text((min(u + 3, img.width - 60), img.height - 13),
+                   "%.1fm %s" % (c["range_m"], c["label"][:4]),
+                   fill=(60, 220, 230))
+    return img
+
+
+def thermal_to_jpeg(buf, bad, regain, opts, dt, frame=None, objects=None,
+                    clusters=None):
+    """Displayable JPEG: repaired frame -> regain -> palette -> overlay.
+
+    ``frame``: the repair_thermal() result when the caller already computed
+    it (the fusion path does); decoded from ``buf`` otherwise.
+    """
+    dead, _ = bad
+    if frame is None:
+        frame = repair_thermal(buf, bad, opts)
     if frame is None:
         return None
-    if not opts.no_repair:
-        frame = lepton_fix.destripe(frame, dead, offset)
-        frame = lepton_fix.repair(frame, dead)
-        # Per-pixel correction goes AFTER the row work and BEFORE regain. After,
-        # because dead rows are invented by repair() and have no sensor pattern
-        # to correct. Before, because regain multiplies by ~4.4 and correcting a
-        # stretched frame would need a stretched map -- one that goes stale the
-        # moment the scene's span changes.
-        frame = lepton_fix.apply_pixel_offsets(frame, FPN["map"])
-        if not opts.no_regain:
-            frame = regain.apply(frame, dead, dt)
+    if not opts.no_repair and not opts.no_regain:
+        frame = regain.apply(frame, dead, dt)
     # Read the palette per frame rather than binding it once at startup. It is
     # a host-side lookup table applied after every correction step, so unlike a
     # camera switch it costs nothing and needs no soft reset -- there is no
     # reason to make someone restart the server to change it.
     with lock:
         pal = desired["palette"]
+    img = Image.fromarray(lepton_fix.colourise(frame, pal))
+    if objects is not None or clusters:
+        img = draw_fusion_overlay(img, objects, clusters)
     out = io.BytesIO()
-    Image.fromarray(lepton_fix.colourise(frame, pal)).save(
-        out, "JPEG", quality=opts.quality)
+    img.save(out, "JPEG", quality=opts.quality)
     return out.getvalue()
 
 
@@ -581,8 +645,27 @@ def camera_thread(port, opts):
             elif g.payload:
                 now = time.time()
                 dt, t_frame = min(now - t_frame, 1.0), now
-                jpeg = (thermal_to_jpeg(g.payload, bad, regain, opts, dt)
-                        if kind == "raw" else g.payload)
+                if kind == "raw":
+                    # Decision path: repaired pre-regain frame -> warm-blob
+                    # detection -> azimuth association with the radar's live
+                    # clusters -> uncertainty-fused objects. Display gets the
+                    # same objects drawn on top; state.json gets the records.
+                    dframe = repair_thermal(g.payload, bad, opts)
+                    objects, clus = None, []
+                    if dframe is not None and not opts.no_fusion:
+                        boxes = thermal_detect.detect(dframe, bad[0])
+                        with lock:
+                            clus = [dict(c)
+                                    for c in state["radar"]["clusters"]]
+                        objects = az_fuse.fuse_thermal(
+                            boxes, clus, dframe.shape[1])
+                        with lock:
+                            state["fusion"] = objects
+                    jpeg = thermal_to_jpeg(g.payload, bad, regain, opts, dt,
+                                           frame=dframe, objects=objects,
+                                           clusters=clus)
+                else:
+                    jpeg = g.payload
                 if jpeg:
                     # mono_us is the board's own axis, unwrapped past the 2**30
                     # rollover. host_wall is the Jetson's clock and is for
@@ -1278,6 +1361,9 @@ def main():
                     help="stop storing frame bytes past this; timing keeps logging")
     ap.add_argument("--no-regain", action="store_true",
                     help="skip reclaiming the range the dead rows occupied")
+    ap.add_argument("--no-fusion", action="store_true",
+                    help="skip thermal x radar fusion overlay (detection, "
+                         "azimuth association, uncertainty) on the thermal view")
     ap.add_argument("--no-repair", action="store_true",
                     help="show the dead rows instead of interpolating them")
     ap.add_argument("--cfg",
