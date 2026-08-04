@@ -26,10 +26,11 @@ from conftest import (
 )
 from mapinit import Check, InitContext, InitializationPipeline, MapInitializer, StageStatus
 from mapinit.calibration import SurveyedTargetConstraint
+from mapinit.geo.dem import DemSampler, DemUnavailable, ScaleNotSupported
 from mapinit.geo.geoid import GeoidGridUnavailable, GeoidModel
 from mapinit.geo.providers import LocalFilePriorProvider
 from mapinit.geo.tiles import AmbiguousTiles, TileNotFound, parse_tile_bounds, select_tile
-from mapinit.stage import InitStage
+from mapinit.stage import InitStage, StageResult
 from mapinit.stages import CalibrationStage, GeoidStage, PoseInitStage, PriorsStage
 
 # --------------------------------------------------------------------------
@@ -483,11 +484,160 @@ def test_diagnose_reports_priors_failure_without_hiding_a_good_geoid(tmp_path):
 
 
 # --------------------------------------------------------------------------
+# DEM sampling: the ground plane and ego-altitude prior
+# --------------------------------------------------------------------------
+
+
+def _dem_path(tiled_priors):
+    return tiled_priors / "glo30" / "Copernicus_DSM_COG_10_N31_00_E035_00_DEM.tif"
+
+
+def test_dem_reports_its_own_coverage(tiled_priors):
+    with DemSampler(_dem_path(tiled_priors)) as dem:
+        assert dem.covers(*JERUSALEM)
+        assert not dem.covers(48.85, 2.35)  # Paris
+
+
+def test_sampling_outside_the_tile_raises(tiled_priors):
+    with DemSampler(_dem_path(tiled_priors)) as dem:
+        with pytest.raises(DemUnavailable, match="outside"):
+            dem.surface_elevation_m(48.85, 2.35)
+
+
+def test_missing_dem_file_raises(tmp_path):
+    with pytest.raises(DemUnavailable, match="not found"):
+        DemSampler(tmp_path / "absent.tif")
+
+
+def test_bilinear_sampling_varies_smoothly_across_a_pixel(tiled_priors):
+    """Interpolation, not nearest neighbour: adjacent points must differ."""
+    with DemSampler(_dem_path(tiled_priors)) as dem:
+        a = dem.surface_elevation_m(31.5000, 35.5000)
+        b = dem.surface_elevation_m(31.5000, 35.5010)
+        assert a != b
+        assert abs(a - b) < 1.0, "a fraction of a pixel must not jump"
+
+
+def test_obstacle_scale_queries_are_refused(tiled_priors):
+    """Trap #10: 30 m posting cannot support a 1.2 m clustering epsilon."""
+    with DemSampler(_dem_path(tiled_priors)) as dem:
+        with pytest.raises(ScaleNotSupported, match="finer than"):
+            dem.assert_scale_supported(1.2)
+        dem.assert_scale_supported(100.0)  # coarse enough, must not raise
+
+
+def test_ground_is_estimated_from_the_ring_not_the_point(tiled_priors):
+    """Trap #8: GLO-30 is a DSM, so the value overhead may be a roof.
+
+    The synthetic tile carries a central bump standing above its surroundings.
+    Sampled at the peak, ground must come out below the surface, which only
+    happens if the estimate uses the ring rather than the point.
+    """
+    with DemSampler(_dem_path(tiled_priors)) as dem:
+        estimate = dem.ground_elevation(31.5, 35.5, ring_radius_m=2000.0)
+        assert estimate.surface_m > estimate.ground_m
+        assert estimate.structure_m == pytest.approx(estimate.surface_m - estimate.ground_m)
+        assert estimate.ring_samples > 0
+
+
+def test_ground_plane_fit_reports_slope_and_residual(tiled_priors):
+    with DemSampler(_dem_path(tiled_priors)) as dem:
+        slope, aspect, residual = dem.ground_plane(31.2, 35.2, radius_m=2000.0)
+        assert slope >= 0.0
+        assert 0.0 <= aspect < 360.0
+        assert residual >= 0.0
+
+
+def test_nodata_does_not_leak_into_an_elevation(tmp_path):
+    """A nodata neighbour must never be interpolated as if it were a height."""
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    path = tmp_path / "holed.tif"
+    data = np.full((40, 40), 700.0, dtype="float32")
+    data[20:24, 20:24] = -32767.0
+    with rasterio.open(
+        path, "w", driver="GTiff", height=40, width=40, count=1, dtype="float32",
+        crs="EPSG:4326", nodata=-32767.0,
+        transform=from_bounds(35.0, 31.0, 36.0, 32.0, 40, 40),
+    ) as dst:
+        dst.write(data, 1)
+
+    with DemSampler(path) as dem:
+        # Beside the hole, where a naive read would blend -32767 into the result
+        assert dem.surface_elevation_m(31.5, 35.48) == pytest.approx(700.0, abs=1.0)
+
+
+def test_all_nodata_raises_rather_than_returning_the_sentinel(tmp_path):
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    path = tmp_path / "empty.tif"
+    with rasterio.open(
+        path, "w", driver="GTiff", height=20, width=20, count=1, dtype="float32",
+        crs="EPSG:4326", nodata=-32767.0,
+        transform=from_bounds(35.0, 31.0, 36.0, 32.0, 20, 20),
+    ) as dst:
+        dst.write(np.full((20, 20), -32767.0, dtype="float32"), 1)
+
+    with DemSampler(path) as dem:
+        with pytest.raises(DemUnavailable, match="no data"):
+            dem.surface_elevation_m(31.5, 35.5)
+
+
+def test_ego_altitude_prior_carries_both_height_systems(tiled_priors):
+    """The pair must stay consistent: h = H + N, with N never assumed."""
+    with DemSampler(_dem_path(tiled_priors)) as dem:
+        prior = dem.ego_altitude_prior(
+            31.5, 35.5, geoid_undulation_m=19.8, rig_height_agl_m=1.5
+        )
+        assert prior.ellipsoidal_m == pytest.approx(prior.orthometric_m + 19.8)
+        assert prior.orthometric_m == pytest.approx(prior.ground.ground_m + 1.5)
+        assert prior.sigma_m >= 4.0, "cannot be tighter than the DEM's own accuracy"
+
+
+def test_priors_stage_reports_a_sampled_elevation(tiled_priors):
+    ctx = InitContext(*JERUSALEM, prior_provider=LocalFilePriorProvider(tiled_priors))
+    result = PriorsStage().run(ctx)
+
+    assert result.status is StageStatus.OK
+    assert "ground_elevation_m" in result.data
+    assert any(c.name == "priors.dem_yields_elevation" for c in result.checks)
+
+
+def test_priors_stage_pairs_the_prior_with_the_geoid_when_it_ran(tiled_priors):
+    """The altitude prior must reach consumers already geoid-corrected."""
+    ctx = InitContext(*JERUSALEM, prior_provider=LocalFilePriorProvider(tiled_priors))
+    ctx.results["geoid"] = StageResult("geoid", StageStatus.OK, [], {"undulation_m": 19.8})
+
+    result = PriorsStage().run(ctx)
+    prior = result.data["ego_altitude_prior"]
+    assert prior.geoid_undulation_m == pytest.approx(19.8)
+    assert prior.ellipsoidal_m == pytest.approx(prior.orthometric_m + 19.8)
+
+
+def test_priors_stage_fails_when_the_dem_is_not_a_raster(tmp_path):
+    """A file with the right name and size but no readable raster must fail."""
+    priors_dir = tmp_path / "priors"
+    (priors_dir / "glo30").mkdir(parents=True)
+    (priors_dir / "overture").mkdir(parents=True)
+    (priors_dir / "glo30" / "Copernicus_DSM_COG_10_N31_00_E035_00_DEM.tif").write_bytes(
+        b"\0" * 60_000
+    )
+    (priors_dir / "overture" / "overture_N31_00_E035_00_b.parquet").write_bytes(b"\0" * 20_000)
+
+    ctx = InitContext(*JERUSALEM, prior_provider=LocalFilePriorProvider(priors_dir))
+    assert PriorsStage().run(ctx).status is StageStatus.FAILED
+
+
+# --------------------------------------------------------------------------
 # MapInitializer: the surface consuming code holds onto
 # --------------------------------------------------------------------------
 
 
-def test_constructing_the_facade_touches_no_disk(monkeypatch):
+def test_constructing_the_initializer_touches_no_disk(monkeypatch):
     """Holding a MapInitializer must cost nothing until something is asked."""
     import mapinit.geo.geoid as geoid_module
 
@@ -558,13 +708,13 @@ def test_orthometric_conversion_uses_the_initializer_point():
 
 
 @requires_geoid_grid
-def test_facade_resolves_priors_for_its_own_point(tiled_priors):
+def test_initializer_resolves_priors_for_its_own_point(tiled_priors):
     init = MapInitializer(*JERUSALEM, prior_provider=LocalFilePriorProvider(tiled_priors))
     assert "N31_00_E035_00" in init.priors().glo30_path.name
 
 
 @requires_geoid_grid
-def test_facade_run_matches_the_pipeline_it_exposes(tiled_priors):
+def test_initializer_run_matches_the_pipeline_it_exposes(tiled_priors):
     init = MapInitializer(*JERUSALEM, prior_provider=LocalFilePriorProvider(tiled_priors))
     report = init.run()
 
@@ -575,7 +725,7 @@ def test_facade_run_matches_the_pipeline_it_exposes(tiled_priors):
     )
 
 
-def test_facade_carries_calibration_constraints_into_the_run():
+def test_initializer_carries_calibration_constraints_into_the_run():
     from mapinit.calibration import SurveyedTargetConstraint
 
     init = MapInitializer(*JERUSALEM, constraints=[SurveyedTargetConstraint(make_targets())])

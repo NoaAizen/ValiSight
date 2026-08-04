@@ -16,7 +16,7 @@ require pyproj; the grid is opened on first use.
 
 from .check import Check, CheckFailed
 from .context import GLOBAL_GEOID_BOUND_M, InitContext
-from .facade import MapInitializer
+from .map_initializer import MapInitializer
 from .runner import InitializationPipeline, InitReport
 from .stage import InitStage, StageResult, StageStatus
 

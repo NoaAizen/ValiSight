@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The object consuming code holds onto.
+"""The public interface of this package: the one object consuming code imports.
 
 Everything else in this package is internal detail. A consumer constructs one
 MapInitializer, and gets three things from it:
@@ -7,6 +7,7 @@ MapInitializer, and gets three things from it:
 * ``run()``               - guarded initialization, returning every check
 * ``separation_probe``    - the geoid callable other modules inject
 * ``priors()``            - the map layers covering the point
+* ``ego_altitude_prior`` - our own altitude, in both height systems
 
 Construction is cheap and never touches disk. The geoid grid is opened on first
 use, so holding a MapInitializer costs nothing until something is asked of it.
@@ -22,6 +23,7 @@ from .runner import InitializationPipeline, InitReport
 
 if TYPE_CHECKING:
     from .calibration.constraints import CalibrationConstraint
+    from .geo.dem import DemSampler, EgoAltitudePrior, GroundEstimate
     from .geo.geoid import GeoidModel
     from .geo.providers import BasePriorDataProvider, PriorPaths
 
@@ -101,6 +103,50 @@ class MapInitializer:
             self.context.priors_dir, tile_size_deg=self.context.tile_size_deg
         )
         return provider.get_priors(self.context.latitude, self.context.longitude)
+
+    # -- terrain ----------------------------------------------------------
+
+    def dem(self) -> "DemSampler":
+        """Open a sampler on the DEM tile covering this point.
+
+        Caller closes it, or uses it as a context manager. Kept as a method
+        rather than a cached property so a long-lived initializer does not hold
+        a file handle open for its whole life.
+        """
+        from .geo.dem import DemSampler
+
+        return DemSampler(self.priors().glo30_path)
+
+    def ground_elevation(self, **kwargs) -> "GroundEstimate":
+        """Bare-ground orthometric height beneath this point.
+
+        GLO-30 is a surface model, so this estimates ground from a ring around
+        the point rather than reading the value overhead, which may be a roof.
+        """
+        with self.dem() as dem:
+            return dem.ground_elevation(self.context.latitude, self.context.longitude, **kwargs)
+
+    def ego_altitude_prior(self, rig_height_agl_m: float = 0.0, **kwargs) -> "EgoAltitudePrior":
+        """Prior on our own altitude, in both height systems.
+
+        The geoid undulation is taken from the verified geoid rather than
+        assumed, so the orthometric and ellipsoidal values cannot drift apart.
+        """
+        with self.dem() as dem:
+            return dem.ego_altitude_prior(
+                self.context.latitude,
+                self.context.longitude,
+                geoid_undulation_m=self.geoid_separation_m(
+                    self.context.latitude, self.context.longitude
+                ),
+                rig_height_agl_m=rig_height_agl_m,
+                **kwargs,
+            )
+
+    def ground_plane(self, **kwargs) -> "Tuple[float, float, float]":
+        """Local terrain plane as (slope percent, aspect degrees, rms residual m)."""
+        with self.dem() as dem:
+            return dem.ground_plane(self.context.latitude, self.context.longitude, **kwargs)
 
     # -- full run ---------------------------------------------------------
 

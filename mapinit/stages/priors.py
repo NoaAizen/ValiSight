@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Tuple
 
 from ..check import Check
 from ..context import InitContext
+from ..geo.dem import DemSampler
 from ..geo.providers import BasePriorDataProvider, LocalFilePriorProvider
 from ..stage import InitStage
 
@@ -53,8 +54,41 @@ class PriorsStage(InitStage):
             ),
         ]
 
-        return checks, {
+        data = {
             "glo30_path": priors.glo30_path,
             "overture_path": priors.overture_path,
             "provider": type(provider).__name__,
         }
+
+        # A tile that covers the point on paper but yields no height there is
+        # still unusable, so the guard reads a value rather than trusting the
+        # filename. Raises DemUnavailable if the raster cannot answer.
+        with DemSampler(priors.glo30_path) as dem:
+            ground = dem.ground_elevation(ctx.latitude, ctx.longitude)
+            checks.append(
+                Check.in_range(
+                    "priors.dem_yields_elevation",
+                    ground.ground_m,
+                    -450.0,   # Dead Sea shore, the lowest land on Earth
+                    9000.0,
+                    unit="m",
+                    detail=f"ground plane at {point}: {ground}",
+                )
+            )
+            data["ground_elevation_m"] = ground.ground_m
+            data["surface_elevation_m"] = ground.surface_m
+            data["dem_posting_m"] = dem.posting_m
+
+            # Publish the geoid-corrected altitude prior when the geoid stage
+            # already ran, so a consumer never has to pair them up itself
+            undulation = ctx.output("geoid", "undulation_m")
+            if undulation is not None:
+                prior = dem.ego_altitude_prior(
+                    ctx.latitude, ctx.longitude, geoid_undulation_m=undulation
+                )
+                data["ego_altitude_prior"] = prior
+                checks.append(
+                    Check.that("priors.ego_altitude_prior", True, str(prior))
+                )
+
+        return checks, data

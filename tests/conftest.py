@@ -46,15 +46,58 @@ requires_geoid_grid = pytest.mark.skipif(
 )
 
 
+#: Side length of a synthetic DEM tile, in pixels. 120x120 float32 clears the
+#: provider's 50 KiB corruption floor while staying fast to write.
+SYNTHETIC_DEM_PX = 120
+
+
+def write_dem(path: Path, min_lat: float, min_lon: float, size_deg: float = 1.0) -> Path:
+    """Write a real, georeferenced GeoTIFF so sampling code can be tested against it.
+
+    Elevation ramps north-east and carries a bump, giving the plane fit and the
+    percentile ring something with actual structure to work on rather than a
+    constant surface that would pass any check.
+    """
+    import numpy as np
+    import rasterio
+    from rasterio.transform import from_bounds
+
+    n = SYNTHETIC_DEM_PX
+    rows, cols = np.mgrid[0:n, 0:n]
+    ramp = 500.0 + 4.0 * (cols / n) + 6.0 * ((n - rows) / n)
+    bump = 40.0 * np.exp(-(((rows - n / 2) ** 2 + (cols - n / 2) ** 2) / (2 * (n / 12) ** 2)))
+    data = (ramp + bump).astype("float32")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(
+        path, "w", driver="GTiff", height=n, width=n, count=1, dtype="float32",
+        crs="EPSG:4326", nodata=-32767.0,
+        transform=from_bounds(min_lon, min_lat, min_lon + size_deg, min_lat + size_deg, n, n),
+    ) as dst:
+        dst.write(data, 1)
+    return path
+
+
 def write_priors(root: Path, dem_names: Sequence[str], vector_names: Sequence[str]) -> Path:
-    """Build a priors tree with files large enough to pass the integrity floors."""
+    """Build a priors tree.
+
+    DEM entries become real GeoTIFFs, georeferenced from their tile tag where
+    they carry one and global otherwise, so tests exercise actual raster reads
+    rather than byte counts.
+    """
+    from mapinit.geo.tiles import parse_tile_bounds
+
     glo30 = root / "glo30"
     overture = root / "overture"
     glo30.mkdir(parents=True, exist_ok=True)
     overture.mkdir(parents=True, exist_ok=True)
 
     for name in dem_names:
-        (glo30 / name).write_bytes(b"\0" * DEM_BYTES)
+        bounds = parse_tile_bounds(Path(name))
+        if bounds is None:
+            write_dem(glo30 / name, -90.0, -180.0, size_deg=180.0)  # untagged: global
+        else:
+            write_dem(glo30 / name, bounds.min_lat, bounds.min_lon)
     for name in vector_names:
         (overture / name).write_bytes(b"\0" * VECTOR_BYTES)
     return root
