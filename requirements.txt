@@ -1,0 +1,14 @@
+pyproj==3.7.1
+pytest==9.1.1
+
+# Data dependency, not installable via pip.
+#
+# PROJ needs the EGM2008 vertical shift grid to transform EPSG:4979 -> EPSG:3855.
+# Without it PROJ silently degrades to a ballpark transform that returns the
+# input height unchanged, so GeoidStage refuses to run. Fetch it once into
+# data/ (gitignored, ~77MB):
+#
+#   curl -o data/us_nga_egm08_25.tif https://cdn.proj.org/us_nga_egm08_25.tif
+#
+# PROJ reads GeoTIFF (.tif) and legacy .gtx grids only. GeographicLib .pgm
+# distributions of EGM2008 are not readable by PROJ.

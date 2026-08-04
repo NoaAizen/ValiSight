@@ -1,0 +1,18 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Geospatial grids and cached priors are large binaries fetched at setup time,
+# not source. See requirements.txt for how to obtain the EGM2008 grid.
+data/*.tif
+data/*.tiff
+data/*.pgm
+data/*.gtx
+data/priors/
+
+# Test and tooling artifacts
+.pytest_cache/
+.coverage
