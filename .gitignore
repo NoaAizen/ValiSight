@@ -10,5 +10,12 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Machine-local Claude settings
-.claude/settings.local.json
+# External repo clone / virtualenv (never in git)
+env/
+tools/jetson-containers/
+
+# Heavy non-code assets (stay local per 2026-08-04 decision)
+data/recordings/
+shared/recordings/
+shared/חומרי מחקר/
+models/

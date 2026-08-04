@@ -63,10 +63,15 @@ class Recorder:
         return self._f[name]
 
     def write_meta(self, meta):
+        """Idempotent on the started-* stamps: write_meta may be re-called
+        mid-session (facts measured off the stream, e.g. actual frame dims,
+        get stamped once known), and a re-call must not shift session start."""
         meta = dict(meta)
+        if not hasattr(self, "_started"):
+            self._started = (time.time(), time.strftime("%Y-%m-%dT%H:%M:%S"))
         meta.update(session=self.session,
-                    started_host_wall=time.time(),
-                    started_iso=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    started_host_wall=self._started[0],
+                    started_iso=self._started[1],
                     save_frames=self.save_frames,
                     note="mono_us is the N6 monotonic axis; host_wall is the "
                          "Jetson clock and is for correlation only")
