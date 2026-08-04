@@ -11,24 +11,8 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from mapinit import InitContext, InitializationPipeline
+from mapinit import MapInitializer
 from mapinit.calibration import SurveyedTargetConstraint
-from mapinit.stages import CalibrationStage, GeoidStage, PriorsStage
-
-
-def build_pipeline(targets: Path | None) -> InitializationPipeline:
-    """Assemble the stages, wiring in whatever calibration constraints exist.
-
-    Extending the calibration means appending another CalibrationConstraint
-    here; neither CalibrationStage nor the runner needs to know about it.
-    """
-    constraints = []
-    if targets is not None:
-        constraints.append(SurveyedTargetConstraint.from_json(targets))
-
-    return InitializationPipeline(
-        [GeoidStage(), PriorsStage(), CalibrationStage(constraints)]
-    )
 
 
 def main() -> None:
@@ -56,13 +40,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    ctx = InitContext(
+    # Extending the calibration means appending another CalibrationConstraint
+    # here; neither CalibrationStage nor the runner needs to know about it.
+    constraints = []
+    if args.targets is not None:
+        constraints.append(SurveyedTargetConstraint.from_json(args.targets))
+
+    initializer = MapInitializer(
         latitude=args.lat,
         longitude=args.lon,
         expected_geoid_range=tuple(args.expect_geoid) if args.expect_geoid else None,
+        constraints=constraints,
     )
 
-    report = build_pipeline(args.targets).run(ctx, fail_fast=not args.diagnose)
+    report = initializer.run(fail_fast=not args.diagnose)
     print(report.summary())
     raise SystemExit(0 if report.ok else 1)
 

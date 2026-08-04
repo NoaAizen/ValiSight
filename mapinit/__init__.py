@@ -1,30 +1,37 @@
 """Map-relative position initialization with explicit checks at every stage.
 
-Typical use::
+Consuming code needs one object::
 
-    from mapinit import InitContext, InitializationPipeline
+    from mapinit import MapInitializer
 
-    ctx = InitContext(latitude=31.7683, longitude=35.2137)
-    report = InitializationPipeline.default().run(ctx)
-    print(report.summary())
+    init = MapInitializer(latitude=31.7683, longitude=35.2137)
 
-Stage implementations are imported lazily by ``InitializationPipeline.default``
-so that importing this package does not require pyproj.
+    report = init.run()                 # guarded startup, every check reported
+    init.separation_probe               # geoid callable, signature (lon, lat)
+    init.priors()                       # DEM and vector layers for this point
+
+Everything below MapInitializer is internal. Importing this package does not
+require pyproj; the grid is opened on first use.
 """
 
 from .check import Check, CheckFailed
 from .context import GLOBAL_GEOID_BOUND_M, InitContext
+from .facade import MapInitializer
 from .runner import InitializationPipeline, InitReport
 from .stage import InitStage, StageResult, StageStatus
 
 __all__ = [
+    # The public surface
+    "MapInitializer",
+    # Extension points, for adding stages or constraints
     "Check",
     "CheckFailed",
+    "InitStage",
+    "StageResult",
+    "StageStatus",
+    # Internals, exposed for tests and advanced wiring
     "GLOBAL_GEOID_BOUND_M",
     "InitContext",
     "InitializationPipeline",
     "InitReport",
-    "InitStage",
-    "StageResult",
-    "StageStatus",
 ]

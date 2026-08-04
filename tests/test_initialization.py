@@ -24,7 +24,7 @@ from conftest import (
     requires_geoid_grid,
     write_priors,
 )
-from mapinit import Check, InitContext, InitializationPipeline, StageStatus
+from mapinit import Check, InitContext, InitializationPipeline, MapInitializer, StageStatus
 from mapinit.calibration import SurveyedTargetConstraint
 from mapinit.geo.geoid import GeoidGridUnavailable, GeoidModel
 from mapinit.geo.providers import LocalFilePriorProvider
@@ -475,6 +475,111 @@ def test_diagnose_reports_priors_failure_without_hiding_a_good_geoid(tmp_path):
     assert report.stage("geoid").status is StageStatus.OK
     assert report.stage("priors").status is StageStatus.FAILED
     assert not report.ok
+
+
+# --------------------------------------------------------------------------
+# Check semantics
+# --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# MapInitializer: the surface consuming code holds onto
+# --------------------------------------------------------------------------
+
+
+def test_constructing_the_facade_touches_no_disk(monkeypatch):
+    """Holding a MapInitializer must cost nothing until something is asked."""
+    import mapinit.geo.geoid as geoid_module
+
+    def explode(*args, **kwargs):
+        raise AssertionError("the geoid grid was opened during construction")
+
+    monkeypatch.setattr(geoid_module, "GeoidModel", explode)
+    MapInitializer(*JERUSALEM)  # must not raise
+
+
+@requires_geoid_grid
+def test_separation_probe_takes_lon_lat_in_that_order():
+    """The probe signature is (lon, lat) — the reverse of the rest of the package."""
+    init = MapInitializer(*JERUSALEM)
+    latitude, longitude = JERUSALEM
+
+    assert init.separation_probe(longitude, latitude) == pytest.approx(
+        init.geoid_separation_m(latitude, longitude)
+    )
+
+
+@requires_geoid_grid
+def test_swapping_probe_arguments_gives_a_different_answer():
+    """Why the argument order matters: the mistake is silent, not loud.
+
+    Jerusalem's coordinates transposed land in the Mediterranean off Libya.
+    Both calls succeed and both return a plausible undulation, so nothing
+    surfaces the error except the value being several meters off — which reads
+    as a calibration bias rather than a coordinate bug.
+    """
+    init = MapInitializer(*JERUSALEM)
+    latitude, longitude = JERUSALEM
+
+    correct = init.separation_probe(longitude, latitude)
+    swapped = init.separation_probe(latitude, longitude)
+    assert abs(correct - swapped) > 1.0
+
+
+@requires_geoid_grid
+def test_probe_satisfies_an_injected_liveness_invariant():
+    """Stands in for core.physics_invariants.geoid.geoid_is_live.
+
+    That invariant lives in a pure layer and cannot load a grid itself; it
+    injects a probe and asks whether the undulation is non-zero where it must
+    be. This package supplies that probe.
+    """
+
+    def geoid_is_live(separation_probe, ref_lon=34.8, ref_lat=32.1, min_separation_m=5.0):
+        try:
+            separation = separation_probe(ref_lon, ref_lat)
+        except Exception:
+            return False, "probe raised: grid not usable"
+        if separation is None or abs(separation) < min_separation_m:
+            return False, "separation ~0: grid did not load"
+        return True, f"grid live: {separation:.3f} m"
+
+    ok, reason = geoid_is_live(MapInitializer(*JERUSALEM).separation_probe)
+    assert ok, reason
+    assert "18.9" in reason, "the hagai reference point measures 18.916 m, not 17-18 m"
+
+
+@requires_geoid_grid
+def test_orthometric_conversion_uses_the_initializer_point():
+    init = MapInitializer(*JERUSALEM)
+    assert init.orthometric_height_m(100.0) == pytest.approx(
+        100.0 - JERUSALEM_UNDULATION_M, abs=0.01
+    )
+
+
+@requires_geoid_grid
+def test_facade_resolves_priors_for_its_own_point(tiled_priors):
+    init = MapInitializer(*JERUSALEM, prior_provider=LocalFilePriorProvider(tiled_priors))
+    assert "N31_00_E035_00" in init.priors().glo30_path.name
+
+
+@requires_geoid_grid
+def test_facade_run_matches_the_pipeline_it_exposes(tiled_priors):
+    init = MapInitializer(*JERUSALEM, prior_provider=LocalFilePriorProvider(tiled_priors))
+    report = init.run()
+
+    assert report.ok, report.summary()
+    assert [s.name for s in init.pipeline().stages] == ["geoid", "priors", "calibration"]
+    assert report.stage("geoid").data["undulation_m"] == pytest.approx(
+        JERUSALEM_UNDULATION_M, abs=0.01
+    )
+
+
+def test_facade_carries_calibration_constraints_into_the_run():
+    from mapinit.calibration import SurveyedTargetConstraint
+
+    init = MapInitializer(*JERUSALEM, constraints=[SurveyedTargetConstraint(make_targets())])
+    assert init.pipeline().stages[-1].constraints, "constraints must reach CalibrationStage"
 
 
 # --------------------------------------------------------------------------
