@@ -1,0 +1,25 @@
+# The upstream OpenMV firmware tree: 2.6 GB of someone else's repository, of
+# which eleven lines are ours. Those eleven live in openmv-integration/ as a
+# patch, with instructions for reproducing the tree. See that directory's README.
+/openmv/
+
+# Build outputs
+/host/fuse
+/host/fuse-asan
+/host/libfusion.so
+/host/synth/
+*.o
+*.so
+__pycache__/
+*.pyc
+
+# Preview renders, regenerated on demand
+/captures/views/
+
+# Recorded frame pairs. One sequence is kept, deliberately: `make real` and
+# tools/test_live.py need real frames to run, and handwave3 is the sequence that
+# carries the sensor's 14 dead rows - the defect that the synthetic tests cannot
+# reproduce honestly because it was mischaracterised the first time. The other
+# nine sequences are another 26 MB of binary that git history never forgets.
+/captures/*
+!/captures/handwave3/
