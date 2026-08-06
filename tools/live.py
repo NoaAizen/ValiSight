@@ -58,9 +58,28 @@ def stream(n):
         sys.stdout.write("#F %d %d %d\n" % (j.size(), len(tb), 1 if was_torn else 0))
         for buf in (memoryview(j.bytearray()), memoryview(tb)):
             off = 0
+            stalls = 0
             while off < len(buf):
-                out.write(buf[off:off + CHUNK])
-                off += CHUNK
+                # out.write returns what the CDC actually took, and returns 0
+                # when its 500ms no-progress timeout fires - the unsent tail is
+                # then DISCARDED, never queued and never retried, with no
+                # exception. Advancing by CHUNK regardless drops those bytes
+                # while the header has already promised them, and the host reads
+                # straight into the next frame. Measured on this board: a host
+                # stall past 500ms costs exactly one CHUNK, every time.
+                w = out.write(buf[off:off + CHUNK])
+                if w:
+                    off += w
+                    stalls = 0
+                    continue
+                # Nothing moved for a full timeout. Retrying is right - that is
+                # what recovers the frame - but not forever: a host that has
+                # died must not leave this loop writing into a port nobody
+                # drains, which is what wedges the board hard enough to need a
+                # replug. Give up on the batch and let the prompt resynchronise.
+                stalls += 1
+                if stalls > 4:
+                    return
     sys.stdout.write("#BATCH\n")
 
 
@@ -471,6 +490,17 @@ def health(pipe, state, now):
     else:
         add("stream", "ok", "%.1f fps" % fps)
 
+    # --- framing. A resync means bytes went missing on the wire and a frame was
+    # dropped to get back in step. The stream survives it, which is the point,
+    # but silently surviving is how this went unnoticed for so long - a link
+    # that needs to resynchronise is not a healthy link, so say so.
+    rs = state.get("resyncs", 0)
+    if rs:
+        add("framing", "warn", "%d resync%s: %s" % (
+            rs, "" if rs == 1 else "s", state.get("last_resync", "")))
+    else:
+        add("framing", "ok", "in step")
+
     # --- VoSPI tearing. Unlike the dead rows this really is random, and a torn
     #     frame is stale data in part of the image, not a marked defect.
     win = state.get("torn_window") or []
@@ -560,6 +590,23 @@ def health(pipe, state, now):
 # ---------------------------------------------------------------- board stream
 
 
+def _board_error(raw):
+    """A real exception from the board, or a payload byte that happens to be 0x04?
+
+    The raw REPL ends stdout with \\x04, so a line starting with one is how a
+    traceback announces itself. But 0x04 occurs constantly inside JPEG and
+    thermal data, and the moment framing slips, _line() starts handing back
+    payload. Taking that at face value invents a board fault that never
+    happened - and sends you debugging firmware that is working correctly.
+    """
+    if b"Traceback" in raw:
+        return True
+    if not raw.startswith(b"\x04"):
+        return False
+    body = raw[1:].strip()
+    return bool(body) and all(c == 9 or 32 <= c < 127 for c in body)
+
+
 class Streamer(threading.Thread):
     """Reads framed board output as fast as the port will give it.
 
@@ -576,6 +623,14 @@ class Streamer(threading.Thread):
         self.batch = batch
         self.buf = bytearray()
         self.stop = threading.Event()
+        # Failure forensics. A stall reports as a bare timeout, and the counters
+        # in state are not enough to tell the two causes apart: the board going
+        # quiet mid-write looks identical to this host losing count of the #F
+        # headers and waiting for frames the board already finished sending.
+        # What separates them is the residual buffer and what was owed at the
+        # time, so keep both current.
+        self.last_line, self.last_line_t = b"", 0.0
+        self.headers, self.pending = 0, 0
 
     def _fill(self, timeout=10.0):
         deadline = time.time() + timeout
@@ -598,6 +653,7 @@ class Streamer(threading.Thread):
             if i >= 0:
                 out = bytes(self.buf[:i])
                 del self.buf[:i + 1]
+                self.last_line, self.last_line_t = out, time.time()
                 return out
             if not self._fill(timeout):
                 raise TimeoutError("no line from board")
@@ -610,13 +666,34 @@ class Streamer(threading.Thread):
         del self.buf[:n]
         return out
 
+    @staticmethod
+    def _dump(b, n=32):
+        """Head of the residual buffer as hex plus repr. Both, because what is
+        left in there is either text or binary and you do not know which in
+        advance: b'\\x04\\x04>' is legible in repr and noise in hex, the tail of
+        a half-read frame payload is the other way round."""
+        head = bytes(b[:n])
+        return "%s%s %r" % (" ".join("%02x" % c for c in head),
+                            "..." if len(b) > n else "", head)
+
     def run(self):
         try:
             self._run()
         except Exception as e:
-            self.state["error"] = "%s: %s (frames=%d, batches=%d, buf=%d)" % (
-                type(e).__name__, e, self.state.get("frames", 0),
-                self.state.get("batches", 0), len(self.buf))
+            # The counters first, then the evidence. pending is the one that
+            # decides: pending > 0 with the buffer holding the raw-REPL end
+            # marker means the batch finished and this host is owed frames that
+            # were already sent - a counting bug here, not a board fault. A
+            # partial line with pending > 0 means the board stopped mid-write.
+            since = ("%.1fs" % (time.time() - self.last_line_t)
+                     if self.last_line_t else "never")
+            self.state["error"] = (
+                "%s: %s (frames=%d, headers=%d, pending=%d, batches=%d, buf=%d)"
+                " buf[%s] last[%r] +%s" % (
+                    type(e).__name__, e, self.state.get("frames", 0),
+                    self.headers, self.pending, self.state.get("batches", 0),
+                    len(self.buf), self._dump(self.buf), self.last_line[:64],
+                    since))
         finally:
             self.release()
 
@@ -640,6 +717,41 @@ class Streamer(threading.Thread):
             pass
         finally:
             s.close()
+
+    def _traceback(self, first):
+        """The whole traceback, not just the line that tripped the check.
+
+        The one line worth having is the last one - the exception type and its
+        message - and it arrives several lines after the marker. Reporting only
+        the first names a file and says nothing about what went wrong, which is
+        how a board fault reads as a mystery.
+        """
+        deadline = time.time() + 3
+        while b"\x04\x04>" not in self.buf and time.time() < deadline:
+            if not self._fill(0.5):
+                break
+        i = self.buf.find(b"\x04\x04>")
+        end = (i + 3) if i >= 0 else len(self.buf)
+        rest = bytes(self.buf[:i if i >= 0 else len(self.buf)])
+        del self.buf[:end]
+        out = [first.lstrip("\x04")]
+        out += [ln.strip() for ln in rest.decode("utf-8", "replace").splitlines()]
+        return " | ".join(ln for ln in out if ln)
+
+    def _resync(self, why):
+        """Abandon this batch; the loop will start a clean one.
+
+        Reading on past a line that is not a header is what turns one lost chunk
+        into a dead stream. Bytes go missing on the wire, _exact() over-reads
+        into the next frame, and from then on _line() finds newlines inside
+        payloads forever - pending never returns to 0, so no further batch is
+        ever submitted and a healthy board looks like it went quiet. A batch
+        self-terminates, so its prompt is always still coming; drop the count
+        and let the top of the loop wait for it.
+        """
+        self.state["resyncs"] = self.state.get("resyncs", 0) + 1
+        self.state["last_resync"] = why
+        self.pending = 0
 
     def _range(self, lo, hi):
         """The board picks its own range by auto-ranging the scene, and it is the
@@ -697,33 +809,54 @@ class Streamer(threading.Thread):
                 self.state["ready"] = True
                 break
 
-        pending = 0
+        self.pending = 0
+        started = False
         t_prev, n = time.time(), 0
         while not self.stop.is_set():
-            if pending == 0:
+            if self.pending == 0:
                 # every submission ends with \x04\x04> - consume the prompt
-                # before handing over the next one
-                self._await(b">", 10.0)
+                # before handing over the next one. That prompt is also the only
+                # dependable sign that a batch finished: #BATCH is written just
+                # ahead of it, so _await eats the line before the loop below can
+                # ever see it - count the prompt, not the line. Match all three
+                # bytes, not a bare '>': after a resync the buffer still holds
+                # payload, and 0x3e is a perfectly ordinary byte inside a JPEG.
+                self._await(b"\x04\x04>", 30.0)
+                if started:
+                    self.state["batches"] = self.state.get("batches", 0) + 1
                 self._submit(BATCH_CODE % self.batch, timeout=20.0)
-                pending = self.batch
-            line = self._line().decode("utf-8", "replace").strip()
-            if line.startswith("\x04") or "Traceback" in line:
-                raise RuntimeError("board: " + line.lstrip("\x04"))
+                started = True
+                self.pending = self.batch
+            raw = self._line()
+            line = raw.decode("utf-8", "replace").strip()
+            if _board_error(raw):
+                raise RuntimeError("board: " + self._traceback(line))
             if line.startswith("#BATCH"):
-                pending = 0
-                self.state["batches"] = self.state.get("batches", 0) + 1
+                self.pending = 0
                 continue
             if line.startswith("#READY"):
                 p = line.split()
                 self._range(int(p[5]), int(p[6]))
                 self.state["ready"] = True
-                pending = 0
+                self.pending = 0
                 continue
             if not line.startswith("#F "):
+                self._resync("not a header: %r" % raw[:24])
                 continue
 
             jlen, tlen, torn = (int(v) for v in line.split()[1:4])
-            pending -= 1
+            # Bytes can go missing after the board has already counted them as
+            # sent - a DTR toggle from anything else opening the port makes the
+            # firmware discard what is queued, and no board-side check can see
+            # it. So the lengths here are not trustworthy just because the board
+            # meant well. A negative jlen would be worse than a wrong one:
+            # _exact's guard is vacuous for it and del buf[:-n] throws the
+            # buffer away.
+            if not (0 < jlen <= OUT_W * OUT_H and tlen == TH_W * TH_H):
+                self._resync("implausible header %r" % line[:40])
+                continue
+            self.headers += 1
+            self.pending -= 1
             jpg = self._exact(jlen)
             thermal = self._exact(tlen)
 
@@ -1046,8 +1179,10 @@ def main():
                 print("stream error: %s" % state["error"], file=sys.stderr)
                 return 1
             if args.seconds and time.time() - t0 > args.seconds:
-                print("fps %.1f, frames flowing: %s" % (
-                    state.get("fps", 0.0), state.get("frame") is not None), file=sys.stderr)
+                print("fps %.1f, frames %d, batches %d, resyncs %d, frames flowing: %s" % (
+                    state.get("fps", 0.0), state.get("frames", 0),
+                    state.get("batches", 0), state.get("resyncs", 0),
+                    state.get("frame") is not None), file=sys.stderr)
                 return 0
     except KeyboardInterrupt:
         return 0
