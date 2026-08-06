@@ -1,0 +1,17 @@
+{
+  "cam": 1,
+  "hfov": 60.0,
+  "yaw_offset": 0.0,
+  "metal_db": 45.0,
+  "fabric_db": 32.0,
+  "cfg": "iwr1843_outdoor.cfg",
+  "no_radar": false,
+  "label": null,
+  "radar_height": 0.7,
+  "start_time": 1783973635.9275281,
+  "start_stamp": "20260713_231355",
+  "end_time": 1783973649.7377098,
+  "radar_frames": 121,
+  "fusion_frames": 118,
+  "snapshots": 2
+}
