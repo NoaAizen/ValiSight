@@ -37,6 +37,7 @@ import serial
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capture  # noqa: E402  - reuse the bring-up that is known to survive
 import detect   # noqa: E402
+import radar_overlay  # noqa: E402
 
 PORT = "/dev/ttyACM0"
 LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "host", "libfusion.so")
@@ -312,6 +313,12 @@ class Pipeline:
         self.outline = False
         self.blink_period = 0.5      # seconds per half-cycle; ~2 alternations/s
         self.show_detections = True
+        self.show_radar = True
+        # The whisker is the honest width of a radar detection's vertical
+        # uncertainty. On by default precisely because the bare dot flatters the
+        # sensor: elevation comes from a two-element aperture and is the least
+        # trustworthy thing on the screen.
+        self.radar_whisker = True
 
         if args.warp:
             with open(args.warp, "rb") as fp:
@@ -969,10 +976,16 @@ class Renderer(threading.Thread):
     500ms write stall that costs a frame's tail.
     """
 
-    def __init__(self, pipe, state, work, detector=None):
+    def __init__(self, pipe, state, work, detector=None, radar=None,
+                 radar_proj=None, video=None):
         super().__init__(daemon=True)
         self.pipe, self.state, self.work = pipe, state, work
         self.stop = threading.Event()
+        # The radar overlay is drawn here rather than in compose() because it is
+        # not part of the fused image: it is a separate sensor annotated ON TOP
+        # of whichever view is showing, and it must never end up inside the
+        # frame the temperature is read from.
+        self.radar, self.radar_proj, self.video = radar, radar_proj, video
         # The detector gets its own thread and its own one-slot handoff for the
         # same reason this class exists: it is the slowest stage, and the frame
         # rate should be set by the sensor rather than by the network.
@@ -1040,6 +1053,13 @@ class Renderer(threading.Thread):
                               mix=p.mix,
                               phase=int(time.time() / p.blink_period) % 2 == 0)
 
+            # The recording feeds calibration picking, so it must not carry the
+            # guessed radar overlay or detection boxes: a pixel clicked next to
+            # a burned-in marker is a correspondence derived from the very
+            # projection being solved for. Copy before anything is drawn;
+            # radar_calib_web.py refuses frames that lack the 'clean' flag.
+            clean = rgb.copy() if self.video is not None else None
+
             if self.det_in is not None:
                 # The detector reads the plain visible luma, not the fused frame.
                 # The COCO weights were trained on natural images; a false-colour
@@ -1056,6 +1076,33 @@ class Renderer(threading.Thread):
                     # than draw a stale rectangle over a moved object.
                     if age < DETECT_STALE_S:
                         detect.annotate(rgb, dets, p.warped)
+
+            if self.radar is not None and self.pipe.show_radar:
+                fr = self.radar.get()
+                if fr is not None:
+                    d, off, al = radar_overlay.annotate(
+                        rgb, fr["points"], self.radar_proj,
+                        show_whisker=self.pipe.radar_whisker)
+                    self.state["radar_drawn"] = d
+                    self.state["radar_offscreen"] = off
+                    self.state["radar_aliased"] = al
+                    self.state["radar_frame"] = fr["frame_number"]
+                self.state["radar_frames"] = self.radar.frames
+                self.state["radar_dropped"] = self.radar.dropped_bytes
+                if self.radar.error:
+                    self.state["radar_error"] = self.radar.error
+
+            if self.video is not None:
+                # The radar frame number this picture was drawn against ties the
+                # two recordings together even if a timestamp is ever doubted.
+                self.video.write(clean, {
+                    "radar_frame": self.state.get("radar_frame"),
+                    "view": self.pipe.view,
+                    "clean": True,
+                })
+                self.state["video_frames"] = self.video.frames
+                if self.video.error:
+                    self.state["video_error"] = self.video.error
 
             ok, enc = cv2.imencode(".jpg", rgb[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
             if ok:
@@ -1878,6 +1925,18 @@ def make_handler(state, pipe):
                     pipe.outline = q.pop("outline") not in ("0", "false", "")
                 if "boxes" in q:
                     pipe.show_detections = q.pop("boxes") not in ("0", "false", "")
+                if "radar" in q:
+                    pipe.show_radar = q.pop("radar") not in ("0", "false", "")
+                if "whisker" in q:
+                    pipe.radar_whisker = q.pop("whisker") not in ("0", "false", "")
+                rp = state.get("radar_proj")
+                if rp is not None:
+                    for k in ("yaw", "pitch", "roll"):
+                        if k in q:
+                            setattr(rp, k, float(q.pop(k)))
+                    for i, k in enumerate(("tx", "ty", "tz")):
+                        if k in q:      # millimetres in the URL, metres inside
+                            rp.t[i] = float(q.pop(k)) / 1000.0
                 if "emissivity" in q or "reflected" in q:
                     eps = float(q.pop("emissivity", pipe.eps))
                     refl = float(q.pop("reflected", pipe.refl))
@@ -2031,6 +2090,28 @@ def main():
                          "against a 114ms frame period (default 416)")
     ap.add_argument("--detect-conf", type=float, default=0.35,
                     help="detection confidence threshold (default 0.35)")
+    # Radar overlay. Off unless a port is given, because live.py must keep
+    # working on a rig that has no radar attached.
+    ap.add_argument("--radar", nargs="?", const=radar_overlay.DATA_PORT, default=None,
+                    metavar="PORT",
+                    help="overlay IWR1843 detections from this DATA port "
+                         "(default %s when the flag is given bare)" % radar_overlay.DATA_PORT)
+    ap.add_argument("--radar-record", metavar="DIR",
+                    help="record the session: radar.bin, radar.jsonl and session.mp4. "
+                         "This is what an offline calibration is solved against")
+    ap.add_argument("--radar-hfov", type=float, default=70.0, metavar="DEG",
+                    help="assumed horizontal FOV used to guess the focal length when no "
+                         "solved intrinsics exist (default 70). DESIGN.md:239 records this "
+                         "as UNVERIFIED and the measured triple implies 63.8")
+    ap.add_argument("--radar-calib", metavar="JSON",
+                    help="solved intrinsics/extrinsics to project with, instead of the guess")
+    ap.add_argument("--view", default="fused",
+                    choices=["fused", "visible", "blink", "mix", "edges"],
+                    help="view to start in, and therefore what gets recorded. "
+                         "For picking a pixel off the recording, see the note in "
+                         "radar_correspond.py: the thermal layer is NOT registered "
+                         "until a warp LUT exists, so a pixel taken from the thermal "
+                         "content carries that unknown offset into the extrinsic")
     ap.add_argument("--seconds", type=int, default=0, help="exit after N seconds (for tests)")
     args = ap.parse_args()
 
@@ -2053,6 +2134,7 @@ def main():
         raise SystemExit("%s missing - run 'make libfusion.so' in host/" % LIB)
 
     pipe = Pipeline(args)
+    pipe.view = args.view
     state = {}
 
     detector = None
@@ -2071,7 +2153,25 @@ def main():
             raise SystemExit("detector model missing: %s" % e)
 
     work = Latest()
-    render = Renderer(pipe, state, work, detector)
+    radar = radar_proj = video = None
+    if args.radar:
+        radar = radar_overlay.RadarReader(args.radar, record_dir=args.radar_record)
+        radar.start()
+        radar_proj = radar_overlay.Bootstrap(OUT_W, OUT_H, hfov_deg=args.radar_hfov,
+                                             calib_path=args.radar_calib)
+        state["radar_proj"] = radar_proj
+        print("radar overlay: %s, intrinsics from %s, f=%.1f px"
+              % (args.radar, radar_proj.source, radar_proj.f), file=sys.stderr)
+        if not args.radar_calib:
+            print("  the projection is a GUESS until radar_extrinsics is solved - "
+                  "nudge it with /set?yaw=..&pitch=..&tz=..", file=sys.stderr)
+        if args.radar_record:
+            video = radar_overlay.SessionVideo(
+                os.path.join(args.radar_record, "session.mp4"))
+            print("recording to %s/" % args.radar_record, file=sys.stderr)
+
+    render = Renderer(pipe, state, work, detector, radar=radar,
+                      radar_proj=radar_proj, video=video)
     render.start()
     stream = Streamer(args.port, pipe, args.quality, state, work)
     stream.start()

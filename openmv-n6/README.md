@@ -31,6 +31,7 @@ Full design notes and every measurement behind the decisions: [DESIGN.md](DESIGN
 | `host/` | harness that runs the same C over recorded frames, plus the test suites |
 | `tools/` | `capture.py` (board -> disk), `live.py` (live viewer), `mpx.py` (raw REPL) |
 | `tools/calib/` | OpenCV stereo calibration -> warp LUT, and a hand-wave fallback |
+| `radar/` | the IWR1843 mmWave path: TLV parser, 10 fps config, link gate. [radar/README.md](radar/README.md) |
 | `openmv-integration/` | the eleven lines that add the module to the firmware tree |
 | `captures/handwave3/` | 18 real frame pairs, kept so the real-data tests can run |
 
