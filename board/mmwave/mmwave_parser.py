@@ -34,6 +34,10 @@ class FrameSync:
     Framing is trusted only when totalPacketLen closes onto the next magic
     word (or the exact end of buffered data) — a magic word alone proves
     nothing, since the pattern can occur inside a payload.
+
+    Offline replay MUST feed in UART-sized chunks (<= a few KB): feeding a
+    whole recording at once trips the max_buffer front-drop and silently
+    discards everything but the last 64 KB.
     """
 
     def __init__(self, max_buffer=64 * 1024, max_frame=16 * 1024):
@@ -127,15 +131,19 @@ def walk_tlvs(frame):
     """Stage 3: return ([(type, payload_bytes), ...], length_mode).
 
     length_mode is 'payload' or 'includes_header' — decided empirically:
-    the interpretation that makes the walk land exactly on totalPacketLen
-    (allowing <32 bytes of zero padding) wins. Raises ValueError if
-    neither closes the frame.
+    an interpretation that makes the walk land exactly on totalPacketLen
+    wins outright; failing that, one that lands within the <32-byte pad
+    region is accepted. Padding CONTENT proves nothing: the demo firmware
+    pads from uninitialized memory, not zeros (385/451 frames in
+    aliasing_walk_20260810/radar_raw.bin carry non-zero padding).
+    Raises ValueError if neither mode closes the frame.
     """
     hdr = parse_header(frame)
     total = hdr['total_len']
     if total > len(frame):
         raise ValueError('frame shorter than totalPacketLen')
 
+    padded = None
     for mode in ('payload', 'includes_header'):
         tlvs = []
         off = _MIN_FRAME
@@ -153,11 +161,13 @@ def walk_tlvs(frame):
             off += 8 + plen
         if not ok:
             continue
-        tail = bytes(frame[off:total])
-        if off == total or (len(tail) < _MAX_PAD and
-                            tail == b'\x00' * len(tail)):
+        if off == total:
             return tlvs, mode
+        if total - off < _MAX_PAD and padded is None:
+            padded = (tlvs, mode)
 
+    if padded is not None:
+        return padded
     raise ValueError('TLV walk does not close the frame')
 
 

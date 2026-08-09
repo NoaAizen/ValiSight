@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+board/mmwave_stage1_raw_uart
