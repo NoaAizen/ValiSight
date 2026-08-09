@@ -123,6 +123,55 @@ typedef struct {
     int deadrow_flat;     /* max spread across a row for it to count as empty. 0 disables */
     int deadrow_lift;     /* codes above the frame median such a row must sit */
 
+    /*
+     * Temporal noise filtering. See fusion_thermal_temporal() for the kernel and
+     * why it is motion-adaptive rather than a plain IIR.
+     *
+     * temporal_noise_mc is the sensor's per-pixel temporal noise in
+     * milli-Celsius - NOT the NETD. Measured on this board over ~13000 frames:
+     * NETD is 33 mK, but the common-mode-removed temporal spread is 126-148 mK,
+     * 4x worse, and that larger figure is what a per-pixel filter actually has
+     * to discriminate against. Default 148, the pessimistic end of the measured
+     * range: setting it too low leaks noise through, too high smears real
+     * detail, and leaking is the cheaper mistake.
+     *
+     * It is stated in temperature rather than in codes on purpose. capture.py
+     * re-picks the sensor range every session to buy resolution (0.588 ->
+     * 0.141 C/LSB measured), so a knee expressed in raw codes would silently
+     * mean a different temperature from one session to the next. This is the
+     * same reasoning that makes fusion_set_range() exist at all - and it means
+     * whoever sets the range on the sensor must set it here too, or the filter
+     * is tuned for a span the sensor is not using.
+     *
+     * temporal_frames is the equivalent number of frames averaged on a static
+     * scene. 8 gives a noise reduction of ~3.9x (exponential smoothing with
+     * alpha = 1/8 has variance ratio alpha/(2-alpha) = 0.067). Note that this
+     * beats an 8-frame boxcar's 2.8x while costing one buffer instead of eight.
+     *
+     * 0 in either field disables the thermal filter.
+     */
+    int temporal_noise_mc;
+    int temporal_frames;
+
+    /*
+     * The same filter on the visible luma. Knee is in 8-bit luma codes directly:
+     * there is no radiometric mapping to respect here, and read noise on a lit
+     * scene is a few codes.
+     *
+     * This one is off by default because it costs an out_w*out_h buffer -
+     * 256KB at 640x400, allocated only when enabled. DESIGN.md section 11 found
+     * that placement in internal SRAM, not arithmetic, is what decides
+     * performance on this part, so a quarter-megabyte is not a rounding error
+     * and should be opted into rather than inherited.
+     *
+     * Worth enabling for the case it was written for: dark electrical cabinets
+     * and machine rooms, where the detail layer amplifies sensor noise exactly
+     * as hard as it amplifies edges, and injecting a noisy high-pass makes the
+     * fused image worse than not injecting one at all.
+     */
+    int y_temporal_knee;
+    int y_temporal_frames;
+
     int show_uncovered;   /* 1: draw plain grey where thermal has no coverage */
     int out_rgb565;       /* 1: write uint16 RGB565 instead of packed RGB888 */
 } fusion_cfg_t;
@@ -153,6 +202,29 @@ typedef struct {
     int32_t  tmin_mc, tmax_mc;    /* sensor range endpoints, milli-Celsius */
     int32_t  eps_q10;             /* emissivity, 1024 = 1.0 */
     int32_t  refl_mc;             /* reflected background temperature, milli-C */
+
+    /*
+     * Temporal filter state: the *filtered* previous frame, which is what makes
+     * one buffer behave like an N-frame average.
+     *
+     * Held in Q8, not 8-bit, and that is not an optimisation - an IIR whose
+     * state carries no more precision than its input stalls outright once the
+     * blend weight drops below about 1/4. See temporal_blend_q8() in fusion.c.
+     *
+     * Cost: 38KB for the thermal history (always, when the filter is on) and
+     * 768KB for the visible one - 512KB of Q8 state plus a 256KB 8-bit plane to
+     * hand back to fusion_process(). That is why the visible filter is opt-in.
+     */
+    uint16_t *t_prev;
+    uint16_t *y_prev;
+    uint8_t  *y_out;
+    int      t_prev_valid;
+    int      y_prev_valid;
+    int      temporal_moved;      /* thermal pixels that took the motion path
+                                     this frame. Sustained high means the filter
+                                     is buying nothing and the scene is alive;
+                                     sustained zero on a live scene means the
+                                     knee is too wide and detail is being eaten. */
 
     uint8_t  *row_bad;            /* th_h flags: this row was reconstructed */
     int      rows_rebuilt;        /* how many, this frame. A jump here is the
@@ -190,12 +262,20 @@ void fusion_free(fusion_t *f);
  *    cameras into the mapping - a homography alone cannot express that.
  *
  * Entries are Q8 thermal coordinates; either component FUSION_INVALID marks a
- * pixel with no thermal coverage.
+ * pixel with no thermal coverage. Q8 in a uint16 tops out at 255.996, so the
+ * format is only valid for th_w, th_h <= 256 - fusion_init() enforces that
+ * rather than letting a larger core wrap silently.
+ *
+ * fusion_set_warp() validates as it copies: an entry that would sample outside
+ * the thermal frame becomes FUSION_INVALID, and the return value is how many
+ * did. Zero means the table agrees with this pipeline's geometry; anything else
+ * means the calibration was built for a different one and is worth reporting,
+ * because the picture will still look plausible where coverage was dropped.
  */
 #if FUSION_ENABLE_HOMOGRAPHY
 void fusion_set_homography(fusion_t *f, const double H[9]);
 #endif
-void fusion_set_warp(fusion_t *f, const uint16_t *warp);
+int  fusion_set_warp(fusion_t *f, const uint16_t *warp);
 
 /* 256-entry RGB palette. NULL restores the built-in ironbow. */
 void fusion_set_palette(fusion_t *f, const uint8_t (*palette)[3]);
@@ -226,6 +306,71 @@ extern uint8_t fusion_blackhot[256][3];
  *   out     packed RGB888 (out_w*out_h*3), or RGB565 uint16 if cfg.out_rgb565
  */
 void fusion_process(fusion_t *f, const uint8_t *y, const uint8_t *thermal, uint8_t *out);
+
+/* ------------------------------------------------------- temporal noise filter
+ *
+ * A motion-adaptive temporal IIR, run on the thermal frame between
+ * fusion_thermal_prep() and the warp - which is where DESIGN.md's pipeline
+ * diagram has always put it.
+ *
+ * Per pixel, against the previous *filtered* frame:
+ *
+ *     d = |cur - prev|
+ *     d >= 2*knee   ->  out = cur                        (motion: pass through)
+ *     else          ->  w ramps knee_w .. 256 with d
+ *                       out = (w*cur + (256-w)*prev) >> 8
+ *
+ * Why adaptive rather than a plain IIR: a fixed blend smears anything that
+ * moves, and on an inspection image a smear does not look like an artefact, it
+ * looks like a thermal gradient. That is a worse failure than the noise it
+ * removes, because it is plausible. Gating on the per-pixel delta means a
+ * static wall gets the full N-frame average while a moving hand gets none.
+ *
+ * Two consequences worth knowing:
+ *
+ *  - It is inherently FFC-tolerant. An FFC steps the whole frame by 0.75-0.99C
+ *    (measured), which is far past the knee everywhere at once, so every pixel
+ *    takes the motion path and the step passes through in one frame. A plain
+ *    IIR would have dragged it out over the 30-60 frames the sensor already
+ *    needs to settle. fusion_temporal_reset() is still the correct thing to
+ *    call on a detected FFC - this is a safety net, not the mechanism.
+ *
+ *  - It filters the *measurement*, not just the picture. fusion_temp_at() reads
+ *    t_prep, so a static target is quoted from an N-frame average. That is the
+ *    right answer for inspection - but it does mean a reading is no longer
+ *    instantaneous, and a target that has just moved carries one frame of the
+ *    old value at the pixels the motion gate did not catch.
+ *
+ * Cheap: 19200 pixels, one pass, no allocation beyond the one frame buffer.
+ */
+void fusion_thermal_temporal(fusion_t *f);
+
+/*
+ * The same kernel on the visible luma, at full resolution.
+ *
+ * Returns the filtered frame to hand to fusion_process(), or `y` unchanged when
+ * the filter is disabled - so the call site is the same either way:
+ *
+ *     fusion_process(f, fusion_y_temporal(f, y), thermal, out);
+ *
+ * Kept caller-driven rather than folded into fusion_process() so that the
+ * visible camera can be filtered at its own rate. There are ~13 PAG7936 frames
+ * free between two Lepton frames (0.2ms against 113ms, measured), and feeding
+ * all of them through this is what turns that idle time into SNR.
+ */
+const uint8_t *fusion_y_temporal(fusion_t *f, const uint8_t *y);
+
+/*
+ * Drop both histories. Call on a detected FFC, on a range change, and after any
+ * gap in the stream - anything that makes the previous frame a statement about
+ * a different sensor state rather than a noisier look at the same one.
+ *
+ * The FFC detector is a timing rule and lives in the caller: the sensor does not
+ * deliver a flat shutter frame, it stops delivering for 1824ms against a steady
+ * inter-frame interval of 114ms (measured, 15.9x margin). fusion.c has no clock
+ * and should not grow one.
+ */
+void fusion_temporal_reset(fusion_t *f);
 
 /* ------------------------------------------------------------------ radiometry
  *

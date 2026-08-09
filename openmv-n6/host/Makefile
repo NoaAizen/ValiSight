@@ -1,7 +1,7 @@
 CC      ?= cc
 # _POSIX_C_SOURCE: strict c99 hides clock_gettime, which the bench path needs
 CFLAGS  ?= -std=c99 -D_POSIX_C_SOURCE=199309L -O2 -Wall -Wextra -Wno-unused-parameter -I../src
-LDFLAGS ?=
+LDFLAGS ?= -lm
 
 SRC := main.c ../src/fusion.c
 BIN := fuse
@@ -29,6 +29,18 @@ test: $(BIN) asan
 		--range 20,45 --emissivity 0.1 --reflected 18 --stats --probe 400,125
 	./$(BIN)-asan synth/y.raw synth/thermal_hot.raw synth/out.ppm --warp synth/warp.lut \
 		--stats --probe 0,0
+	# A warp table that is the right size and points off the thermal frame. This
+	# read past the frame until fusion_set_warp() started range-checking; the
+	# table is the one input built by a separate toolchain, so it is the one that
+	# has to be validated rather than trusted.
+	./$(BIN)-asan synth/y.raw synth/thermal.raw synth/out.ppm --warp synth/warp_bad.lut \
+		--stats --probe 320,200
+	# The temporal filters under the sanitizers. Both histories are carried
+	# across frames, so a one-shot run would never touch the update path at all -
+	# --frames is what makes this a real exercise.
+	./$(BIN)-asan synth/y.raw synth/thermal.raw synth/out.ppm --warp synth/warp.lut \
+		--range 20,40 --temporal 8 --noise 3 --frames 25 \
+		--y-temporal 6,8 --y-noise 4 --stats --probe 400,125
 	./$(BIN) synth/y.raw synth/thermal.raw synth/out.ppm --warp synth/warp.lut --bench 20
 	python3 verify.py
 

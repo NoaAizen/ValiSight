@@ -58,7 +58,27 @@ lep = csi.CSI(cid=LEP)
 # configure lepton".
 lep.reset(hard=False)
 lep.pixformat(csi.GRAYSCALE)
-lep.ioctl(csi.IOCTL_LEPTON_SET_MODE, True, True)
+# SET_MODE(a, b) is (measurement_mode, high_temp_mode) - the SECOND argument is
+# not radiometry. Radiometry comes from the first (LEP_SetRadEnableState); the
+# second selects LEP_SYS_GAIN_MODE_LOW (lepton.c:307). Passing True there ran the
+# part in LOW gain, which is what every frame recorded before 2026-08-09 was shot
+# in. Confirmed 2026-08-06 by reading GAIN_MODE (CID 0x0248) back: 1 = LOW.
+#
+# HIGH gain from here on. Low gain bought a 600C ceiling this project never uses
+# (0.5-2m electrical inspection) and gave up the tighter accuracy spec for it. It
+# costs no noise either way - NETD measured identical in both modes - so the
+# ceiling was the only thing being traded, and it was not worth having.
+#
+# The pairing with SET_RANGE below is the part to keep in view, and it is safe at
+# the default: SET_RANGE clamps to the ceiling of whichever gain mode is active,
+# and the clamp was measured on the board 2026-08-09 at 140C high / 200C+ low.
+# The default range is -10..140, exactly the high-gain ceiling, so it survives the
+# switch untouched. Ask for more than 140 here and you will silently get 140.
+lep.ioctl(csi.IOCTL_LEPTON_SET_MODE, True, False)
+# Must come AFTER SET_MODE, and does not touch I2C at all - it only writes two
+# host-side floats. It also clamps silently, to a limit that depends on the gain
+# mode just set (measured: 140C in high gain, 600C in low), and silently reorders
+# an inverted pair. Requesting 143 in high gain returns 140 with no error.
 lep.ioctl(csi.IOCTL_LEPTON_SET_RANGE, TMIN, TMAX)
 lep.framesize(csi.QQVGA)
 time.sleep_ms(2000)
@@ -72,30 +92,124 @@ lep.snapshot()                      # absorb the ~1.7s VoSPI sync frame
 # everywhere else - a real scene edge can sit anywhere, a tear only ever sits on
 # a boundary. Costs ~4800 byte reads per frame, which is nothing at 8.7Hz.
 SEG = 30
+STEP = 4
+
+# This runs on every thermal frame forever, so it must allocate NOTHING. Measured
+# 2026-08-09: the original built three Python lists per call and cost 3728 B/frame
+# of the 3888 B/frame the whole stream loop leaked - 96% of it. At 8.8fps that
+# exhausts the ~25MB heap in about eleven minutes, and what ends the run is not
+# the exhaustion itself but the emergency gc.collect() it triggers: a collect on
+# this board costs 1.06s whatever the garbage (it scales with heap size, and the
+# heap is external SDRAM), the Lepton delivers every 114ms, and its queue backs up
+# and raises "Frame buffer overflow". A 5892-frame run died exactly there.
+#
+# So: fixed buffers filled in place, and integer sums rather than float means.
+# Storing a small int into a list is allocation-free in MicroPython; storing a
+# float boxes it, and 120 boxed floats per frame was most of the leak. Working in
+# sums just scales both sides of the test by the sample count, so the thresholds
+# below carry that factor and the verdict is unchanged.
+_ROWSUM = None
+_JUMPS = None
+_SORTBUF = None
 
 
-def _row_means(b, w, h, step=4):
-    out = []
-    for y in range(h):
-        base = y * w
-        s = 0
-        for x in range(0, w, step):
-            s += b[base + x]
-        out.append(s / (w // step))
-    return out
+def _alloc_tear_buffers(h):
+    global _ROWSUM, _JUMPS, _SORTBUF
+    _ROWSUM = [0] * h
+    _JUMPS = [0] * (h - 1)
+    _SORTBUF = [0] * (h - 1)
 
 
 def is_torn(img):
     b = img.bytearray()
-    w, h = img.width(), img.height()
-    rm = _row_means(b, w, h)
-    jumps = [abs(rm[i + 1] - rm[i]) for i in range(h - 1)]
-    boundaries = [jumps[i - 1] for i in range(SEG, h, SEG) if i - 1 < len(jumps)]
-    if not boundaries:
+    w = img.width()
+    h = img.height()
+    ns = w // STEP
+
+    # while, not `for x in range(...)`: a range object is allocated per loop, and
+    # at one per row that was 120 of them a frame - measured at 1920 B/frame, the
+    # entire remainder of the leak once the lists were gone. The outer loops below
+    # build one range each and are left alone.
+    rs = _ROWSUM
+    y = 0
+    while y < h:
+        base = y * w
+        end = base + w
+        s = 0
+        x = base
+        while x < end:
+            s += b[x]
+            x += STEP
+        rs[y] = s
+        y += 1
+
+    jm = _JUMPS
+    for i in range(h - 1):
+        d = rs[i + 1] - rs[i]
+        jm[i] = d if d >= 0 else -d
+
+    # The seam only ever lands on a segment boundary; a real scene edge can sit
+    # anywhere. Worst boundary step, without building a list to hold them.
+    worst = -1
+    i = SEG
+    while i < h:
+        k = i - 1
+        if k < h - 1 and jm[k] > worst:
+            worst = jm[k]
+        i += SEG
+    if worst < 0:
         return False
-    ordered = sorted(jumps)
-    typical = ordered[len(ordered) // 2]
-    return max(boundaries) > max(6.0, 5.0 * typical)
+
+    sb = _SORTBUF
+    for i in range(h - 1):
+        sb[i] = jm[i]
+    sb.sort()                       # in place: no copy, unlike sorted()
+    typical = sb[(h - 1) // 2]
+
+    # 5x the typical step, floored - the floor is the old 6.0 threshold on means,
+    # carried into sums by the ns factor that is deliberately never divided out.
+    thr = 5 * typical
+    floor = 6 * ns
+    if thr < floor:
+        thr = floor
+    return worst > thr
+
+
+# THE INVARIANT THIS LOOP MUST HOLD: never call gc.collect() while the Lepton is
+# up. Not "keep up with the frame rate" - the collect itself is the hazard.
+#
+# Measured directly 2026-08-09, because the obvious theory was wrong and cost an
+# afternoon. Plain delays between snapshots are harmless: 150, 300, 600, 1000,
+# 1500 and 2500ms gaps via time.sleep_ms() all returned a frame afterwards. The
+# sensor does not care that nobody collected its output. But a gc.collect() of
+# 1.066s wedges it immediately, every time, and the collect costs that 1.06s
+# whatever the garbage - it scales with heap size, and the heap is 25MB of
+# external SDRAM. So it is the collect, not the pause.
+#
+# The wedge is PERMANENT within the process. Against a wedged sensor these were
+# all tried and all raised:
+#   - 60 retries over 7.2s of waiting
+#   - re-arming with framesize(csi.QQVGA)
+#   - a full soft re-init: reset(hard=False) + pixformat + SET_MODE + SET_RANGE
+#     + framesize + 2s VoSPI settle
+# The PAG7936 keeps delivering 640x400 throughout, so this is the Lepton's buffer
+# specifically and not the board running out of memory. Only tearing the whole
+# bring-up down and running it again brings it back - the host's job, not this
+# loop's, so there is deliberately no retry here. A retry costs a second and
+# cannot work.
+#
+# That makes prevention the entire defence, and prevention means the automatic
+# collector must never fire. Hence is_torn() above allocating nothing: it was
+# 3728 B/frame of the loop's 3888, which filled the heap in about eleven minutes
+# and ended a 5892-frame run with exactly this fault. The loop now leaks ~208
+# B/frame, which is roughly 3.7 hours - better, still bounded, so a session
+# meant to outlive that needs the host to restart the bring-up on purpose rather
+# than be surprised by it.
+#
+# FFC is NOT this failure and must not be confused with it: the sensor stops
+# delivering for 1824ms every ~183s, but snapshot() blocks, so the consumer is
+# still parked in the driver. A 5892-frame run spans 3.7 FFC intervals and did
+# not die at the first one.
 
 
 def good_snapshot(csi_dev, tries=6):
@@ -108,6 +222,9 @@ def good_snapshot(csi_dev, tries=6):
     return img, True
 
 
+_alloc_tear_buffers(lep.height())
+
+
 if __AUTORANGE__:
     # Percentile clip off a real histogram. Two summary-statistic attempts failed
     # here: min/max let a few hot pixels stretch the range fivefold (40 of 255
@@ -116,10 +233,51 @@ if __AUTORANGE__:
     # the scene while letting a genuinely hot target saturate, which is the
     # behaviour you want on an inspection camera anyway.
     _b = lep.snapshot().bytearray()
+    _W, _H = lep.width(), lep.height()
+
+    # Condemn the lifted rows BEFORE building the histogram, or they decide it.
+    # This part intermittently kills 14 rows and holds them for the session, at
+    # a fixed high offset - so they are 14/120 = 11.67% of the pixels sitting at
+    # the TOP of the distribution, and any percentile above the 88.33rd must
+    # land inside them. That is arithmetic: no choice of clip point avoids it,
+    # and the comment above about outliers does not apply to a population this
+    # size. Measured on the recorded frames, _pct(0.995) read 242 with them in
+    # and 106 with them out - the range came out more than twice as wide as the
+    # scene needed, costing ~4x of the resolution this whole narrow-range
+    # exercise exists to buy. Flat AND lifted, the same test repair_rows uses in
+    # fusion.c: a threshold on brightness alone misses them before they clip.
     _h = [0] * 256
-    for _i in range(0, len(_b), 3):
-        _h[_b[_i]] += 1
-    _n = sum(_h)
+    _rlo, _rhi, _rsum = [255] * _H, [0] * _H, [0] * _H
+    for _y in range(_H):
+        _o = _y * _W
+        _lo, _hi, _s = 255, 0, 0
+        for _x in range(_W):
+            _v = _b[_o + _x]
+            _h[_v] += 1
+            _s += _v
+            if _v < _lo:
+                _lo = _v
+            if _v > _hi:
+                _hi = _v
+        _rlo[_y], _rhi[_y], _rsum[_y] = _lo, _hi, _s
+
+    _n = _W * _H
+    _c, _median = 0, 0
+    for _k in range(256):
+        _c += _h[_k]
+        if _c * 2 >= _n:
+            _median = _k
+            break
+
+    _dead = 0
+    for _y in range(_H):
+        if _rhi[_y] - _rlo[_y] <= 24 and (_rsum[_y] // _W) - _median >= 64:
+            _o = _y * _W
+            for _x in range(_W):
+                _h[_b[_o + _x]] -= 1       # out of the histogram, not repaired
+            _dead += 1
+    _n -= _dead * _W
+    sys.stdout.write("#DEADROWS %d\n" % _dead)
 
     def _pct(f):
         target = _n * f
@@ -136,16 +294,25 @@ if __AUTORANGE__:
     pad = max(1.5, (hi - lo) * 0.10)
     lo, hi = lo - pad, hi + pad
 
-    # Floor the span at the sensor's own noise. Lepton 3.5 NETD is ~50mK, so a
-    # range finer than 255 * 0.05 = 12.75C is not resolving temperature any more,
-    # it is just displaying NETD noise at full contrast - which is what made a
-    # flat wall look torn. Tightening past the noise floor buys nothing.
-    NETD_C = 0.05
+    # Floor the span at the sensor's own noise. Measured on this part 2026-08-06
+    # over 250-frame runs: NETD is 33mK, not the ~50mK the datasheet implies, and
+    # it is the same in both gain modes (33.0 high / 34.5 low; three runs landed
+    # in 32-35mK). So the floor is 255 * 0.033 = 8.4C - below that the range is
+    # no longer resolving temperature, it is displaying NETD noise at full
+    # contrast, which is what made a flat wall look torn.
+    #
+    # This is a noise floor, not an accuracy floor. Over the same runs the
+    # common-mode-removed temporal spread was 126-148mK, so two readings seconds
+    # apart agree only to ~0.15C. A finer range is not a finer measurement.
+    NETD_C = 0.033
     span_min = 255.0 * NETD_C
     if hi - lo < span_min:
         mid = (hi + lo) / 2.0
         lo, hi = mid - span_min / 2.0, mid + span_min / 2.0
-    TMIN, TMAX = int(lo), int(hi) + 1
+    # floor, not truncate: int() rounds toward zero, so a negative lo would move
+    # UP and narrow the range on the cold side - the one direction that clips
+    # real scene content rather than padding it.
+    TMIN, TMAX = int(lo // 1), int(hi // 1) + 1
     lep.ioctl(csi.IOCTL_LEPTON_SET_RANGE, TMIN, TMAX)
     time.sleep_ms(300)
     lep.snapshot()
@@ -172,7 +339,10 @@ for i in range(__NPAIRS__):
         with open("__DIR__/%04d_rgb%d.raw" % (i, b), "wb") as f:
             f.write(rgb.snapshot().bytearray())
     sys.stdout.write("#REC %d\n" % i)
-    gc.collect()
+    # No gc.collect() here, deliberately. It wedges the Lepton - see the invariant
+    # above good_snapshot(). This loop is bounded by __NPAIRS__ rather than running
+    # forever, so it does not need one; RAM_CODE below collects after its loop, and
+    # that is the pattern to copy.
 
 # No shutdown(True): OMV_CSI_POWER_PIN is shared, so powering one sensor down
 # cuts the other, and the second shutdown then talks I2C to an unpowered part.
@@ -276,8 +446,9 @@ for i in range(__NPAIRS__):
     emit("thermal", t)
     for b in range(__BURST__):
         emit("rgb%d" % b, rgb.snapshot())
-    gc.collect()
+    # No gc.collect() here either - it wedges the Lepton. See good_snapshot().
 sys.stdout.write("#DONE\n")
+gc.collect()
 '''
 
 # ---------------------------------------------------------------- transport

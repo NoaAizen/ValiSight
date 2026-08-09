@@ -1,0 +1,12 @@
+# Python bytecode. Regenerated on every run; never worth committing.
+__pycache__/
+*.py[co]
+
+# Local virtualenvs and editor state
+.venv/
+venv/
+.vscode/
+.idea/
+
+# The OpenMV project keeps its own .gitignore under openmv-n6/ - build outputs,
+# the 2.6 GB upstream firmware tree, and recorded frame pairs are handled there.

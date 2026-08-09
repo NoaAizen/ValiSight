@@ -56,6 +56,78 @@ def fuse(out, thermal="synth/thermal.raw", *extra):
     return r.stdout
 
 
+def thermal_noise(frames=8, noise=2, nframes=80, *extra):
+    """RMS of the filtered thermal plane against the clean frame, in codes, plus
+    how many pixels took the motion path on the last frame.
+
+    Measured on the thermal plane rather than the fused image on purpose: the
+    guided filter averages ~(2r+1)^2 low-res samples, so by the output the
+    temporal filter's contribution is buried under a spatial one and the number
+    is meaningless. This is also the plane fusion_temp_at() quotes from."""
+    out = fuse("synth/temporal.ppm", "synth/thermal.raw",
+               "--range", "20,40", "--gain", "0",
+               "--temporal", str(frames), "--noise", str(noise),
+               "--frames", str(nframes), *extra)
+    line = [l for l in out.splitlines() if l.startswith("thermal noise:")][0]
+    rms = float(line.split()[2])
+    moved = int(line.split("frame(s),")[1].split()[0])
+    return rms, moved
+
+
+def check_temporal():
+    """The temporal filter: does it remove noise, does it keep working as it is
+    asked to smooth harder, does the motion gate gate, and does it leave the
+    measurement alone."""
+
+    off, _ = thermal_noise(frames=1)
+    on, moved = thermal_noise(frames=8)
+    check("temporal filter cuts thermal noise", on < off / 2.0,
+          "%.3f -> %.3f codes rms (%.1fx)" % (off, on, off / max(on, 1e-9)))
+
+    # A static scene must not be reading as motion, or the filter is doing
+    # nothing and the reduction above came from somewhere else.
+    check("static scene does not trip the motion gate", moved < 100,
+          "%d of 19200 px" % moved)
+
+    # The regression test for the stall. An IIR held at input precision quietly
+    # stops converging once the blend weight drops past ~1/4: the first version
+    # measured 2.0x at 4 frames, 1.2x at 8 and exactly 1.0x at 16 and 32. The
+    # bug's whole signature is non-monotonicity, so that is what is asserted -
+    # a single-point check at 8 frames would have passed it.
+    series = [thermal_noise(frames=n)[0] for n in (2, 4, 8, 16)]
+    check("more frames means less noise, monotonically",
+          all(b < a for a, b in zip(series, series[1:])),
+          " -> ".join("%.3f" % v for v in series))
+
+    # The gate is specified in milli-Celsius, so the same noise in codes must be
+    # judged differently when the sensor range changes - that is the entire
+    # reason it is not stated in codes. At -10..140C one code is 0.588C, so 2
+    # codes of noise is a large excursion and belongs on the motion path; at
+    # 20..40C the same 2 codes is 0.157C and is squarely noise.
+    def moved_at(rng):
+        out = fuse("synth/temporal_%s.ppm" % rng.replace(",", "_"), "synth/thermal.raw",
+                   "--range", rng, "--gain", "0", "--temporal", "8",
+                   "--noise", "2", "--frames", "40")
+        line = [l for l in out.splitlines() if l.startswith("thermal noise:")][0]
+        return int(line.split("frame(s),")[1].split()[0])
+
+    narrow, wide = moved_at("20,40"), moved_at("-10,140")
+    check("the motion gate follows the sensor range, not the codes",
+          wide > 1000 and wide > 10 * max(narrow, 1),
+          "%d px moved at -10..140C vs %d at 20..40C" % (wide, narrow))
+
+    # The filter sits upstream of the radiometry, so a clean static scene must
+    # come back with the same temperature filtered or not. If it does not, the
+    # filter is biasing the measurement rather than denoising it.
+    t_off = probe("synth/temporal_r0.ppm", "synth/thermal.raw", 400, 125,
+                  "--range", "20,45", "--temporal", "1", "--frames", "20")
+    t_on = probe("synth/temporal_r1.ppm", "synth/thermal.raw", 400, 125,
+                 "--range", "20,45", "--temporal", "8", "--frames", "20")
+    check("filter does not shift a clean static reading",
+          abs(t_off["c"] - t_on["c"]) < 0.05,
+          "%.3f vs %.3f C" % (t_off["c"], t_on["c"]))
+
+
 def probe(out, thermal, x, y, *extra):
     line = [l for l in fuse(out, thermal, "--probe", "%d,%d" % (x, y), *extra).splitlines()
             if l.startswith("probe")][0]
@@ -296,6 +368,9 @@ def main():
     # 8. the sensor defect, and the measurement path that has to survive it
     check_row_repair(meta)
     check_radiometry(meta)
+
+    # 9. the temporal noise filter
+    check_temporal()
 
     print()
     if FAILS:

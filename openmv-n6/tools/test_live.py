@@ -38,10 +38,17 @@ def check(name, ok, detail=""):
 
 
 class Args:
-    """Stands in for the argparse namespace Pipeline expects."""
+    """Stands in for the argparse namespace Pipeline expects.
+
+    Add a field here whenever live.py grows a --flag that Pipeline reads, or this
+    stub raises AttributeError before the first check runs.
+    """
     gain, eps, radius, agc = 200, 200, 4, 0
     palette, warp = "ironbow", None
     emissivity, reflected = 1.0, 20.0
+    # Off, matching fusion_default_cfg: the mirror check below compares layouts,
+    # and the 768KB the visible filter allocates has nothing to do with that.
+    y_knee, y_frames = 0, 8
 
 
 def load_pair(d):

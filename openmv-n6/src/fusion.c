@@ -192,6 +192,17 @@ void fusion_decimate(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, i
  * four neighbours, but only when they differ from it by more than a threshold,
  * so genuine small hot targets survive.
  */
+/*
+ * Divide rounding to nearest, for a positive divisor and either sign of
+ * numerator. C99 truncates toward zero, which biases every quotient toward the
+ * origin; where the quotients are then accumulated (the VoSPI seam offsets) the
+ * bias compounds instead of averaging out.
+ */
+static int32_t rdiv(int32_t num, int32_t den)
+{
+    return num >= 0 ? (num + den / 2) / den : -((-num + den / 2) / den);
+}
+
 static uint8_t med4(int a, int b, int c, int d)
 {
     int t;
@@ -302,6 +313,54 @@ static void repair_rows(const fusion_t *f, uint8_t *dst, uint8_t *row_bad, int *
     }
 }
 
+/*
+ * The DC step across one VoSPI segment boundary, in Q8 codes.
+ *
+ * Two rows either side - enough to see the step, short enough that a scene
+ * gradient barely registers - but reduced with a median over columns rather
+ * than a mean over all of them.
+ *
+ * The seam is a constant offset, so every column sees the same step plus its
+ * own scene. Averaging lets one hot target crossing the boundary bias the
+ * estimate, and that bias is then subtracted from all 30 rows of the segment:
+ * a local feature becomes a frame-wide band. The median throws those columns
+ * away for free. Measured seam steps on real captures are -5.12, +0.09 and
+ * -0.69 codes against a typical row-to-row step of 1.23, so the correction is
+ * doing real work and deserves a robust estimator.
+ *
+ * Read from dst, i.e. after the row repair: a dead row landing on a seam would
+ * otherwise be measured as a ~200-code step. Every offset is computed before
+ * any is applied, so this still sees unmodified data.
+ *
+ * Selected by counting rather than sorting - the per-column step is a
+ * difference of two 2-pixel sums, so it is bounded to +-510 by construction and
+ * needs no comparisons. The histogram is 2 KB of stack, live only for this
+ * call; counts cannot overflow uint16 because fusion_init() caps th_w at 256.
+ */
+#define SEAM_STEP_MAX 510
+
+static int32_t seam_step_q8(const uint8_t *dst, int w, int seam_row)
+{
+    uint16_t hist[2 * SEAM_STEP_MAX + 1];
+    memset(hist, 0, sizeof(hist));
+
+    const uint8_t *a1 = dst + (size_t)(seam_row - 2) * w;
+    const uint8_t *a0 = dst + (size_t)(seam_row - 1) * w;
+    const uint8_t *b0 = dst + (size_t)seam_row * w;
+    const uint8_t *b1 = dst + (size_t)(seam_row + 1) * w;
+
+    for (int x = 0; x < w; x++)
+        hist[(b0[x] + b1[x]) - (a0[x] + a1[x]) + SEAM_STEP_MAX]++;
+
+    int32_t acc = 0, mid = 0;
+    for (int i = 0; i <= 2 * SEAM_STEP_MAX; i++) {
+        acc += hist[i];
+        if (acc * 2 > w) { mid = i - SEAM_STEP_MAX; break; }
+    }
+    /* mid is a difference of two-pixel sums, so the per-pixel step is mid/2 */
+    return rdiv(mid * 256, 2);
+}
+
 void fusion_thermal_prep(fusion_t *f, const uint8_t *src, uint8_t *dst)
 {
     const int w = f->cfg.th_w, h = f->cfg.th_h;
@@ -312,34 +371,25 @@ void fusion_thermal_prep(fusion_t *f, const uint8_t *src, uint8_t *dst)
 
     if (seg > 0 && seg < h) {
         const int nseg = h / seg;
+        /*
+         * Segment offsets, Q8. They accumulate across seams, so the per-seam
+         * estimate has to carry a fraction: rounded to whole codes the
+         * truncation compounds, and by the last of four segments it reached 3
+         * codes - 0.42C at the 0.141 C/LSB an auto-ranged session picks, applied
+         * as a 30-row band in every frame and looking exactly like scene.
+         */
         int32_t off[16];
         if (nseg <= (int)(sizeof(off) / sizeof(off[0]))) {
             off[0] = 0;
-            for (int s = 1; s < nseg; s++) {
-                /* two rows either side of the seam - enough to see a DC step,
-                   short enough that a scene gradient barely registers.
-                   Read from dst, i.e. after the row repair: a dead row on a seam
-                   would otherwise be measured as a ~200-code step and shifted
-                   into an entire segment. The offsets are all computed before
-                   any of them is applied, so reading dst here is still reading
-                   unmodified data. */
-                int32_t above = 0, below = 0;
-                for (int r = 0; r < 2; r++) {
-                    const uint8_t *ra = dst + (size_t)(s * seg - 1 - r) * w;
-                    const uint8_t *rb = dst + (size_t)(s * seg + r) * w;
-                    for (int x = 0; x < w; x++) {
-                        above += ra[x];
-                        below += rb[x];
-                    }
-                }
-                off[s] = off[s - 1] + (below - above) / (2 * w);
-            }
+            for (int s = 1; s < nseg; s++)
+                off[s] = off[s - 1] + seam_step_q8(dst, w, s * seg);
+
             int32_t mean = 0;
             for (int s = 0; s < nseg; s++) mean += off[s];
-            mean /= nseg;
+            mean = rdiv(mean, nseg);
 
             for (int s = 0; s < nseg; s++) {
-                int32_t d = off[s] - mean;
+                const int32_t d = rdiv(off[s] - mean, 256);
                 if (!d) continue;
                 for (int y = s * seg; y < (s + 1) * seg; y++) {
                     uint8_t *row = dst + (size_t)y * w;
@@ -369,9 +419,49 @@ void fusion_thermal_prep(fusion_t *f, const uint8_t *src, uint8_t *dst)
 
 /* ------------------------------------------------------------------ warp */
 
-void fusion_set_warp(fusion_t *f, const uint16_t *warp)
+/*
+ * Install a warp table, rejecting anything that would sample outside the
+ * thermal frame.
+ *
+ * This is not defensive tidying. fusion_warp_thermal() clamps x1/y1 - the
+ * far corner of the bilinear tap - but takes x0/y0 straight from the table, so
+ * a single entry of 0xFA00 (250.0 thermal px, in range for the type, not the
+ * sentinel, and passing py_fusion.c's length-only check) reads hundreds of
+ * bytes past the frame. The table is the one input that arrives from outside
+ * the library, built by a separate toolchain, so it is exactly the input that
+ * cannot be assumed well-formed.
+ *
+ * An out-of-range entry becomes FUSION_INVALID rather than being clamped to the
+ * edge. A clamped coordinate is a plausible reading taken from the wrong pixel,
+ * which is the failure the sentinel exists to prevent; no coverage is honest.
+ *
+ * Returns the number of entries rejected - 0 for a well-formed table. A nonzero
+ * count means the calibration and this pipeline disagree about geometry, so it
+ * is worth surfacing rather than absorbing.
+ */
+int fusion_set_warp(fusion_t *f, const uint16_t *warp)
 {
-    memcpy(f->warp, warp, sizeof(uint16_t) * 2 * (size_t)f->cfg.low_w * f->cfg.low_h);
+    const size_t n = (size_t)f->cfg.low_w * f->cfg.low_h;
+    /* x0 = qx >> 8 must land in [0, th_w-1], so qx < th_w << 8. The fractional
+       part needs no guard: x1 is already clamped, so a full 0xFF frac at the
+       last column interpolates the edge pixel with itself. */
+    const uint32_t xlim = (uint32_t)f->cfg.th_w << 8;
+    const uint32_t ylim = (uint32_t)f->cfg.th_h << 8;
+    int rejected = 0;
+
+    for (size_t i = 0; i < n; i++) {
+        uint16_t qx = warp[2 * i], qy = warp[2 * i + 1];
+
+        if (qx == FUSION_INVALID || qy == FUSION_INVALID) {
+            qx = qy = FUSION_INVALID;               /* half-marked entry: both out */
+        } else if ((uint32_t)qx >= xlim || (uint32_t)qy >= ylim) {
+            qx = qy = FUSION_INVALID;
+            rejected++;
+        }
+        f->warp[2 * i]     = qx;
+        f->warp[2 * i + 1] = qy;
+    }
+    return rejected;
 }
 
 #if FUSION_ENABLE_HOMOGRAPHY
@@ -431,6 +521,190 @@ void fusion_warp_thermal(const fusion_t *f, const uint8_t *thermal)
         f->t_reg[i] = (uint8_t)((top * (256 - fyp) + bot * fyp + 32768) >> 16);
         f->cover[i] = 1;
     }
+}
+
+/* ------------------------------------------------- temporal noise filter
+ *
+ * See fusion.h for the kernel and the reasoning. Everything here is integer:
+ * the knee arrives as a temperature and is converted to Q8 codes against the
+ * sensor range, which is the only place the two units meet.
+ */
+
+/*
+ * Knee in Q8 code units, from a noise figure in milli-Celsius.
+ *
+ * The sensor maps [tmin,tmax] onto 0..255, so one code is span/255 milli-C and
+ *
+ *     knee_codes = noise_mc * 255 / span_mc
+ *
+ * At the 20..40C window this project uses that is 148 * 255 / 20000 = 1.89
+ * codes; at the -10..140C default it is 0.25, i.e. below the quantisation step,
+ * which is the correct answer - at that span the sensor's own quantisation is
+ * coarser than its noise and there is nothing for a temporal filter to remove.
+ *
+ * Clamped to 32 codes. A knee wider than that would smooth across real scene
+ * structure, and the only way to reach it is a misconfigured range - exactly the
+ * mistake fusion_set_range() exists to make visible rather than silent.
+ */
+/*
+ * The gate is set at FUSION_TEMPORAL_GATE times the noise figure, not at the
+ * noise figure itself, and the difference is not cosmetic - the first version
+ * of this filter ramped straight up from zero delta and measured 1.05x.
+ *
+ * The quantity being discriminated is the difference between two frames, which
+ * for independent noise has sigma sqrt(2) times the per-frame figure. A gate at
+ * 1 sigma therefore sits in the middle of the noise distribution: a typical
+ * noise delta lands halfway up the ramp, gets a blend weight near 1/2 instead
+ * of 1/8, and almost nothing is averaged. The gate has to clear the noise
+ * distribution, not mark its centre. 3x the per-frame figure is ~2.1 sigma of
+ * the difference, which passes the overwhelming majority of noise deltas
+ * through to full smoothing.
+ *
+ * A generous gate is cheap here in a way that is worth being explicit about,
+ * because the instinct from spatial filtering is the opposite: this filter is
+ * purely temporal, so a static scene feature is preserved exactly however hard
+ * it is smoothed - the IIR converges on its true value. What a wide gate costs
+ * is temporal responsiveness, not spatial detail. At 8 frames and 8.77 fps a
+ * genuine change below the gate surfaces over ~0.9s, which for inspection work
+ * is not a cost at all.
+ */
+#define FUSION_TEMPORAL_GATE 3
+
+static int32_t temporal_gate_q8(const fusion_t *f)
+{
+    const int32_t noise_mc = f->cfg.temporal_noise_mc;
+    const int64_t span = (int64_t)f->tmax_mc - f->tmin_mc;
+
+    if (noise_mc <= 0 || span <= 0) return 0;
+
+    int64_t g = ((int64_t)noise_mc * FUSION_TEMPORAL_GATE * 255 * 256) / span;
+    if (g > (32 << 8)) g = 32 << 8;
+    return (int32_t)g;
+}
+
+/*
+ * One pixel, three regimes:
+ *
+ *     d <= gate       noise      -> full smoothing at w_min
+ *     gate < d < 2g   ambiguous  -> ramp w_min .. 256
+ *     d >= 2*gate     motion     -> pass through
+ *
+ * The ramp exists so that a pixel on the edge of a moving target does not
+ * alternate between fully smoothed and fully raw from frame to frame, which
+ * reads as a shimmering outline.
+ *
+ * THE HISTORY IS Q8, NOT 8-BIT, AND THAT IS LOAD-BEARING.
+ *
+ * An IIR whose state is held at the same precision as its input stalls. The
+ * per-frame update is (cur - prev) * w / 256; at w = 1/8 that is under half an
+ * LSB for any |cur - prev| < 4, so it rounds to zero and the state never moves.
+ * The filter freezes on the first frame it saw and returns a single noisy
+ * sample forever.
+ *
+ * This is not a subtle degradation - it is invisible on a short run and total on
+ * a long one, and it gets *worse* as the filter is asked to smooth harder. The
+ * first version of this code measured 2.0x at 4 frames, 1.2x at 8 and exactly
+ * 1.0x at 16 and 32, which is the signature: past w = 1/4 nothing but the frozen
+ * first frame is left. Anyone porting this to a fixed-point DSP will meet the
+ * same wall, so it is worth stating plainly rather than leaving in the type.
+ *
+ * At Q8 the smallest update that survives rounding is 1/256 of a code, three
+ * orders below the noise floor the filter exists to attack.
+ *
+ * Widest intermediate is 256 * 65280 = 16.7M, comfortably inside int32.
+ */
+static inline int32_t temporal_blend_q8(int cur, int32_t prev_q8,
+                                        int32_t gate_q8, int32_t w_min)
+{
+    const int32_t cur_q8 = (int32_t)cur << 8;
+    const int32_t diff = cur_q8 - prev_q8;
+    const int32_t d_q8 = diff < 0 ? -diff : diff;
+
+    if (d_q8 >= 2 * gate_q8) return cur_q8;
+
+    int32_t w = w_min;
+    if (d_q8 > gate_q8)
+        w = w_min + (((256 - w_min) * (d_q8 - gate_q8)) / gate_q8);
+
+    return (w * cur_q8 + (256 - w) * prev_q8 + 128) >> 8;
+}
+
+/* Q8 state back to a pixel. */
+static inline uint8_t temporal_round(int32_t v_q8)
+{
+    const int32_t v = (v_q8 + 128) >> 8;
+    return (uint8_t)CLAMP255(v);
+}
+
+/* w_min from a frame count, clamped so that "1 frame" means "no filtering"
+   rather than a divide that quietly rounds to heavy smoothing. */
+static int32_t temporal_wmin(int frames)
+{
+    if (frames < 2) return 256;
+    if (frames > 256) frames = 256;
+    return 256 / frames;
+}
+
+void fusion_thermal_temporal(fusion_t *f)
+{
+    const size_t n = (size_t)f->cfg.th_w * f->cfg.th_h;
+    const int32_t gate = temporal_gate_q8(f);
+    const int32_t w_min = temporal_wmin(f->cfg.temporal_frames);
+
+    f->temporal_moved = 0;
+
+    if (gate <= 0 || w_min >= 256 || !f->t_prev) return;
+
+    if (!f->t_prev_valid) {
+        for (size_t i = 0; i < n; i++)
+            f->t_prev[i] = (uint16_t)((int32_t)f->t_prep[i] << 8);
+        f->t_prev_valid = 1;
+        f->temporal_moved = (int)n;      /* the first frame is all "motion" */
+        return;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const int cur = f->t_prep[i];
+        const int32_t prev = f->t_prev[i];
+        const int32_t v = temporal_blend_q8(cur, prev, gate, w_min);
+
+        if (v == ((int32_t)cur << 8) && v != prev) f->temporal_moved++;
+
+        f->t_prev[i] = (uint16_t)v;
+        f->t_prep[i] = temporal_round(v);
+    }
+}
+
+const uint8_t *fusion_y_temporal(fusion_t *f, const uint8_t *y)
+{
+    const size_t n = (size_t)f->cfg.out_w * f->cfg.out_h;
+    const int32_t gate = (int32_t)f->cfg.y_temporal_knee << 8;
+    const int32_t w_min = temporal_wmin(f->cfg.y_temporal_frames);
+
+    if (gate <= 0 || w_min >= 256 || !f->y_prev || !f->y_out) return y;
+
+    if (!f->y_prev_valid) {
+        for (size_t i = 0; i < n; i++)
+            f->y_prev[i] = (uint16_t)((int32_t)y[i] << 8);
+        memcpy(f->y_out, y, n);
+        f->y_prev_valid = 1;
+        return f->y_out;
+    }
+
+    for (size_t i = 0; i < n; i++) {
+        const int32_t v = temporal_blend_q8(y[i], f->y_prev[i], gate, w_min);
+        f->y_prev[i] = (uint16_t)v;
+        f->y_out[i] = temporal_round(v);
+    }
+
+    return f->y_out;
+}
+
+void fusion_temporal_reset(fusion_t *f)
+{
+    f->t_prev_valid = 0;
+    f->y_prev_valid = 0;
+    f->temporal_moved = 0;
 }
 
 /* ------------------------------------------------------------------ AGC
@@ -657,6 +931,14 @@ void fusion_default_cfg(fusion_cfg_t *cfg)
        These two sit in the middle of that gap, nowhere near either edge. */
     cfg->deadrow_flat = 24;
     cfg->deadrow_lift = 64;
+    /* 148 mK is the pessimistic end of the measured common-mode-removed spread
+       (126-148), not the 33 mK NETD - see fusion.h. 8 frames buys ~3.9x. */
+    cfg->temporal_noise_mc = 148;
+    cfg->temporal_frames = 8;
+    /* Visible filter off: it costs 256KB at 640x400 and only pays in the dark.
+       See fusion.h for why that is opt-in on this part. */
+    cfg->y_temporal_knee = 0;
+    cfg->y_temporal_frames = 8;
     cfg->show_uncovered = 1;
     cfg->out_rgb565 = 0;
 }
@@ -671,6 +953,14 @@ int fusion_init(fusion_t *f, const fusion_cfg_t *cfg)
         return -1;                                  /* see the box_i32 overflow note */
     if (cfg->out_w % cfg->low_w || cfg->out_h % cfg->low_h)
         return -1;                                  /* decimation must be integral */
+    /*
+     * The warp table is Q8 in a uint16, so a thermal coordinate tops out at
+     * 255.996 px - the format cannot address a 320- or 640-wide core. Better to
+     * refuse at init than to fit a bigger sensor one day and find the table
+     * silently wrapping. Two is the minimum the bilinear tap needs.
+     */
+    if (cfg->th_w < 2 || cfg->th_h < 2 || cfg->th_w > 256 || cfg->th_h > 256)
+        return -1;
 
     const size_t n = (size_t)cfg->low_w * cfg->low_h;
     const size_t full = (size_t)cfg->out_w * cfg->out_h;
@@ -691,6 +981,19 @@ int fusion_init(fusion_t *f, const fusion_cfg_t *cfg)
     f->s2    = FUSION_ALLOC(sizeof(int32_t) * s2_len); /* guided scratch + cov, or box ring */
     f->blur  = FUSION_ALLOC(full);
     f->row_bad = FUSION_ALLOC((size_t)cfg->th_h);
+
+    /* Temporal histories, allocated only for the filters that are enabled. The
+       visible one is the expensive half - 256KB at 640x400 against 19KB for the
+       thermal - so an unconfigured build pays nothing for it. */
+    if (cfg->temporal_noise_mc > 0 && cfg->temporal_frames > 1) {
+        f->t_prev = FUSION_ALLOC(sizeof(uint16_t) * (size_t)cfg->th_w * cfg->th_h);
+        if (!f->t_prev) { fusion_free(f); return -1; }
+    }
+    if (cfg->y_temporal_knee > 0 && cfg->y_temporal_frames > 1) {
+        f->y_prev = FUSION_ALLOC(sizeof(uint16_t) * full);
+        f->y_out  = FUSION_ALLOC(full);
+        if (!f->y_prev || !f->y_out) { fusion_free(f); return -1; }
+    }
 
     if (!f->warp || !f->y_low || !f->t_prep || !f->t_reg || !f->cover || !f->a_q16 ||
         !f->b_q16 || !f->s1 || !f->s2 || !f->blur || !f->row_bad) {
@@ -725,6 +1028,9 @@ void fusion_free(fusion_t *f)
     FUSION_FREE(f->s2);
     FUSION_FREE(f->blur);
     FUSION_FREE(f->row_bad);
+    FUSION_FREE(f->t_prev);
+    FUSION_FREE(f->y_prev);
+    FUSION_FREE(f->y_out);
     memset(f, 0, sizeof(*f));
 }
 
@@ -742,6 +1048,11 @@ void fusion_process(fusion_t *f, const uint8_t *y, const uint8_t *thermal, uint8
 
     fusion_decimate(y, ow, oh, f->y_low, lw, lh);
     fusion_thermal_prep(f, thermal, f->t_prep);
+    /* Before the warp, so the filter runs on the sensor grid where the noise is
+       independent per pixel. After the warp it would be filtering interpolated
+       samples, which are already correlated with their neighbours - the same
+       reason the row repair runs here rather than downstream. */
+    fusion_thermal_temporal(f);
     fusion_warp_thermal(f, f->t_prep);
     fusion_agc(f);
     fusion_guided(f);

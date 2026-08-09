@@ -37,6 +37,10 @@ OUT_DIR = "synth"
 # nearest-live-row fill gets wrong.
 DEAD_ROWS = (6, 12, 28, 35, 36, 55, 57, 58)
 
+# Grid cells poisoned in warp_bad.lut. Inside the covered box, so they would
+# otherwise carry real thermal data and the range check is what removes them.
+BAD_LUT_CELLS = ((20, 20), (20, 21), (60, 80), (90, 140), (50, 100))
+
 
 def make_luma():
     """An electrical-panel-ish scene: busbars, terminals, screws, fine labels."""
@@ -108,6 +112,20 @@ def main():
     t.tofile(os.path.join(OUT_DIR, "thermal.raw"))
     lut.tofile(os.path.join(OUT_DIR, "warp.lut"))
 
+    # A malformed table, for the range check in fusion_set_warp(). Every entry
+    # here is a legal uint16 and none is the sentinel, so a length-only check
+    # waves them all through - which is exactly how the heap read past the
+    # thermal frame happened. The planted values sit just past the limit and far
+    # past it, at both ends of the grid, plus one half-marked entry.
+    bad = lut.copy()
+    LIMIT_X, LIMIT_Y = TH_W * 256, TH_H * 256
+    bad[BAD_LUT_CELLS[0]] = (0xFA00, 0)                # 250.0 px: the measured case
+    bad[BAD_LUT_CELLS[1]] = (LIMIT_X, 0)               # first coordinate off the end
+    bad[BAD_LUT_CELLS[2]] = (0, LIMIT_Y)               # ...and on the other axis
+    bad[BAD_LUT_CELLS[3]] = (0xFFFE, 0xFFFE)           # not the sentinel, still absurd
+    bad[BAD_LUT_CELLS[4]] = (0xFFFF, 100 * 256)        # half-marked: x invalid, y not
+    bad.tofile(os.path.join(OUT_DIR, "warp_bad.lut"))
+
     dead = t.copy()
     dead[list(DEAD_ROWS)] = 255
     dead.tofile(os.path.join(OUT_DIR, "thermal_dead.raw"))
@@ -132,6 +150,10 @@ def main():
         "flat_box": list(FLAT_BOX),
         "codes": {"cold": COLD_CODE, "warm": WARM_CODE, "hot": HOT_CODE},
         "dead_rows": list(DEAD_ROWS),
+        "bad_lut_cells": [list(c) for c in BAD_LUT_CELLS],
+        # four of the five are out of range; the fifth is half-marked with the
+        # sentinel, which is malformed but not a range error and is not counted
+        "bad_lut_rejected": len(BAD_LUT_CELLS) - 1,
     }
     with open(os.path.join(OUT_DIR, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

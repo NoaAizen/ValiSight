@@ -50,7 +50,15 @@ CHUNK = 4096
 QUALITY = __Q__
 
 
-def stream(n):
+def stream(n, report=0):
+    # gc.mem_free() walks the whole 25MB heap and costs 227ms - measured on the
+    # board 2026-08-09, and it is the same heap-sized cost as gc.collect(). Per
+    # frame it took the stream from 8.8 to 3.2 fps. So the host asks for a reading
+    # only every Nth batch, and it is taken here, before the frame loop, where a
+    # stall is harmless: plain gaps of up to 2.5s between snapshots were measured
+    # not to disturb the sensor (unlike a collect, which wedges it at any length).
+    if report:
+        sys.stdout.write("#HEAP %d\n" % gc.mem_free())
     for _ in range(n):
         t, was_torn = good_snapshot(lep)       # paces the loop at the thermal rate
         j = rgb.snapshot().to_jpeg(quality=QUALITY)
@@ -80,6 +88,13 @@ def stream(n):
                 stalls += 1
                 if stalls > 4:
                     return
+    # The heap reading is the whole early-warning system. gc.collect() cannot be
+    # called while the Lepton is up - it wedges the part permanently, measured
+    # 2026-08-09 - so the automatic collector firing on an exhausted heap is a
+    # guaranteed kill. This loop leaks ~208 B/frame, which is hours rather than
+    # minutes, but hours is still finite. Reporting free memory lets the host tear
+    # the bring-up down and stand it back up at a moment of its choosing, instead
+    # of discovering the problem as a dead stream.
     sys.stdout.write("#BATCH\n")
 
 
@@ -90,7 +105,12 @@ sys.stdout.write("#READY %d %d %d %d %d %d\n" % (
 # Sent repeatedly. Deliberately bounded: an unbounded loop on the board keeps
 # writing into a port nobody reads if this host dies, the CDC RX backs up, and
 # the board wedges hard enough to need a physical replug. A batch self-terminates.
-BATCH_CODE = "stream(%d)\n"
+BATCH_CODE = "stream(%d, %d)\n"
+
+# How often to ask the board what its heap looks like. The reading costs 227ms,
+# so this is a rate, not a habit: every 10th batch is one reading per ~200 frames
+# (~23s), which is ~1% of throughput to watch something that drains over hours.
+HEAP_EVERY = 10
 
 
 # ---------------------------------------------------------------- fusion via ctypes
@@ -104,6 +124,7 @@ class Cfg(ctypes.Structure):
         "out_w", "out_h", "low_w", "low_h", "th_w", "th_h",
         "gf_radius", "gf_eps", "detail_radius", "detail_gain", "detail_invert",
         "agc_permille", "th_seg_rows", "badpix_thresh", "deadrow_flat", "deadrow_lift",
+        "temporal_noise_mc", "temporal_frames", "y_temporal_knee", "y_temporal_frames",
         "show_uncovered", "out_rgb565")]
 
 
@@ -115,6 +136,10 @@ class Fusion(ctypes.Structure):
         ("agc_valid", ctypes.c_int),
         ("tmin_mc", ctypes.c_int32), ("tmax_mc", ctypes.c_int32),
         ("eps_q10", ctypes.c_int32), ("refl_mc", ctypes.c_int32),
+        ("t_prev", ctypes.c_void_p), ("y_prev", ctypes.c_void_p),
+        ("y_out", ctypes.c_void_p),
+        ("t_prev_valid", ctypes.c_int), ("y_prev_valid", ctypes.c_int),
+        ("temporal_moved", ctypes.c_int),
         ("row_bad", ctypes.c_void_p),
         ("rows_rebuilt", ctypes.c_int), ("have_frame", ctypes.c_int),
         ("palette", ctypes.c_void_p)]
@@ -187,6 +212,10 @@ class Pipeline:
         cfg.agc_permille = args.agc
         cfg.detail_invert = 1 if args.palette == "black" else 0
         cfg.out_rgb565 = 0
+        # Opt-in, and it must be set before fusion_init: the buffer it needs is
+        # allocated there, so flipping the knee later cannot turn the filter on.
+        cfg.y_temporal_knee = args.y_knee
+        cfg.y_temporal_frames = args.y_frames
 
         self.f = Fusion()
         if self.lib.fusion_init(ctypes.byref(self.f), ctypes.byref(cfg)) != 0:
@@ -465,7 +494,19 @@ def compose(view, fused, y, treg=None, cover=None, mix=50, phase=True, exclude=N
 # that none of the failures this code can see are happening.
 
 STALE_S = 5.0           # no frame for this long and the stream is considered dead
-LEPTON_FPS = 8.82       # the sensor's own rate; the pipeline cannot beat it
+# The sensor's own rate; the pipeline cannot beat it. Measured on the board
+# 2026-08-06 over 5220 frames: the inter-frame interval is a three-valued delta
+# function - 113 ms (326x), 114 ms (4742x), 115 ms (148x), and 1824 ms on the
+# three FFCs. Median 114 ms = 8.772 fps, not the 8.82 the datasheet implies.
+#
+# The 70% threshold below is weaker than it looks, and the constant cannot fix
+# that on its own: whether it can fire at all depends on the fps averaging
+# window. Over that same run a 10-frame window dipped to 3.5 fps, a 30-frame
+# window to 5.8, and a 100-frame window never below 7.6. So with a long window
+# it never fires; with a short one it fires only on FFC gaps, which makes it an
+# accidental FFC detector wearing a link-health label. Nothing else in ten
+# minutes came within 25% of it.
+LEPTON_FPS = 8.772
 
 
 def health(pipe, state, now):
@@ -479,7 +520,14 @@ def health(pipe, state, now):
     err = state.get("error")
     last = state.get("last_frame_t")
     fps = state.get("fps", 0.0)
-    if err:
+    restarting = state.get("restarting_since")
+    if restarting is not None:
+        # Recovering is not failing. A restart takes ~13s against a 5s stale
+        # threshold, so without this branch every successful defence reports as a
+        # dead stream - which is how a health panel gets ignored.
+        add("stream", "warn", "restarting the board: %s (%.0fs)"
+            % (state.get("last_restart", "fault"), now - restarting))
+    elif err:
         add("stream", "fail", err)
     elif last is None:
         add("stream", "warn", "waiting for the first frame")
@@ -503,6 +551,13 @@ def health(pipe, state, now):
 
     # --- VoSPI tearing. Unlike the dead rows this really is random, and a torn
     #     frame is stale data in part of the image, not a marked defect.
+    #
+    #     Measured 2026-08-06: 0 torn frames in 5220 over ten minutes, so on this
+    #     link tearing is rare rather than routine - read a green pill here as
+    #     the expected state, not as a reassurance. One structural caveat: the
+    #     detector evaluates the segment seams at rows 29/59/89, and the dead-row
+    #     run 55..63 straddles the 59/60 seam. That seam is therefore measured
+    #     across two stuck rows and cannot report a tear there at all.
     win = state.get("torn_window") or []
     if win:
         rate = sum(win) / float(len(win))
@@ -533,6 +588,27 @@ def health(pipe, state, now):
         add("dead rows", "warn", "%d of %d rows rebuilt - readings there are "
             "interpolated" % (rows, total))
 
+    # --- board heap. The one check that predicts a failure instead of reporting
+    # one. gc.collect() with the Lepton up wedges the part permanently, so the
+    # automatic collector firing on an exhausted heap is fatal - and the heap
+    # drains steadily because the streaming loop cannot be made to allocate
+    # nothing. The supervisor restarts the bring-up before that happens; this
+    # says how much room is left and whether it has had to.
+    free = state.get("heap_free")
+    restarts = state.get("restarts", 0)
+    if free is None:
+        add("board heap", "ok", "no reading yet" if restarts == 0 else
+            "%d restart%s so far" % (restarts, "" if restarts == 1 else "s"))
+    else:
+        mb = free / (1 << 20)
+        note = "%.1fMB free" % mb
+        if restarts:
+            note += ", %d restart%s (%s)" % (restarts, "" if restarts == 1 else "s",
+                                             state.get("last_restart", "fault"))
+        # The floor is where the supervisor acts, so approaching it is normal
+        # operation and not worth a warning until it is close enough to be soon.
+        add("board heap", "warn" if free < HEAP_FLOOR * 2 else "ok", note)
+
     # --- registration
     if not pipe.warped:
         add("registration", "warn", "placeholder warp - the thermal layer is "
@@ -554,9 +630,15 @@ def health(pipe, state, now):
         add("range", "fail", "no sensor range reported - readings are meaningless")
     else:
         per_code = (hi - lo) / 255.0
-        # Lepton 3.5 NETD is ~50 mK, so a code finer than that resolves noise;
-        # much coarser than ~0.2 C and the auto-range has given away resolution
-        # it did not need to.
+        # Measured on this part 2026-08-06, 250-frame runs: NETD is 33 mK, not
+        # the ~50 mK the datasheet implies, and it is the same in both gain
+        # modes. So a code finer than ~0.033 C resolves noise; much coarser than
+        # ~0.2 C and the auto-range has given away resolution it did not need to.
+        #
+        # NETD is the wrong figure for trusting an *absolute* reading, though.
+        # Over the same runs the common-mode-removed temporal spread was
+        # 126-148 mK - 4x worse. Two readings seconds apart are comparable to
+        # ~0.15 C; NETD only bounds frame-to-frame differencing.
         lvl = "warn" if per_code > 0.2 else "ok"
         add("range", lvl, "%d..%d C, %.3f C/code%s" % (lo, hi, per_code,
             " - re-run auto-range for finer steps" if lvl == "warn" else ""))
@@ -605,6 +687,22 @@ def _board_error(raw):
         return False
     body = raw[1:].strip()
     return bool(body) and all(c == 9 or 32 <= c < 127 for c in body)
+
+
+class _PlannedRestart(Exception):
+    """Not a failure: the supervisor is standing the board back up on purpose."""
+
+
+# Free heap below this and the board gets restarted before the automatic collector
+# can fire. The collector is the hazard, not the memory: a gc.collect() with the
+# Lepton up wedges it permanently and no soft re-init recovers it - only a fresh
+# csi.CSI() object does, which is precisely what a restart builds.
+#
+# 4MB against a measured ~208 B/frame is about 19000 frames, 36 minutes, of slack
+# after the trigger. Deliberately enormous. The restart costs ~10s of bring-up and
+# happens once every few hours, so there is nothing to be gained by cutting it
+# fine and a dead stream to be lost by getting it wrong.
+HEAP_FLOOR = 4 << 20
 
 
 class Streamer(threading.Thread):
@@ -677,25 +775,77 @@ class Streamer(threading.Thread):
                             "..." if len(b) > n else "", head)
 
     def run(self):
-        try:
-            self._run()
-        except Exception as e:
-            # The counters first, then the evidence. pending is the one that
-            # decides: pending > 0 with the buffer holding the raw-REPL end
-            # marker means the batch finished and this host is owed frames that
-            # were already sent - a counting bug here, not a board fault. A
-            # partial line with pending > 0 means the board stopped mid-write.
-            since = ("%.1fs" % (time.time() - self.last_line_t)
-                     if self.last_line_t else "never")
-            self.state["error"] = (
-                "%s: %s (frames=%d, headers=%d, pending=%d, batches=%d, buf=%d)"
-                " buf[%s] last[%r] +%s" % (
-                    type(e).__name__, e, self.state.get("frames", 0),
-                    self.headers, self.pending, self.state.get("batches", 0),
-                    len(self.buf), self._dump(self.buf), self.last_line[:64],
-                    since))
-        finally:
-            self.release()
+        """Supervisor. Streaming is a session, not a one-shot, and every failure
+        mode found so far is cured by standing the bring-up back up:
+
+          - a wedged Lepton needs a fresh csi.CSI() object, which only a new
+            SETUP_CODE submission creates. Waiting, framesize() and a full soft
+            re-init were all measured against a wedged part and all raised.
+          - a lost stream, a resync storm, a board that fell off USB: same cure.
+          - the planned heap restart above: same cure, taken early and on purpose.
+
+        Previously this recorded the exception and let the thread end, so the
+        first hiccup ended the session silently and the browser kept showing the
+        last frame forever.
+        """
+        backoff = 1.0
+        while not self.stop.is_set():
+            planned = False
+            try:
+                self._run()
+                return                          # asked to stop, cleanly
+            except _PlannedRestart as e:
+                planned = True
+                self.state["last_restart"] = str(e)
+            except Exception as e:
+                self._record_failure(e)
+                self.state["last_restart"] = type(e).__name__
+            finally:
+                # A restart outlasts STALE_S by a wide margin - ~3s draining the
+                # port plus ~10s of bring-up - so without this the health panel
+                # would call the stream dead every time the defence works. The
+                # panel is only worth having if it distinguishes "recovering" from
+                # "broken".
+                self.state["restarting_since"] = time.time()
+                self.release()
+
+            if self.stop.is_set():
+                return
+            self.state["restarts"] = self.state.get("restarts", 0) + 1
+            # A planned restart is not a fault and must not be rate-limited into
+            # a stutter; an unplanned one backs off so a genuinely dead board is
+            # not hammered at full speed.
+            if planned:
+                backoff = 1.0
+            else:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 15.0)
+            self._reset_for_restart()
+
+    def _reset_for_restart(self):
+        """Everything that must not survive into the next session."""
+        self.buf = bytearray()
+        self.pending, self.headers = 0, 0
+        self.last_line, self.last_line_t = b"", 0.0
+        self.s = None
+        self.state["ready"] = False
+        self.state.pop("heap_free", None)
+
+    def _record_failure(self, e):
+        # The counters first, then the evidence. pending is the one that decides:
+        # pending > 0 with the buffer holding the raw-REPL end marker means the
+        # batch finished and this host is owed frames that were already sent - a
+        # counting bug here, not a board fault. A partial line with pending > 0
+        # means the board stopped mid-write.
+        since = ("%.1fs" % (time.time() - self.last_line_t)
+                 if self.last_line_t else "never")
+        self.state["error"] = (
+            "%s: %s (frames=%d, headers=%d, pending=%d, batches=%d, buf=%d)"
+            " buf[%s] last[%r] +%s" % (
+                type(e).__name__, e, self.state.get("frames", 0),
+                self.headers, self.pending, self.state.get("batches", 0),
+                len(self.buf), self._dump(self.buf), self.last_line[:64],
+                since))
 
     def release(self):
         """Read first, then interrupt. The board can only act on a ctrl-C once its
@@ -807,11 +957,17 @@ class Streamer(threading.Thread):
                 p = line.split()
                 self._range(int(p[5]), int(p[6]))
                 self.state["ready"] = True
+                # Frames are flowing again, so the error that got us here is
+                # history. Leaving it set would pin the health panel red for the
+                # rest of the session and train the user to ignore it.
+                self.state.pop("error", None)
+                self.state.pop("restarting_since", None)
                 break
 
         self.pending = 0
         started = False
-        t_prev, n = time.time(), 0
+        t_prev, n = time.time(), 0      # n counts frames, for fps - do not reuse
+        batch_no = 0
         while not self.stop.is_set():
             if self.pending == 0:
                 # every submission ends with \x04\x04> - consume the prompt
@@ -824,13 +980,22 @@ class Streamer(threading.Thread):
                 self._await(b"\x04\x04>", 30.0)
                 if started:
                     self.state["batches"] = self.state.get("batches", 0) + 1
-                self._submit(BATCH_CODE % self.batch, timeout=20.0)
+                self._submit(
+                    BATCH_CODE % (self.batch, 1 if batch_no % HEAP_EVERY == 0 else 0),
+                    timeout=20.0)
+                batch_no += 1
                 started = True
                 self.pending = self.batch
             raw = self._line()
             line = raw.decode("utf-8", "replace").strip()
             if _board_error(raw):
                 raise RuntimeError("board: " + self._traceback(line))
+            if line.startswith("#HEAP"):
+                free = int(line.split()[1])
+                self.state["heap_free"] = free
+                if free < HEAP_FLOOR:
+                    raise _PlannedRestart("heap down to %.1fMB" % (free / (1 << 20)))
+                continue
             if line.startswith("#BATCH"):
                 self.pending = 0
                 continue
@@ -953,9 +1118,13 @@ background:#1a1a1a;line-height:1.5}
 <p class=note>Hover for a reading. The number comes from the thermal frame behind
 that pixel &mdash; before the AGC and before the guided filter, which borrows the
 visible camera's edges to sharpen the picture and must not be quoted off.
-Absolute accuracy is &plusmn;5&deg;C; the <b>delta</b> between two points of the same
-material in one frame is far better than that, and is what a finding should rest on.
-Readings keep working in every view.</p>
+Absolute accuracy is &plusmn;5&deg;C at best. The board runs the Lepton in
+<b>high gain</b> since 2026-08-09; before that it was silently in low gain, whose
+specified accuracy is the greater of &plusmn;10&deg;C or 10%, so any reading quoted
+off a frame recorded earlier than that carries the looser number. The <b>delta</b> between two nearby points of the same
+material in one frame is far better than either, and is what a finding should rest
+on &mdash; provided neither point is clipped, neither sits on a rebuilt row, and no
+shutter event separates them. Readings keep working in every view.</p>
 <p class=note><b>Judging registration.</b> The fused view cannot tell you whether the
 warp is right: the guided filter puts crisp edges in the right places even when the
 thermal layer is offset, so a misregistered frame still looks sharp &mdash; it just
@@ -1151,6 +1320,20 @@ def main():
     ap.add_argument("--agc", type=int, default=0, metavar="PERMILLE",
                     help="scene AGC, per-mille clipped each end (20 = 2%%). "
                          "Makes tone scene-relative rather than absolute")
+    # The visible temporal filter. fusion.c leaves it off because it costs 768KB
+    # (fusion.c:993-994) that only pays back in the dark - but
+    # dark is the case this project exists for. In an unlit cabinet the detail
+    # layer amplifies read noise exactly as hard as it amplifies edges, so a
+    # noisy high-pass makes the fused image worse than none at all. Motion-adaptive
+    # IIR: 8 frames buys ~3.9x for one buffer, where an 8-frame boxcar buys 2.8x
+    # for eight - and a host-side burst average of 8 measured only 1.86x on this
+    # board (2026-08-09), because every blend step re-quantises to 8 bits.
+    ap.add_argument("--y-knee", type=int, default=0, metavar="CODES",
+                    help="visible temporal filter knee in 8-bit luma codes; 0 = off. "
+                         "Try 3-6 for a dark scene. Costs 768KB when enabled "
+                         "(512KB of Q8 state + a 256KB output plane)")
+    ap.add_argument("--y-frames", type=int, default=8, metavar="N",
+                    help="equivalent frames averaged by the visible filter (default 8)")
     ap.add_argument("--quality", type=int, default=50, help="board-side JPEG quality")
     ap.add_argument("--seconds", type=int, default=0, help="exit after N seconds (for tests)")
     args = ap.parse_args()

@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <time.h>
 
 static void die(const char *msg)
@@ -84,6 +85,18 @@ static void usage(void)
            "                    median - the sensor's 14 dead rows (default 24,64)\n"
            "  --no-deadrow      leave the dead rows in\n"
            "\n"
+           " temporal noise filter - needs a stream, so see --frames:\n"
+           "  --temporal F      equivalent frames averaged on a static scene (default 8, 1 = off)\n"
+           "  --temporal-noise M  sensor temporal noise in milli-C (default 148, 0 = off)\n"
+           "                    stated as a temperature, not codes: --range rescales the knee\n"
+           "  --y-temporal K,F  visible-luma filter: motion knee in codes, frames (default off)\n"
+           "  --frames N        push the same pair through N times, as a live stream would.\n"
+           "                    A temporal filter is a no-op on one frame; this is how it is\n"
+           "                    exercised. Combine with --noise.\n"
+           "  --noise S         add uniform noise in [-S,+S] codes to the thermal each frame,\n"
+           "                    deterministically seeded. sigma = S/sqrt(3).\n"
+           "  --y-noise S       the same on the visible luma\n"
+           "\n"
            " radiometry - the numbers, as opposed to the picture:\n"
            "  --range MIN,MAX   sensor range in C that codes 0..255 span (default -10,140)\n"
            "                    MUST match IOCTL_LEPTON_SET_RANGE or every reading is wrong\n"
@@ -97,6 +110,35 @@ static void usage(void)
 static int parse_wh(const char *s, int *w, int *h)
 {
     return sscanf(s, "%dx%d", w, h) == 2;
+}
+
+/*
+ * Deterministic noise for the temporal-filter tests. xorshift32, seeded per run
+ * so a failing assertion reproduces exactly - a filter that only works on one
+ * draw of the noise is not a working filter.
+ *
+ * Uniform in [-s,+s], so sigma = s/sqrt(3). Uniform rather than Gaussian on
+ * purpose: it puts a hard bound on the excursion, which makes the interaction
+ * with the motion knee something that can be reasoned about rather than
+ * estimated from a tail.
+ */
+static uint32_t rng_state = 2463534242u;
+
+static uint32_t rnd32(void)
+{
+    rng_state ^= rng_state << 13;
+    rng_state ^= rng_state >> 17;
+    rng_state ^= rng_state << 5;
+    return rng_state;
+}
+
+static void add_noise(uint8_t *dst, const uint8_t *src, size_t n, int s)
+{
+    if (s <= 0) { memcpy(dst, src, n); return; }
+    for (size_t i = 0; i < n; i++) {
+        int v = (int)src[i] + (int)(rnd32() % (uint32_t)(2 * s + 1)) - s;
+        dst[i] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+    }
 }
 
 int main(int argc, char **argv)
@@ -118,6 +160,7 @@ int main(int argc, char **argv)
     int32_t tmin_mc = -10000, tmax_mc = 140000;
     int32_t eps_q10 = 1024, refl_mc = 20000;
     int probe_x = -1, probe_y = -1, want_stats = 0;
+    int frames = 0, t_noise = 0, y_noise = 0;
 
     for (int i = 4; i < argc; i++) {
         const char *a = argv[i];
@@ -198,6 +241,20 @@ int main(int argc, char **argv)
             cfg.show_uncovered = 0;
         } else if (!strcmp(a, "--bench") && !last) {
             bench = atoi(argv[++i]);
+        } else if (!strcmp(a, "--temporal") && !last) {
+            cfg.temporal_frames = atoi(argv[++i]);
+        } else if (!strcmp(a, "--temporal-noise") && !last) {
+            cfg.temporal_noise_mc = atoi(argv[++i]);
+        } else if (!strcmp(a, "--y-temporal") && !last) {
+            if (sscanf(argv[++i], "%d,%d", &cfg.y_temporal_knee,
+                       &cfg.y_temporal_frames) != 2)
+                die("bad --y-temporal (want KNEE,FRAMES)");
+        } else if (!strcmp(a, "--frames") && !last) {
+            frames = atoi(argv[++i]);
+        } else if (!strcmp(a, "--noise") && !last) {
+            t_noise = atoi(argv[++i]);
+        } else if (!strcmp(a, "--y-noise") && !last) {
+            y_noise = atoi(argv[++i]);
         } else {
             fprintf(stderr, "error: unknown option %s\n", a);
             return 1;
@@ -221,7 +278,15 @@ int main(int argc, char **argv)
     if (warp_path) {
         size_t n = sizeof(uint16_t) * 2 * (size_t)cfg.low_w * cfg.low_h;
         uint8_t *lut = load(warp_path, n);
-        fusion_set_warp(&f, (const uint16_t *)lut);
+        int rejected = fusion_set_warp(&f, (const uint16_t *)lut);
+        if (rejected) {
+            /* The table is the right size but points off the thermal frame, so
+               it was built for a different geometry. Those cells are now
+               uncovered and the picture stays plausible - say so out loud. */
+            fprintf(stderr, "warning: %s has %d entries outside the %dx%d thermal "
+                            "frame; dropped to no-coverage\n",
+                    warp_path, rejected, cfg.th_w, cfg.th_h);
+        }
         free(lut);
     } else {
         if (!have_H) {
@@ -241,11 +306,62 @@ int main(int argc, char **argv)
     uint8_t *out = malloc((size_t)cfg.out_w * cfg.out_h * 3);
     if (!out) die("out of memory");
 
-    int reps = bench > 0 ? bench : 1;
+    /*
+     * A temporal filter cannot be exercised by one frame, so --frames replays
+     * the pair as a live stream would. With --noise each replay gets its own
+     * draw, which is what makes the filter's job real: the scene is static and
+     * the noise is not, and separating those two is the whole point.
+     */
+    const size_t t_n = (size_t)cfg.th_w * cfg.th_h;
+    const size_t y_n = (size_t)cfg.out_w * cfg.out_h;
+    uint8_t *t_frame = t, *y_frame = y;
+
+    if (t_noise > 0 && !(t_frame = malloc(t_n))) die("out of memory");
+    if (y_noise > 0 && !(y_frame = malloc(y_n))) die("out of memory");
+
+    /*
+     * Reference for the noise measurement: the clean frame through the same prep
+     * stage, so debanding and bad-pixel repair are common to both sides and what
+     * is left is exactly what the temporal filter did. Taken before the loop -
+     * fusion_thermal_prep() writes row_bad and rows_rebuilt as a side effect.
+     */
+    uint8_t *t_ref = NULL;
+    if (t_noise > 0) {
+        if (!(t_ref = malloc(t_n))) die("out of memory");
+        fusion_thermal_prep(&f, t, t_ref);
+    }
+
+    int reps = frames > 0 ? frames : (bench > 0 ? bench : 1);
     double t0 = now_ms();
-    for (int i = 0; i < reps; i++)
-        fusion_process(&f, y, t, out);
+    for (int i = 0; i < reps; i++) {
+        if (t_noise > 0) add_noise(t_frame, t, t_n, t_noise);
+        if (y_noise > 0) add_noise(y_frame, y, y_n, y_noise);
+        fusion_process(&f, fusion_y_temporal(&f, y_frame), t_frame, out);
+    }
     double el = now_ms() - t0;
+
+    /*
+     * RMS of the thermal plane against that reference, in codes.
+     *
+     * Measured here rather than on the fused image on purpose: the guided filter
+     * averages ~(2r+1)^2 low-res samples and removes most of the noise
+     * spatially, so by the time it reaches the output the temporal filter's
+     * contribution is buried and the number says nothing. This is the plane the
+     * radiometry path actually quotes from.
+     */
+    if (t_ref) {
+        double acc = 0;
+        for (size_t i = 0; i < t_n; i++) {
+            double d = (double)f.t_prep[i] - t_ref[i];
+            acc += d * d;
+        }
+        printf("thermal noise: %.4f codes rms over %d frame(s), %d px took the "
+               "motion path\n", sqrt(acc / t_n), reps, f.temporal_moved);
+        free(t_ref);
+    }
+
+    if (t_frame != t) free(t_frame);
+    if (y_frame != y) free(y_frame);
 
     write_ppm(out_path, out, cfg.out_w, cfg.out_h);
 

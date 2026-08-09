@@ -7,8 +7,9 @@ lep = csi.CSI(cid=LEP)
 lep.reset()
 lep.pixformat(csi.GRAYSCALE)
 
-# radiometric (TLinear) mode + measurement range suited to electrical inspection
-lep.ioctl(csi.IOCTL_LEPTON_SET_MODE, True, True)
+# radiometric (TLinear) mode + measurement range suited to electrical inspection.
+# Second arg is high_temp_mode = LOW gain, not radiometry - keep it False.
+lep.ioctl(csi.IOCTL_LEPTON_SET_MODE, True, False)
 lep.ioctl(csi.IOCTL_LEPTON_SET_RANGE, -10, 140)
 print("radiometry :", lep.ioctl(csi.IOCTL_LEPTON_GET_RADIOMETRY))
 print("mode       :", lep.ioctl(csi.IOCTL_LEPTON_GET_MODE))
