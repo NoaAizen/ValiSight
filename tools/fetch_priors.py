@@ -167,6 +167,87 @@ def fetch_buildings(
     return target
 
 
+#: OSM highway classes worth caching. Tracks and unclassified roads are
+#: included deliberately: the platform does not stay on paved roads, so the
+#: rough routes are exactly the ones that carry a heading reference where the
+#: paved network has nothing.
+ROAD_CLASSES = (
+    "motorway|trunk|primary|secondary|tertiary|unclassified|residential"
+    "|service|track|path|living_street"
+)
+
+
+def fetch_roads(bbox, tag: str, out_dir: Path) -> Path:
+    """Fetch the road and track network for a box, as GeoJSON linestrings.
+
+    A road carries a bearing, and a vehicle travelling along one is pointing
+    roughly that way. That makes the network an absolute heading reference in a
+    system with no magnetometer, which is the one thing the IMU can never
+    supply on its own.
+
+    It is a prior, not a constraint: off-road the vehicle has no bearing to
+    borrow, so anything consuming this has to degrade rather than assume.
+    """
+    target = out_dir / f"roads_{tag}.geojson"
+    area = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+    query = (
+        f"[out:json][timeout:600];"
+        f"way[highway~'^({ROAD_CLASSES})$']({area});"
+        f"out geom;"
+    )
+    print(f"  querying Overpass for roads and tracks in bbox {area}")
+
+    request = urllib.request.Request(
+        OVERPASS_URL,
+        data=urllib.parse.urlencode({"data": query}).encode(),
+        headers={"User-Agent": "valisight-prior-cache"},
+    )
+    with urllib.request.urlopen(request, timeout=900) as response:
+        payload = json.load(response)
+
+    features, lats, lons = [], [], []
+    for element in payload.get("elements", []):
+        geometry = element.get("geometry")
+        if not geometry or len(geometry) < 2:
+            continue
+        line = [[p["lon"], p["lat"]] for p in geometry]
+        lons.extend(p[0] for p in line)
+        lats.extend(p[1] for p in line)
+
+        tags = element.get("tags", {})
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": line},
+            "properties": {
+                "id": element.get("id"),
+                "highway": tags.get("highway"),
+                "name": tags.get("name"),
+                # A one-way road resolves the 180 degree ambiguity a bearing
+                # alone leaves open
+                "oneway": tags.get("oneway"),
+                "surface": tags.get("surface"),
+                "lanes": tags.get("lanes"),
+            },
+        })
+
+    if not features:
+        raise RuntimeError(f"Overpass returned no roads for bbox {area}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.joinpath(target.name).write_text(json.dumps({
+        "type": "FeatureCollection",
+        "bbox": [min(lons), min(lats), max(lons), max(lats)],
+        "properties": {
+            "source": "OpenStreetMap via Overpass",
+            "tile": tag,
+            "feature_count": len(features),
+        },
+        "features": features,
+    }))
+    print(f"  wrote {target.name}: {len(features):,} ways, {target.stat().st_size / 1e6:.1f} MB")
+    return target
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--lat", type=float, default=31.76465, help="Operating area latitude")
