@@ -57,7 +57,17 @@ class CalibrationStage(InitStage):
             )
         )
 
-        return checks, {
+        data: Dict[str, Any] = {
             "observation_count": observation_count,
             "constraints": [c.name for c in self.constraints],
         }
+
+        # Constraints that solve as well as validate publish their result, so a
+        # consumer takes the transform from the report rather than reaching back
+        # into the constraint object it passed in
+        for constraint in self.constraints:
+            solution = getattr(constraint, "solution", None)
+            if solution is not None:
+                data[f"{constraint.name}_solution"] = solution
+
+        return checks, data
