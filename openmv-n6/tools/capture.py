@@ -35,6 +35,21 @@ import csi, time, sys, gc, os
 PAG, LEP = 0x7936, 0x5435
 TMIN, TMAX = __TMIN__, __TMAX__
 
+# The ONE safe place to collect, and the thing that makes a restart restorative.
+#
+# The raw REPL keeps globals between submissions, so re-running this bring-up
+# rebinds rgb/lep but reclaims nothing on its own: measured 2026-08-09, a fresh
+# submission opened with only 14.4MB free because previous sessions' garbage was
+# still resident. A supervisor that restarts on a low heap would then restart into
+# the same low heap and loop forever. One collect here returned 14.2MB -> 25.6MB
+# in 695ms.
+#
+# It is safe *here* and nowhere else in the streaming path. A collect wedges a live
+# Lepton permanently, at any duration - but no CSI object has been constructed yet
+# at this point, and the ones built below are fresh. Do not move this line after
+# csi.CSI(), and do not add another one further down.
+gc.collect()
+
 # Visible sensor FIRST. OMV_CSI_RESET_PIN (PE3) is shared board-wide, so
 # rgb.reset() hard-resets the Lepton too - doing it after the Lepton has synced
 # costs a full ~1.2s VoSPI resync on the next thermal frame.

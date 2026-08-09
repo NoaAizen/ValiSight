@@ -21,6 +21,7 @@ during a calibration session rather than trusting how sharp the picture looks.
 """
 import argparse
 import ctypes
+import glob
 import json
 import os
 import sys
@@ -847,6 +848,50 @@ class Streamer(threading.Thread):
                 len(self.buf), self._dump(self.buf), self.last_line[:64],
                 since))
 
+    def _attention(self, settle=8.0):
+        """Take control of a board that may be in the middle of a batch.
+
+        The old sequence was two ctrl-Cs and a 0.3s sleep, which assumes the board
+        is sitting at a prompt. It very often is not: a host killed mid-session
+        (a timeout, a ctrl-C, a crash) never runs release(), so the board is left
+        streaming 26KB frames into a port nobody drains. Its write blocks, it
+        cannot reach the point where it would notice the interrupt, and the next
+        session then waits 30s for a prompt that cannot come while the buffer
+        fills with a previous run's payload. That is a restart failing to restart,
+        which is the one thing a supervisor may not do.
+
+        So: the same read-first-then-interrupt dance release() already documents.
+        Drain whatever is in flight so the board's write can complete, keep
+        interrupting, and only enter the raw REPL once the port has gone quiet.
+
+        A ctrl-D soft reboot was tried here as well, to get a genuinely fresh
+        interpreter rather than one still holding the previous session's CSI
+        objects. It desynchronised the raw-REPL handshake - the next submission
+        came back as `NameError: name 'c' isn't defined`, a fragment of its own
+        source - so it is deliberately not done. The heap side of that problem is
+        handled instead by the gc.collect() at the top of capture._BRINGUP, which
+        is safe there because no CSI object exists yet.
+        """
+        deadline = time.time() + settle
+        quiet = 0
+        while time.time() < deadline:
+            n = self.s.in_waiting
+            if n:
+                self.s.read(n)
+                quiet = 0
+            else:
+                quiet += 1
+                if quiet >= 3:          # ~0.3s with nothing in flight
+                    break
+            self.s.write(b"\r\x03\x03")
+            time.sleep(0.1)
+
+        self.s.reset_input_buffer()
+        self.buf = bytearray()
+        self.s.write(b"\x01")           # raw REPL
+        time.sleep(0.3)
+        self.s.read_all()
+
     def release(self):
         """Read first, then interrupt. The board can only act on a ctrl-C once its
         own pending writes have somewhere to go."""
@@ -938,12 +983,7 @@ class Streamer(threading.Thread):
         setup = (SETUP_CODE
                  .replace("__TMIN__", "-10").replace("__TMAX__", "140")
                  .replace("__AUTORANGE__", "True").replace("__Q__", str(self.quality)))
-        self.s.write(b"\r\x03\x03")
-        time.sleep(0.3)
-        self.s.reset_input_buffer()
-        self.s.write(b"\x01")
-        time.sleep(0.3)
-        self.s.read_all()
+        self._attention()
         self._submit(setup)
 
         # Drain the bring-up before batching starts. pending begins at 0, so
@@ -1339,7 +1379,20 @@ def main():
     args = ap.parse_args()
 
     if not os.path.exists(args.port):
-        raise SystemExit("%s is not present - replug the board" % args.port)
+        # The board does not always come back on the node it left. Anything that
+        # re-enumerates it - a replug, or the USB reset that follows a wedge -
+        # can hand it ttyACM1 while the stale ttyACM0 is still being released,
+        # and then the default looks exactly like a board that is not there.
+        # Measured 2026-08-09: a healthy board sat on ttyACM1 while this printed
+        # "replug the board", which is advice that would not have helped.
+        found = sorted(glob.glob("/dev/ttyACM*"))
+        if args.port == PORT and found:
+            print("%s is gone; using %s instead" % (args.port, found[0]), file=sys.stderr)
+            args.port = found[0]
+        else:
+            raise SystemExit("%s is not present%s - replug the board"
+                             % (args.port, "" if not found else
+                                " (found %s, pass --port)" % ", ".join(found)))
     if not os.path.exists(LIB):
         raise SystemExit("%s missing - run 'make libfusion.so' in host/" % LIB)
 
