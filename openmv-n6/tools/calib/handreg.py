@@ -287,11 +287,30 @@ def main():
     for name, pts_, span in (("visible", si, (LOW_W, LOW_H)), ("thermal", di, (TH_W, TH_H))):
         frac = pts_.ptp(0) / np.array(span, float)
         if min(frac) < 0.25:
+            # Say which axis and what to do about it. Every capture on this bench
+            # so far has failed here, and the bare percentages did not tell you
+            # whether to wave wider, wave slower, or hold still more - so the
+            # session got repeated with the same mistake in it.
+            thin = "horizontally" if frac[0] < frac[1] else "vertically"
+            why = ("the hand was not the brightest thing the thermal detector "
+                   "could find - a face or a radiator outshone it"
+                   if name == "thermal" else
+                   "the hand was not the biggest thing that MOVED - the visible "
+                   "side keys off motion against the sequence median, so a "
+                   "shifting body, a swaying arm or a moved camera takes over")
             raise SystemExit(
-                "%s detections only span %.0f%%x%.0f%% of the frame. The object did not "
-                "move enough, or the detector is locked on something static - either way "
-                "the fit would be an extrapolation from a cluster."
-                % (name, frac[0] * 100, frac[1] * 100))
+                "%s detections only span %.0f%%x%.0f%% of the frame, mostly too thin %s.\n"
+                "The fit would be an extrapolation from a cluster, so it is refused.\n"
+                "\n"
+                "Most likely %s.\n"
+                "\n"
+                "A capture that works: 30-60 frames (~5s), bare hand, sleeve down,\n"
+                "0.6-1.0m from the lens, held still for two or three frames at each\n"
+                "of ~9 positions on a 3x3 grid that reaches the corners of the\n"
+                "thermal field. Everything else in the scene stays put, including\n"
+                "you - sit down and move only the arm. Nothing else warm in view.\n"
+                "Then: ./handreg.py <dir> -o warp.lut --preview"
+                % (name, frac[0] * 100, frac[1] * 100, thin, why))
 
     # both views must agree the object moved the same way
     for k, ax in ((0, "x"), (1, "y")):

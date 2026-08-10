@@ -26,7 +26,8 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import live  # noqa: E402
+import live    # noqa: E402
+import detect  # noqa: E402
 
 FAILS = []
 
@@ -61,6 +62,219 @@ def load_pair(d):
         if os.path.exists(rgb) and os.path.exists(th):
             return open(rgb, "rb").read(), open(th, "rb").read(), json.load(open(jp))
     raise SystemExit("no frame pair in %s" % d)
+
+
+def board_clock():
+    """The cadence/skew panel, off a dict, plus the header that feeds it.
+
+    Worth testing offline because every input is board-side and the failure is
+    quiet: a wrong median here does not break the picture, it just misreports how
+    far apart in time the two planes being fused were looked at.
+    """
+    import ast
+
+    print("\nboard clock")
+    src = (live.SETUP_CODE.replace("__TMIN__", "-10").replace("__TMAX__", "140")
+           .replace("__AUTORANGE__", "True").replace("__Q__", "80"))
+    try:
+        ast.parse(src)
+        ok = "#F %d %d %d %d %d" in src and "ticks_diff" in src
+    except SyntaxError as e:
+        ok = False
+        src = str(e)
+    check("the board code parses and emits both clocks in the header", ok)
+
+    now = time.time()
+    st = {"dt_window": [113, 114, 114, 115, 114, 1824, 114, 113],
+          "skew_window": [11, 12, 12, 13, 12], "fps": 8.7,
+          "last_ffc_t": now - 42, "ffcs": 3}
+    t = live.timing(st, now)
+    check("the FFC gap is kept out of the cadence median",
+          t["thermal_ms"]["median"] == 114 and t["thermal_ms"]["n"] == 7
+          and t["thermal_ms"]["max"] == 115,
+          "median %d ms over %d frames" % (t["thermal_ms"]["median"], t["thermal_ms"]["n"]))
+    check("cadence is reported as the sensor's own rate, not the link's",
+          abs(t["thermal_fps"] - 8.77) < 0.01 and t["host_fps"] == 8.7,
+          "sensor %.2f fps, link %.2f fps" % (t["thermal_fps"], t["host_fps"]))
+    check("the skew is expressed as a share of one thermal period",
+          abs(t["skew_frac"] - 12 / 114.0) < 1e-3, "%.1f%%" % (100 * t["skew_frac"]))
+    check("a clock with no data reports nothing rather than zero",
+          live.timing({}, now)["thermal_ms"] is None)
+
+    # the health panel's reading of the same numbers
+    pipe = live.Pipeline(Args())
+    pipe.process(*load_pair("../captures/handwave3")[:2])
+    names = lambda s: {c["name"]: c for c in live.health(pipe, s, now)}  # noqa: E731
+
+    h = names(st)
+    check("a healthy cadence and pairing read green",
+          h["cadence"]["level"] == "ok" and h["pairing"]["level"] == "ok",
+          "%s | %s" % (h["cadence"]["text"], h["pairing"]["text"]))
+    check("a fresh FFC is surfaced, an old one is not",
+          "ffc" not in h and "ffc" in names(dict(st, last_ffc_t=now - 1)))
+
+    h = names(dict(st, skew_window=[40] * 8))
+    check("a visible frame that lags most of a period warns",
+          h["pairing"]["level"] == "warn", h["pairing"]["text"])
+    h = names(dict(st, dt_window=[300] * 8))
+    check("a thermal cadence far off 114 ms warns",
+          h["cadence"]["level"] == "warn", h["cadence"]["text"])
+
+    # the header the reader parses, including the resync case that made the
+    # trailing fields optional in the first place
+    def parse(line):
+        f = line.split()
+        return tuple(int(f[i]) if len(f) > i else None for i in (4, 5, 6))
+    check("the header carries both clocks and the stall count",
+          parse("#F 11024 19200 0 114 12 0") == (114, 12, 0))
+    check("a truncated header does not raise, it reports no timing",
+          parse("#F 11024 19200 0") == (None, None, None))
+
+    # --- protecting the sensor from host load. The Lepton's one unrecoverable
+    # failure is the collector firing while it is up, and the one way host load
+    # reaches it is the board sitting in out.write() instead of snapshot().
+    check("the write-stall limit keeps the sensor inside its tested envelope",
+          "if stalls > 2:" in src and str(live.LEPTON_SAFE_GAP_MS) == "2500",
+          "3 timeouts = 1500ms, envelope %dms" % live.LEPTON_SAFE_GAP_MS)
+
+    h = names(dict(st, stalls=4))
+    check("write stalls are reported as a threat to the sensor, not a slow link",
+          h["thermal load"]["level"] == "warn", h["thermal load"]["text"])
+    h = names(dict(st, starved=2, last_starve_ms=3100))
+    check("a gap past the tested envelope fails outright",
+          h["thermal load"]["level"] == "fail", h["thermal load"]["text"])
+    check("a clean run says so rather than staying silent",
+          names(st)["thermal load"]["level"] == "ok",
+          names(st)["thermal load"]["text"])
+
+    # the heap watch tightens as the margin closes, because near the floor the
+    # measured drain rate is exactly what should not be trusted
+    s = live.Streamer.__new__(live.Streamer)
+    rate = lambda free: sum(  # noqa: E731
+        live.Streamer._want_heap(type("S", (), {"state": {"heap_free": free}})(), b)
+        for b in range(30))
+    check("the heap is read every batch once the margin is thin",
+          rate(live.HEAP_FLOOR) == 30 and rate(3 * live.HEAP_FLOOR) == 10
+          and rate(20 * live.HEAP_FLOOR) == 3,
+          "%d/30 near the floor, %d/30 mid, %d/30 with room"
+          % (rate(live.HEAP_FLOOR), rate(3 * live.HEAP_FLOOR), rate(20 * live.HEAP_FLOOR)))
+    check("a session with no reading yet takes one immediately",
+          live.Streamer._want_heap(type("S", (), {"state": {}})(), 7) is True)
+
+
+def failure_reporting():
+    """The board's own exception must survive the port dying while it is read.
+
+    Both halves of this were real losses. _dump printed the first 32 bytes of the
+    residual buffer, and a traceback puts the one line worth having - the
+    exception type - last; and _traceback let a read error propagate, so
+    SerialException replaced the board fault it was in the middle of reporting.
+    The two together turned `RuntimeError: Frame buffer overflow` into `device
+    disconnected or multiple access on port?`.
+    """
+    import serial
+
+    print("\nfailure reporting")
+    buf = bytearray(b'  File "<stdin>", line 1, in <module>\r\n'
+                    b'RuntimeError: Frame buffer overflow, try reducing the frame size\r\n')
+    dump = live.Streamer._dump(buf)
+    check("the buffer dump keeps the line that names the fault",
+          "Frame buffer overflow" in dump and "line 1" in dump)
+
+    class Dying(live.Streamer):
+        def __init__(self, chunks):
+            self.buf, self.chunks = bytearray(), list(chunks)
+            self.last_line, self.last_line_t = b"", 0.0
+
+        def _fill(self, timeout=10.0):
+            if not self.chunks:
+                raise serial.SerialException(
+                    "device reports readiness to read but returned no data")
+            self.buf += self.chunks.pop(0)
+            return True
+
+    got = Dying([b'  File "<stdin>", line 1, in <module>\r\n',
+                 b'RuntimeError: Frame buffer overflow\r\n'])._traceback(
+                     "\x04Traceback (most recent call last):")
+    check("a port that dies mid-traceback still reports the board's exception",
+          "Frame buffer overflow" in got and "port died" in got, got[-90:])
+
+    got = Dying([b'OSError: 5\r\n\x04\x04>leftover'])._traceback(
+        "\x04Traceback (most recent call last):")
+    check("a traceback that arrives whole is not marked truncated",
+          "OSError: 5" in got and "port died" not in got, got)
+
+    d = live.Latest()
+    d.put(1)
+    d.put(2)
+    check("the handoff slot keeps the newest frame and counts the drop",
+          d.get(0.01) == 2 and d.dropped == 1)
+    check("an empty slot returns None rather than blocking forever",
+          d.get(0.01) is None)
+
+
+def threading_and_detection(y, thermal):
+    """Renderer + Detector driven off recorded frames, with no board attached.
+
+    Worth having offline because the interesting failure is not the detector
+    getting a box wrong - it is a box carrying a temperature that came from the
+    wrong pixels. With the placeholder warp that is the *expected* state, so the
+    check is that the flag saying so is present, not that it is absent.
+    """
+    print("\nrender thread and detection")
+    pipe = live.Pipeline(Args())
+    state, work = {}, live.Latest()
+
+    try:
+        det = detect.Detector(size=320)
+    except FileNotFoundError as e:
+        check("detector model is present", False, str(e))
+        det = None
+
+    r = live.Renderer(pipe, state, work, det)
+    r.start()
+    try:
+        for _ in range(6):
+            work.put((cv2.imencode(".jpg", np.frombuffer(y, np.uint8).reshape(
+                live.OUT_H, live.OUT_W), [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes(),
+                thermal))
+            time.sleep(0.25)
+
+        check("the render thread produces a frame without the reader touching fusion",
+              state.get("frame") is not None and state.get("rendered", 0) > 0,
+              "%d rendered, %d dropped" % (state.get("rendered", 0),
+                                           state.get("dropped", 0)))
+        check("rows_rebuilt is recorded by the thread that actually ran the fusion",
+              len(state.get("rows_window") or []) > 0)
+
+        if det:
+            dets = state.get("detections")
+            check("detection ran on the render pipeline", dets is not None,
+                  "%d box(es) in %.0f ms" % (len(dets or []), state.get("detect_ms", 0)))
+            withtemp = [d for d in (dets or []) if "max_c" in d]
+            check("every box that overlaps the thermal footprint carries a temperature",
+                  all(("max_c" in d) or d.get("no_thermal") for d in (dets or [])),
+                  "%d of %d with a reading" % (len(withtemp), len(dets or [])))
+            lo, hi = pipe.f.tmin_mc / 1000.0, pipe.f.tmax_mc / 1000.0
+            check("box temperatures land inside the sensor range",
+                  all(lo - 0.5 <= d["max_c"] <= hi + 0.5 for d in withtemp),
+                  "%d readings" % len(withtemp))
+            check("an unregistered warp is carried alongside every box",
+                  pipe.warped is False)
+    finally:
+        r.stop.set()
+
+    # The visible temporal filter: live.py set cfg.y_temporal_knee and then never
+    # called fusion_y_temporal(), so --y-knee reserved 256KB and filtered nothing.
+    a = Args()
+    a.y_knee, a.y_frames = 4, 8
+    p2 = live.Pipeline(a)
+    out = [p2.process(y, thermal) for _ in range(3)]
+    check("the visible temporal filter is actually applied now",
+          p2.y_knee == 4 and out[-1].shape == (live.OUT_H, live.OUT_W, 3)
+          and out[-1].any(), "knee %d" % p2.y_knee)
+    p2.temporal_reset()
+    check("temporal_reset is reachable and does not fault", True)
 
 
 def main():
@@ -377,8 +591,28 @@ def main():
         code, body = get("/stat")
         check("/stat reports the range and the warp state", code == 200 and "range" in body,
               body.strip())
+
+        code, body = get("/timing")
+        t = json.loads(body)
+        check("/timing answers before the board has reported a clock",
+              code == 200 and t["thermal_ms"] is None and t["expected_ms"] == 114.0,
+              "expected %.1f ms" % t["expected_ms"])
+
+        code, body = get("/detections")
+        d = json.loads(body)
+        check("/detections answers even with no detector running",
+              code == 200 and d["detections"] == [] and d["warped"] is False,
+              "warped=%s" % d["warped"])
+
+        get("/set?boxes=0")
+        check("/set can turn the overlay off", pipe.show_detections is False)
+        get("/set?boxes=1")
     finally:
         srv.shutdown()
+
+    board_clock()
+    failure_reporting()
+    threading_and_detection(y, thermal)
 
     print()
     if FAILS:

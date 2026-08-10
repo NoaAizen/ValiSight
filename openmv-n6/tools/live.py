@@ -36,6 +36,7 @@ import serial
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capture  # noqa: E402  - reuse the bring-up that is known to survive
+import detect   # noqa: E402
 
 PORT = "/dev/ttyACM0"
 LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "host", "libfusion.so")
@@ -50,8 +51,21 @@ out = sys.stdout.buffer
 CHUNK = 4096
 QUALITY = __Q__
 
+# Last thermal arrival, on the board's own clock. The host cannot derive this:
+# by the time a frame reaches it, the interval has been through a 4KB-chunked
+# CDC write, a 500ms stall retry loop and the host's own scheduling, and the
+# sensor cadence is buried under all three. ticks_ms() is a plain counter read,
+# not a heap walk like gc.mem_free(), and small ints do not allocate - so unlike
+# the heap reading this is safe to take every frame.
+_t_prev = 0
+# 500ms write timeouts hit on the previous frame. Nonzero means the host stopped
+# draining the port, which is the only way host load reaches the thermal sensor:
+# the board sits in out.write() instead of calling snapshot().
+_stalled = 0
+
 
 def stream(n, report=0):
+    global _t_prev, _stalled
     # gc.mem_free() walks the whole 25MB heap and costs 227ms - measured on the
     # board 2026-08-09, and it is the same heap-sized cost as gc.collect(). Per
     # frame it took the stream from 8.8 to 3.2 fps. So the host asks for a reading
@@ -62,9 +76,42 @@ def stream(n, report=0):
         sys.stdout.write("#HEAP %d\n" % gc.mem_free())
     for _ in range(n):
         t, was_torn = good_snapshot(lep)       # paces the loop at the thermal rate
+        t_th = time.ticks_ms()
         j = rgb.snapshot().to_jpeg(quality=QUALITY)
+        t_rgb = time.ticks_ms()
         tb = t.bytearray()
-        sys.stdout.write("#F %d %d %d\n" % (j.size(), len(tb), 1 if was_torn else 0))
+        # Two extra numbers, both differences taken on this clock so the host
+        # never has to reason about ticks wrapping:
+        #
+        #   dt    since the previous thermal frame landed. The sensor's true
+        #         cadence - 114ms, and 1824ms across an FFC.
+        #   skew  from the thermal frame landing to the visible one being in
+        #         hand. This is the pairing error the fusion inherits: the two
+        #         planes it registers were not looked at at the same moment, and
+        #         anything moving is displaced by whatever this says.
+        #
+        # skew is measured between *completions*, which is the honest thing to
+        # report and not the whole story: the Lepton's frame is already ~one
+        # VoSPI transfer old when snapshot() returns, while the PAG's is fresh.
+        # So the true exposure gap is larger than this number, and this is its
+        # lower bound.
+        # A sixth field costs nothing. MicroPython's GC allocates in 16-byte
+        # blocks, and both the 3-tuple and the 6-tuple, and both the short and
+        # the long header string, land in the same block - so the whole clock is
+        # free against the ~208 B/frame this loop already leaks. That mattered
+        # enough to check: the leak is what drains the heap, an exhausted heap is
+        # what fires the automatic collector, and a collect with the Lepton up
+        # wedges it permanently.
+        #
+        # _stalled belongs to the PREVIOUS frame - this header is written before
+        # this frame's payload, so its stall count does not exist yet. It is the
+        # number that says whether the host starved the board, which is the one
+        # form of host load that can reach the sensor.
+        sys.stdout.write("#F %d %d %d %d %d %d\n" % (
+            j.size(), len(tb), 1 if was_torn else 0,
+            time.ticks_diff(t_th, _t_prev), time.ticks_diff(t_rgb, t_th), _stalled))
+        _t_prev = t_th
+        _stalled = 0
         for buf in (memoryview(j.bytearray()), memoryview(tb)):
             off = 0
             stalls = 0
@@ -82,12 +129,27 @@ def stream(n, report=0):
                     stalls = 0
                     continue
                 # Nothing moved for a full timeout. Retrying is right - that is
-                # what recovers the frame - but not forever: a host that has
-                # died must not leave this loop writing into a port nobody
-                # drains, which is what wedges the board hard enough to need a
-                # replug. Give up on the batch and let the prompt resynchronise.
+                # what recovers the frame - but not forever, and the limit is set
+                # by the Lepton rather than by patience.
+                #
+                # Every millisecond in here is a millisecond snapshot() is not
+                # being called. Measured 2026-08-09, plain gaps between snapshots
+                # of 150/300/600/1000/1500/2500 ms were all harmless - 2500ms is
+                # the largest gap this part is KNOWN to survive, and beyond it
+                # there is no measurement, only hope. The old limit of 4 allowed
+                # five 500ms timeouts, 2.5s in this loop alone, before the frame
+                # loop and the host's round trip to submit the next batch were
+                # added on top - so it could put the sensor outside the tested
+                # envelope in exactly the situation where the host is already
+                # struggling. Three timeouts is 1.5s, which leaves the rest of
+                # the gap inside 2500ms.
+                #
+                # The trade is deliberate: giving up costs the tail of one frame
+                # and a resync. Wedging the Lepton costs a full restart and is
+                # unrecoverable any other way.
                 stalls += 1
-                if stalls > 4:
+                _stalled += 1
+                if stalls > 2:
                     return
     # The heap reading is the whole early-warning system. gc.collect() cannot be
     # called while the Lepton is up - it wedges the part permanently, measured
@@ -167,8 +229,17 @@ class Pipeline:
     def __init__(self, args):
         self.lib = ctypes.CDLL(LIB)
         self.lib.fusion_init.argtypes = [ctypes.POINTER(Fusion), ctypes.POINTER(Cfg)]
+        # y is c_void_p, not c_char_p, so that the pointer fusion_y_temporal()
+        # returns can be passed straight through. A bytes object still converts.
         self.lib.fusion_process.argtypes = [ctypes.POINTER(Fusion),
-                                            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p]
+                                            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p]
+        self.lib.fusion_y_temporal.argtypes = [ctypes.POINTER(Fusion), ctypes.c_char_p]
+        # c_void_p and never c_char_p: a c_char_p restype builds a Python bytes
+        # by scanning to the first NUL, and a luma frame is full of them, so the
+        # buffer handed on would be truncated at the first black pixel. That is
+        # an out-of-bounds read inside fusion_process(), not a dim picture.
+        self.lib.fusion_y_temporal.restype = ctypes.c_void_p
+        self.lib.fusion_temporal_reset.argtypes = [ctypes.POINTER(Fusion)]
         self.lib.fusion_set_warp.argtypes = [ctypes.POINTER(Fusion), ctypes.c_char_p]
         self.lib.fusion_set_homography.argtypes = [ctypes.POINTER(Fusion),
                                                    ctypes.POINTER(ctypes.c_double)]
@@ -217,6 +288,7 @@ class Pipeline:
         # allocated there, so flipping the knee later cannot turn the filter on.
         cfg.y_temporal_knee = args.y_knee
         cfg.y_temporal_frames = args.y_frames
+        self.y_knee = args.y_knee
 
         self.f = Fusion()
         if self.lib.fusion_init(ctypes.byref(self.f), ctypes.byref(cfg)) != 0:
@@ -239,6 +311,7 @@ class Pipeline:
         self.mix = 50
         self.outline = False
         self.blink_period = 0.5      # seconds per half-cycle; ~2 alternations/s
+        self.show_detections = True
 
         if args.warp:
             with open(args.warp, "rb") as fp:
@@ -288,9 +361,23 @@ class Pipeline:
 
     def process(self, y, thermal):
         with self.lock:
+            if self.y_knee:
+                # fusion.h's documented call site, which live.py never used:
+                # setting cfg.y_temporal_knee only made fusion_init allocate the
+                # buffer, so --y-knee reserved 256KB and filtered nothing. It
+                # returns `y` unchanged when disabled, so the guard is only here
+                # to skip a call, not to choose behaviour.
+                y = self.lib.fusion_y_temporal(ctypes.byref(self.f), y)
             self.lib.fusion_process(ctypes.byref(self.f), y, thermal, self.out)
             return np.frombuffer(self.out, np.uint8,
                                  OUT_W * OUT_H * 3).reshape(OUT_H, OUT_W, 3).copy()
+
+    def temporal_reset(self):
+        """Drop both frame histories. For the caller that knows the previous
+        frame has stopped being a statement about the same scene - a restart, a
+        range change, an FFC."""
+        with self.lock:
+            self.lib.fusion_temporal_reset(ctypes.byref(self.f))
 
     def temp_at(self, x, y):
         t = Temp()
@@ -300,6 +387,26 @@ class Pipeline:
             return None
         return {"c": t.milli_c / 1000.0, "raw": t.raw_milli_c / 1000.0,
                 "tx": t.th_x, "ty": t.th_y, "repaired": bool(t.repaired)}
+
+    def temp_region(self, x, y, w, h):
+        """min/max/mean over a rectangle, plus where the peak sits.
+
+        This is what turns a detection into a measurement: the box comes from the
+        visible camera, and fusion_temp_region() maps it through the warp into the
+        thermal frame. Which is also the catch - with the placeholder warp the
+        rectangle lands wherever the stretch put it, so the number is real
+        radiometry read from the wrong pixels. Callers must carry `warped`
+        alongside anything they quote from here.
+        """
+        r = Region()
+        with self.lock:
+            rc = self.lib.fusion_temp_region(ctypes.byref(self.f), int(x), int(y),
+                                             int(w), int(h), ctypes.byref(r))
+        if rc != 0:
+            return None
+        return {"min": r.min_milli_c / 1000.0, "max": r.max_milli_c / 1000.0,
+                "mean": r.mean_milli_c / 1000.0, "max_x": r.max_x, "max_y": r.max_y,
+                "samples": r.samples, "repaired": r.repaired}
 
     def cover_grid(self):
         """The 0/1 thermal coverage mask on the low-res grid, straight out of the
@@ -550,6 +657,104 @@ def health(pipe, state, now):
     else:
         add("framing", "ok", "in step")
 
+    # --- the two sensors' timing, from the board's clock. Separate from the
+    # "stream" check above on purpose: that one is about the link keeping up,
+    # this one is about whether the pair being fused was looked at at the same
+    # moment. A link can be perfect while the pairing is not.
+    tm = timing(state, now)
+    if tm["thermal_ms"]:
+        med = tm["thermal_ms"]["median"]
+        want = tm["expected_ms"]
+        if abs(med - want) > 0.25 * want:
+            add("cadence", "warn", "thermal frame every %d ms, expected %.0f" % (med, want))
+        else:
+            add("cadence", "ok", "thermal %d ms (%.2f fps)" % (med, tm["thermal_fps"]))
+    if tm["skew_frac"] is not None:
+        sm = tm["skew_ms"]["median"]
+        if tm["skew_frac"] > SKEW_WARN:
+            add("pairing", "warn", "visible frame lags thermal by %d ms (%.0f%% of a "
+                "frame) - anything moving is displaced before the warp sees it"
+                % (sm, 100 * tm["skew_frac"]))
+        else:
+            add("pairing", "ok", "visible +%d ms after thermal (%.0f%% of a frame)"
+                % (sm, 100 * tm["skew_frac"]))
+    # --- the sensor being starved by host load. This is the check the whole
+    # board clock earns its keep on. Everything else about a slow host is a
+    # frame rate complaint; this one is the part that cannot be undone, because
+    # a wedged Lepton needs a fresh csi.CSI() object and no amount of retrying,
+    # re-arming or soft re-init has ever recovered one.
+    if tm["starved"]:
+        add("thermal load", "fail",
+            "%d thermal gap%s past %dms, worst %dms - the board was not being "
+            "drained and the sensor went unserviced beyond anything measured safe"
+            % (tm["starved"], "" if tm["starved"] == 1 else "s",
+               tm["safe_gap_ms"], tm["last_starve_ms"] or 0))
+    elif tm["stalls"]:
+        add("thermal load", "warn",
+            "%d write stall%s - the host stopped draining the port for 500ms at a "
+            "time. Frames are lost and the sensor waits; reduce host work before "
+            "this reaches %dms" % (tm["stalls"], "" if tm["stalls"] == 1 else "s",
+                                   tm["safe_gap_ms"]))
+    elif tm["thermal_ms"]:
+        # The longest gap excluding FFCs. An FFC is a different mechanism and
+        # not a hazard: the sensor stops delivering for 1824ms but snapshot()
+        # BLOCKS, so the consumer stays parked in the driver rather than leaving
+        # the part unserviced. Quoting it here would read as the sensor being
+        # three quarters of the way to danger every three minutes.
+        add("thermal load", "ok", "no write stalls, longest gap %dms of %dms"
+            % (tm["thermal_ms"]["max"], tm["safe_gap_ms"]))
+
+    if tm["ffc_ago_s"] is not None and tm["ffc_ago_s"] < 3.0:
+        # The sensor needs time to settle after the shutter. Quoting through one
+        # is the kind of error that survives into a report.
+        add("ffc", "warn", "shutter closed %.1fs ago - let the sensor settle "
+            "before quoting a reading" % tm["ffc_ago_s"])
+
+    # --- short or unreadable JPEGs. The visible signature of bytes lost on the
+    # wire: the board announced a length and the host got fewer usable bytes.
+    # Framing can stay in step through this, so it does not always show up as a
+    # resync - and a frame that silently vanishes makes the link look healthier
+    # than it is. The known cause on this bench is another process opening the
+    # port and toggling DTR, which makes the CDC discard what it has queued;
+    # keep ModemManager off the device (ID_MM_DEVICE_IGNORE) before blaming the
+    # firmware.
+    bad = state.get("bad_jpeg", 0)
+    if bad:
+        add("jpeg", "warn", "%d frame%s arrived corrupt - bytes lost on the wire"
+            % (bad, "" if bad == 1 else "s"))
+
+    # --- the render thread. Dropping is by design when it falls behind, but the
+    # viewer must say so: a page showing every third frame while quoting the
+    # board's fps is describing a stream nobody is watching.
+    dropped, rendered = state.get("dropped", 0), state.get("rendered", 0)
+    if rendered:
+        rate = dropped / float(dropped + rendered)
+        if rate > 0.25:
+            add("render", "fail", "%.0f%% of frames dropped before display" % (100 * rate))
+        elif rate > 0.02:
+            add("render", "warn", "%.0f%% dropped before display" % (100 * rate))
+        else:
+            add("render", "ok", "%d rendered" % rendered)
+
+    # --- detection. Reported separately from the boxes themselves because the
+    # thing worth knowing is whether the temperature beside a label means
+    # anything, and without a calibrated warp it does not.
+    dt = state.get("detect_t")
+    if dt is not None:
+        age = now - dt
+        n_det = len(state.get("detections") or [])
+        if state.get("detect_error"):
+            add("detect", "fail", state["detect_error"])
+        elif age > DETECT_STALE_S * 4:
+            add("detect", "warn", "no detection for %.0fs" % age)
+        elif not pipe.warped:
+            add("detect", "warn", "%d box%s, %.0fms - temperatures are read through "
+                "the placeholder warp and belong to the wrong pixels"
+                % (n_det, "" if n_det == 1 else "es", state.get("detect_ms", 0)))
+        else:
+            add("detect", "ok", "%d box%s, %.0fms"
+                % (n_det, "" if n_det == 1 else "es", state.get("detect_ms", 0)))
+
     # --- VoSPI tearing. Unlike the dead rows this really is random, and a torn
     #     frame is stale data in part of the image, not a marked defect.
     #
@@ -705,6 +910,165 @@ class _PlannedRestart(Exception):
 # fine and a dead stream to be lost by getting it wrong.
 HEAP_FLOOR = 4 << 20
 
+# The largest gap between snapshots this part is KNOWN to survive. Measured
+# 2026-08-09: plain sleeps of 150/300/600/1000/1500/2500 ms between snapshots
+# were all harmless, and a gc.collect() of any length wedges it. 2500ms is
+# therefore the edge of the tested envelope, not a limit anyone has found - past
+# it there is simply no measurement. The board's own thermal interval is the only
+# way to see it, since a gap on this side is indistinguishable from a slow link.
+LEPTON_SAFE_GAP_MS = 2500
+
+
+class Latest:
+    """One-slot handoff between threads: the newest item wins, older ones drop.
+
+    A queue is wrong here in both of its usual forms. Unbounded, it grows without
+    limit the moment the consumer falls behind, and every frame it eventually
+    renders is already stale - a live viewer that is four seconds behind is not
+    showing you the board. Bounded-and-blocking puts the consumer's latency
+    straight back onto the producer, which is precisely the coupling this split
+    exists to break: the serial reader must never wait for anything.
+
+    So dropping is the correct behaviour, not a compromise. It is counted, though
+    - a viewer quietly showing every third frame while reporting the board's fps
+    would be lying about what you are looking at.
+    """
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.item = None
+        self.dropped = 0
+        self.closed = False
+
+    def put(self, item):
+        with self.cv:
+            if self.item is not None:
+                self.dropped += 1
+            self.item = item
+            self.cv.notify()
+
+    def get(self, timeout=0.5):
+        with self.cv:
+            if self.item is None:
+                self.cv.wait(timeout)
+            item, self.item = self.item, None
+            return item
+
+    def close(self):
+        with self.cv:
+            self.closed = True
+            self.cv.notify_all()
+
+
+class Renderer(threading.Thread):
+    """Everything between a received frame and the JPEG the browser gets.
+
+    Split off the reader so that host compute cannot back-pressure the board's
+    CDC. It also gives the detector somewhere to live: at 68-99ms a detection is
+    most of a 114ms frame period, and running it inline would have guaranteed the
+    500ms write stall that costs a frame's tail.
+    """
+
+    def __init__(self, pipe, state, work, detector=None):
+        super().__init__(daemon=True)
+        self.pipe, self.state, self.work = pipe, state, work
+        self.stop = threading.Event()
+        # The detector gets its own thread and its own one-slot handoff for the
+        # same reason this class exists: it is the slowest stage, and the frame
+        # rate should be set by the sensor rather than by the network.
+        self.det_in = Latest() if detector else None
+        self.det = detector
+        if detector:
+            self.det_thread = threading.Thread(target=self._detect_loop, daemon=True)
+            self.det_thread.start()
+
+    def _detect_loop(self):
+        while not self.stop.is_set():
+            item = self.det_in.get()
+            if item is None:
+                continue
+            y = item
+            try:
+                dets = self.det(y)
+            except Exception as e:                  # a bad frame must not end detection
+                self.state["detect_error"] = "%s: %s" % (type(e).__name__, e)
+                continue
+            # The temperature is the whole reason for the box. Taken here rather
+            # than in the drawing code so that /detections and the overlay quote
+            # the same number, and so a slow region query costs the detector's
+            # thread rather than the frame rate.
+            for d in dets:
+                r = self.pipe.temp_region(d["x"], d["y"], d["w"], d["h"])
+                if r is None or r["samples"] == 0:
+                    d["no_thermal"] = True
+                    continue
+                d["max_c"], d["mean_c"] = round(r["max"], 1), round(r["mean"], 1)
+                d["max_x"], d["max_y"] = r["max_x"], r["max_y"]
+                d["repaired"] = bool(r["repaired"])
+            self.state["detections"] = dets
+            self.state["detect_ms"] = round(self.det.ms, 1)
+            self.state["detect_t"] = time.time()
+
+    def run(self):
+        while not self.stop.is_set():
+            item = self.work.get()
+            if item is None:
+                continue
+            jpg, thermal = item
+
+            y = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_GRAYSCALE)
+            if y is None or y.shape != (OUT_H, OUT_W):
+                # A short or corrupt JPEG is the visible signature of bytes lost
+                # on the wire. Count it: without this the frame simply vanishes
+                # and the link looks healthier than it is.
+                self.state["bad_jpeg"] = self.state.get("bad_jpeg", 0) + 1
+                continue
+
+            p = self.pipe
+            rgb = p.process(y.tobytes(), thermal)
+
+            rw = self.state.setdefault("rows_window", [])
+            rw.append(p.f.rows_rebuilt)
+            del rw[:-60]
+
+            if p.view != "fused" or p.outline:
+                edges = p.view == "edges"
+                rgb = compose(p.view, rgb, y,
+                              treg=p.treg_grid() if edges else None,
+                              exclude=p.repaired_grid() if edges else None,
+                              cover=p.cover_grid() if p.outline else None,
+                              mix=p.mix,
+                              phase=int(time.time() / p.blink_period) % 2 == 0)
+
+            if self.det_in is not None:
+                # The detector reads the plain visible luma, not the fused frame.
+                # The COCO weights were trained on natural images; a false-colour
+                # thermal composite is further from that than grey is, and the
+                # boxes are wanted in visible-camera coordinates anyway - that is
+                # the frame fusion_temp_region() maps through the warp.
+                self.det_in.put(y)
+                if p.show_detections:
+                    dets = self.state.get("detections") or []
+                    age = time.time() - self.state.get("detect_t", 0)
+                    # Boxes outlive the frame they were found in by design - the
+                    # detector runs slower than the stream. Past this they are a
+                    # claim about a scene that may be gone, so drop them rather
+                    # than draw a stale rectangle over a moved object.
+                    if age < DETECT_STALE_S:
+                        detect.annotate(rgb, dets, p.warped)
+
+            ok, enc = cv2.imencode(".jpg", rgb[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
+            if ok:
+                self.state["frame"] = enc.tobytes()
+            self.state["rendered"] = self.state.get("rendered", 0) + 1
+            self.state["dropped"] = self.work.dropped
+
+
+# Boxes older than this are not drawn. The detector runs at ~10Hz against an
+# 8.8Hz stream, so in normal operation a box is at most one frame old; this only
+# fires when detection has actually fallen behind or died.
+DETECT_STALE_S = 1.0
+
 
 class Streamer(threading.Thread):
     """Reads framed board output as fast as the port will give it.
@@ -716,9 +1080,10 @@ class Streamer(threading.Thread):
     That is the failure this project spent a long time chasing.
     """
 
-    def __init__(self, port, pipeline, quality, state, batch=20):
+    def __init__(self, port, pipeline, quality, state, work, batch=20):
         super().__init__(daemon=True)
         self.port, self.pipe, self.quality, self.state = port, pipeline, quality, state
+        self.work = work
         self.batch = batch
         self.buf = bytearray()
         self.stop = threading.Event()
@@ -766,14 +1131,31 @@ class Streamer(threading.Thread):
         return out
 
     @staticmethod
-    def _dump(b, n=32):
-        """Head of the residual buffer as hex plus repr. Both, because what is
-        left in there is either text or binary and you do not know which in
-        advance: b'\\x04\\x04>' is legible in repr and noise in hex, the tail of
-        a half-read frame payload is the other way round."""
+    def _dump(b, n=32, tail=96):
+        """Head of the residual buffer as hex plus repr, then its tail as repr.
+
+        Both encodings for the head, because what is left in there is either text
+        or binary and you do not know which in advance: b'\\x04\\x04>' is legible
+        in repr and noise in hex, the tail of a half-read frame payload is the
+        other way round.
+
+        The tail is here because this function once threw away the diagnosis. A
+        board exception arrived, the port died mid-traceback, and the 174 bytes
+        still sitting in the buffer held the one line worth having - the exception
+        type and its message, which a traceback prints LAST. Dumping only the head
+        printed `File "<stdin>", line 1, in <module>`, the outer frame, which
+        names nothing at all. The answer was already on this host and got
+        truncated away, so the tail gets the generous allowance: a MicroPython
+        exception line runs to ~70 characters before the prompt bytes.
+        """
         head = bytes(b[:n])
-        return "%s%s %r" % (" ".join("%02x" % c for c in head),
-                            "..." if len(b) > n else "", head)
+        out = "%s %r" % (" ".join("%02x" % c for c in head), head)
+        rest = b[n:]
+        if rest:
+            end = bytes(rest[-tail:])
+            skipped = len(rest) - len(end)
+            out += " ...%s%r" % ("[%d more]" % skipped if skipped else "", end)
+        return out
 
     def run(self):
         """Supervisor. Streaming is a session, not a one-shot, and every failure
@@ -920,10 +1302,25 @@ class Streamer(threading.Thread):
         message - and it arrives several lines after the marker. Reporting only
         the first names a file and says nothing about what went wrong, which is
         how a board fault reads as a mystery.
+
+        Reading it must never be allowed to fail the report. Whatever stalls the
+        interpreter enough to raise on the board is also what starves TinyUSB's
+        tud_task, so the CDC very often dies in the middle of these very bytes -
+        that is the common case here, not an edge case. Letting the read error
+        propagate substitutes it for the board fault, and the session is then
+        reported as `SerialException: device disconnected or multiple access on
+        port?`, which sends you to check the cable while the real exception is
+        sitting unread in the buffer. Keep whatever arrived and mark it partial.
         """
         deadline = time.time() + 3
+        cut = ""
         while b"\x04\x04>" not in self.buf and time.time() < deadline:
-            if not self._fill(0.5):
+            try:
+                if not self._fill(0.5):
+                    cut = "<no more output>"
+                    break
+            except Exception as e:
+                cut = "<port died mid-traceback: %s: %s>" % (type(e).__name__, e)
                 break
         i = self.buf.find(b"\x04\x04>")
         end = (i + 3) if i >= 0 else len(self.buf)
@@ -931,6 +1328,8 @@ class Streamer(threading.Thread):
         del self.buf[:end]
         out = [first.lstrip("\x04")]
         out += [ln.strip() for ln in rest.decode("utf-8", "replace").splitlines()]
+        if cut and i < 0:
+            out.append(cut)
         return " | ".join(ln for ln in out if ln)
 
     def _resync(self, why):
@@ -978,6 +1377,32 @@ class Streamer(threading.Thread):
         self.s.write(code.encode() + b"\x04")
         self._await(b"OK", timeout)
 
+    def _want_heap(self, batch_no):
+        """Should this batch carry a heap reading?
+
+        The reading costs 227ms - gc.mem_free() walks the whole 25MB heap - so it
+        cannot be taken every batch. But a fixed rate is the wrong shape for what
+        it is watching: the danger is the automatic collector firing on an
+        exhausted heap, which wedges the Lepton permanently, and how urgent that
+        is depends entirely on how much room is left.
+
+        So the rate follows the margin. Far from the floor, every 10th batch
+        (~23s) is plenty against a drain measured in hours. Close to it, the
+        assumption that the drain rate is the one that was measured is exactly
+        what should not be relied on - a leak this code does not know about, or a
+        scene that makes the loop allocate more, would be invisible until the
+        collector had already fired. Near the floor the reading is worth its
+        227ms every batch.
+        """
+        free = self.state.get("heap_free")
+        if free is None:
+            return True                      # first batch of a session: establish it
+        if free < HEAP_FLOOR * 2:
+            return True                      # inside 4MB of the trigger: watch closely
+        if free < HEAP_FLOOR * 4:
+            return batch_no % 3 == 0
+        return batch_no % HEAP_EVERY == 0
+
     def _run(self):
         self.s = serial.Serial(self.port, 115200, timeout=0.2, write_timeout=10)
         setup = (SETUP_CODE
@@ -1021,7 +1446,7 @@ class Streamer(threading.Thread):
                 if started:
                     self.state["batches"] = self.state.get("batches", 0) + 1
                 self._submit(
-                    BATCH_CODE % (self.batch, 1 if batch_no % HEAP_EVERY == 0 else 0),
+                    BATCH_CODE % (self.batch, 1 if self._want_heap(batch_no) else 0),
                     timeout=20.0)
                 batch_no += 1
                 started = True
@@ -1049,7 +1474,16 @@ class Streamer(threading.Thread):
                 self._resync("not a header: %r" % raw[:24])
                 continue
 
-            jlen, tlen, torn = (int(v) for v in line.split()[1:4])
+            f = line.split()
+            jlen, tlen, torn = (int(v) for v in f[1:4])
+            # The two board clocks are optional in the parse, not because any
+            # firmware omits them - the host submits the code that writes them -
+            # but because a resync leaves payload in the buffer and a line that
+            # happens to start "#F " must not take the whole stream down on an
+            # index error.
+            dt_ms = int(f[4]) if len(f) > 4 else None
+            skew_ms = int(f[5]) if len(f) > 5 else None
+            stalled = int(f[6]) if len(f) > 6 else None
             # Bytes can go missing after the board has already counted them as
             # sent - a DTR toggle from anything else opening the port makes the
             # firmware discard what is queued, and no board-side check can see
@@ -1065,25 +1499,15 @@ class Streamer(threading.Thread):
             jpg = self._exact(jlen)
             thermal = self._exact(tlen)
 
-            y = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_GRAYSCALE)
-            if y is None or y.shape != (OUT_H, OUT_W):
-                continue
-
-            rgb = self.pipe.process(y.tobytes(), thermal)
-
-            p = self.pipe
-            if p.view != "fused" or p.outline:
-                edges = p.view == "edges"
-                rgb = compose(p.view, rgb, y,
-                              treg=p.treg_grid() if edges else None,
-                              exclude=p.repaired_grid() if edges else None,
-                              cover=p.cover_grid() if p.outline else None,
-                              mix=p.mix,
-                              phase=int(time.time() / p.blink_period) % 2 == 0)
-
-            ok, enc = cv2.imencode(".jpg", rgb[:, :, ::-1], [cv2.IMWRITE_JPEG_QUALITY, 85])
-            if ok:
-                self.state["frame"] = enc.tobytes()
+            # Hand off and go straight back to the port. Nothing that decodes,
+            # fuses, composes or encodes belongs on this thread: every
+            # millisecond spent here is a millisecond the CDC is not being
+            # drained, and the board's out.write() discards the tail of a frame
+            # it has already announced once no progress is made for 500ms.
+            # Measured inline cost was 18ms fused / 28ms in the edges view
+            # against a 114ms frame, so this is headroom rather than a rescue -
+            # but the detector is 68-99ms and would not have fitted at all.
+            self.work.put((jpg, thermal))
 
             n += 1
             now = time.time()
@@ -1093,17 +1517,122 @@ class Streamer(threading.Thread):
             # Short rolling windows rather than totals: the panel is meant to
             # report the state of the board now, and a fault that cleared ten
             # minutes ago should stop being red.
+            # Tearing is read off the board's own header, so it belongs to this
+            # thread. rows_rebuilt is a property of the fusion pass and is
+            # recorded by the worker, which is the only thread that knows when
+            # one has actually run.
             tw = self.state.setdefault("torn_window", [])
             tw.append(bool(torn))
             del tw[:-60]
-            rw = self.state.setdefault("rows_window", [])
-            rw.append(self.pipe.f.rows_rebuilt)
-            del rw[:-60]
+
+            # The board's own cadence, kept separate from the host's fps. They
+            # answer different questions and this project has already been
+            # confused by conflating them: "8.8 fps" from arrival times says the
+            # link is keeping up, and says nothing about whether the sensors are.
+            #
+            # The first interval of every batch is discarded. _t_prev survives
+            # between submissions - the raw REPL keeps globals - so the gap it
+            # measures spans the host's round trip to submit the next batch, not
+            # a thermal frame period. Same on the very first frame, where
+            # _t_prev is still 0 and the difference is the whole uptime.
+            if dt_ms is not None and self.pending < self.batch - 1 and 0 < dt_ms < 60000:
+                dw = self.state.setdefault("dt_window", [])
+                dw.append(dt_ms)
+                del dw[:-120]
+                # An FFC parks snapshot() in the driver for 1824ms (measured
+                # 2026-08-06, three in ten minutes). It is not a fault and must
+                # not be averaged in with the 114ms frames, or the cadence reads
+                # as chronically slow for a minute after every shutter event.
+                if dt_ms > 1000:
+                    self.state["last_ffc_t"] = now
+                    self.state["ffcs"] = self.state.get("ffcs", 0) + 1
+            if skew_ms is not None and 0 <= skew_ms < 60000:
+                sw = self.state.setdefault("skew_window", [])
+                sw.append(skew_ms)
+                del sw[:-120]
+
+            # Host load reaching the sensor. Counted rather than averaged: one
+            # stall is 500ms the Lepton went unserviced, and the part is only
+            # measured safe out to a 2500ms gap. This is the number that says
+            # whether adding work on this host - a detector, a browser, anything
+            # that stops draining the port - has started to cost the thermal
+            # side, and it is the only such signal the board can give.
+            if stalled:
+                self.state["stalls"] = self.state.get("stalls", 0) + stalled
+                self.state["last_stall_t"] = now
+            if dt_ms is not None and dt_ms > LEPTON_SAFE_GAP_MS:
+                self.state["starved"] = self.state.get("starved", 0) + 1
+                self.state["last_starve_ms"] = dt_ms
 
             if now - t_prev >= 1.0:
                 self.state["fps"] = n / (now - t_prev)
                 self.state["torn"] = torn
                 n, t_prev = 0, now
+
+
+# ---------------------------------------------------------------- timing
+#
+# What the two sensors are actually doing, on the board's clock rather than on
+# arrival times. The distinction is the whole point: between a frame being
+# grabbed and this host seeing it lie a 4KB-chunked CDC write, a 500ms stall
+# retry and the host's scheduler, so arrival-time fps measures the link. It has
+# been read as a sensor rate more than once in this project.
+#
+# Three numbers come out of it:
+#
+#   thermal   the Lepton's cadence. Should be 114ms; it is a three-valued delta
+#             function (113/114/115ms) with 1824ms across an FFC.
+#   skew      thermal frame in hand -> visible frame in hand. This is the pairing
+#             error fusion inherits: the two planes it registers were not looked
+#             at at the same instant, so anything moving is displaced by roughly
+#             (object speed x skew) before the warp ever sees it.
+#   ffc       when the shutter last closed. Readings either side of one are not
+#             comparable, which is exactly the kind of thing that is invisible
+#             three weeks later in a capture review.
+
+
+def timing(state, now):
+    """Board-side cadence and pairing skew. Pure, so it tests off a dict."""
+    dw = [d for d in (state.get("dt_window") or []) if d <= 1000]   # FFC gaps out
+    sw = state.get("skew_window") or []
+    ffc = state.get("last_ffc_t")
+
+    def stats(v):
+        if not v:
+            return None
+        s = sorted(v)
+        return {"median": s[len(s) // 2], "min": s[0], "max": s[-1], "n": len(s)}
+
+    th, sk = stats(dw), stats(sw)
+    out = {
+        "thermal_ms": th,
+        "thermal_fps": round(1000.0 / th["median"], 2) if th and th["median"] else None,
+        "skew_ms": sk,
+        # The share of one thermal period that the visible frame lags by. This is
+        # the number to judge the pairing on - a skew of 12ms means nothing until
+        # you know the period is 114ms.
+        "skew_frac": round(sk["median"] / float(th["median"]), 3)
+                     if th and sk and th["median"] else None,
+        "host_fps": round(state.get("fps", 0.0), 2),
+        "ffc_ago_s": round(now - ffc, 1) if ffc else None,
+        "ffcs": state.get("ffcs", 0),
+        "expected_ms": round(1000.0 / LEPTON_FPS, 1),
+        # Host load reaching the sensor: 500ms write timeouts the board sat
+        # through, and thermal gaps past the envelope the part is measured safe
+        # in. Both are about protecting the Lepton, not about frame rate.
+        "stalls": state.get("stalls", 0),
+        "starved": state.get("starved", 0),
+        "last_starve_ms": state.get("last_starve_ms"),
+        "safe_gap_ms": LEPTON_SAFE_GAP_MS,
+    }
+    return out
+
+
+# Past this share of a thermal period between the two grabs, the pair stops being
+# simultaneous in any useful sense. 0.25 of 114ms is 28ms, which at a walking
+# 1.4 m/s is 4cm of subject travel - already several thermal pixels at close
+# range, and drawn as a registration error rather than as the timing error it is.
+SKEW_WARN = 0.25
 
 
 # ---------------------------------------------------------------- http
@@ -1124,6 +1653,9 @@ white-space:nowrap}
 #read.warn{border-color:#c84;color:#fc9}
 #band{font:13px ui-monospace,monospace;color:#bbb}
 #band b{color:#fda;font-weight:600}
+#clock{font:12px ui-monospace,monospace;color:#999;gap:14px}
+#clock b{font-weight:600}
+#clock .th{color:#f0a860}#clock .vis{color:#6cc8ff}#clock .warn{color:#f0c060}
 #health{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start}
 .pill{border:1px solid #444;border-radius:4px;padding:3px 9px;font-size:12px;
 background:#1a1a1a;line-height:1.5}
@@ -1146,13 +1678,16 @@ background:#1a1a1a;line-height:1.5}
 <span>view</span><span id=view></span>
 <label>mix <input type=range id=mix min=0 max=100 value=50></label>
 <label><input type=checkbox id=outline> thermal footprint</label>
+<label><input type=checkbox id=boxes checked> detections</label>
 </div>
+<div class=row id=dets></div>
 <div class=row>
 <span>palette</span><span id=pal></span>
 <label>&epsilon; <input type=number id=emis min=0.05 max=1 step=0.01 value=1 style=width:5em></label>
 <label>reflected &deg;C <input type=number id=refl step=1 value=20 style=width:5em></label>
 </div>
 <div class=row id=band></div>
+<div class=row id=clock></div>
 <div class=row id=health></div>
 <div class=row><span id=s></span></div>
 <p class=note>Hover for a reading. The number comes from the thermal frame behind
@@ -1208,6 +1743,8 @@ buttons('view', ['fused','visible','blink','mix','edges'], 'fused', 'view');
 document.getElementById('mix').oninput = (e) => fetch('/set?mix='+e.target.value);
 document.getElementById('outline').onchange =
   (e) => fetch('/set?outline='+(e.target.checked ? 1 : 0));
+document.getElementById('boxes').onchange =
+  (e) => fetch('/set?boxes='+(e.target.checked ? 1 : 0));
 
 // The image is scaled to fit, so client coords have to be mapped back to the
 // 640x400 the pipeline actually indexes - otherwise the reading is off by the
@@ -1240,6 +1777,73 @@ setInterval(async () => {
   ).join('');
 
   document.getElementById('s').textContent = await (await fetch('/stat')).text();
+
+  // The clock. One thermal period drawn to scale, with the moment the visible
+  // frame was actually grabbed marked inside it - which is the question the two
+  // sensors raise and the fused picture cannot answer. Both timestamps come off
+  // the board's own clock; arrival times here have been through USB and measure
+  // the link, not the sensors.
+  const t = await (await fetch('/timing')).json();
+  const c = document.getElementById('clock');
+  if (!t.thermal_ms) { c.innerHTML = '<span>waiting for board timing</span>'; }
+  else {
+    const per = t.thermal_ms.median, W = 380, X = 8;
+    const frac = t.skew_frac === null ? 0 : Math.min(1, t.skew_frac);
+    const vx = X + W * frac;
+    // Jitter drawn as a band, not a number: the Lepton's interval is a
+    // three-valued delta function (113/114/115ms), so a wide band here is a real
+    // anomaly rather than ordinary spread.
+    const jl = X + W * Math.max(0, (t.thermal_ms.min - per) / per + 1) - W;
+    const jw = W * (t.thermal_ms.max - t.thermal_ms.min) / per;
+    const bad = t.skew_frac !== null && t.skew_frac > 0.25;
+    c.innerHTML =
+      '<svg width="'+(W+2*X)+'" height="40">'
+      + '<rect x="'+X+'" y="14" width="'+W+'" height="10" fill="#1e1e1e" stroke="#3a3a3a"/>'
+      + '<rect x="'+X+'" y="14" width="'+(vx-X)+'" height="10" fill="'
+        + (bad?'#5a4418':'#1d3346')+'"/>'
+      + '<rect x="'+(X+W-jw)+'" y="14" width="'+jw+'" height="10" fill="#2a2a2a"/>'
+      + '<line x1="'+X+'" y1="8" x2="'+X+'" y2="30" stroke="#f0a860" stroke-width="2"/>'
+      + '<line x1="'+vx+'" y1="8" x2="'+vx+'" y2="30" stroke="#6cc8ff" stroke-width="2"/>'
+      + '<line x1="'+(X+W)+'" y1="8" x2="'+(X+W)+'" y2="30" stroke="#f0a860" stroke-width="2"'
+        + ' stroke-dasharray="2 2"/>'
+      + '<text x="'+(X+2)+'" y="38" fill="#f0a860" font-size="10">thermal</text>'
+      + '<text x="'+(vx+3)+'" y="12" fill="#6cc8ff" font-size="10">visible</text>'
+      + '<text x="'+(X+W)+'" y="38" fill="#777" font-size="10" text-anchor="end">'
+        + per+' ms</text></svg>'
+      + '<span class=th>thermal <b>'+per+' ms</b> = '+t.thermal_fps+' fps'
+        + (t.thermal_ms.min!==t.thermal_ms.max
+            ? ' <span style=color:#666>('+t.thermal_ms.min+'-'+t.thermal_ms.max+')</span>' : '')
+        + '</span>'
+      + '<span class="vis'+(bad?' warn':'')+'">visible <b>+'
+        + (t.skew_ms ? t.skew_ms.median : '?')+' ms</b> ('
+        + (t.skew_frac===null?'?':Math.round(100*t.skew_frac))+'% of a frame)</span>'
+      + '<span>link <b>'+t.host_fps+' fps</b></span>'
+      + '<span>'+(t.ffc_ago_s===null ? 'no FFC seen yet'
+          : 'FFC <b>'+t.ffc_ago_s+'s</b> ago ('+t.ffcs+')')+'</span>'
+      // Load reaching the sensor. Always on screen, including when it is zero:
+      // this is the number that decides whether more host work is affordable,
+      // and it is worth watching go up rather than discovering afterwards.
+      + '<span'+(t.starved||t.stalls ? ' class=warn' : '')+'>sensor '
+        + (t.starved ? '<b>STARVED '+t.starved+'x</b> (worst '+t.last_starve_ms+' ms)'
+           : t.stalls ? '<b>'+t.stalls+'</b> write stall(s)'
+           : 'unstarved')+'</span>';
+  }
+
+  // The detection list in text as well as boxes. A box you have to squint at is
+  // not a reading you would write down, and the peak location matters as much as
+  // the value - "this motor is warm" and "this motor's near bearing is warm" are
+  // different findings.
+  const dd = await (await fetch('/detections')).json();
+  document.getElementById('dets').innerHTML = dd.detections.length
+    ? dd.detections.map(d => '<span class="pill '+(dd.warped?'ok':'warn')+'">'
+        + '<span class=n>'+d.cls+'</span><span class=t>'+Math.round(100*d.conf)+'%'
+        + (d.max_c !== undefined
+            ? '  '+d.max_c.toFixed(1)+'\\u00b0C peak @'+d.max_x+','+d.max_y
+              + (dd.warped ? '' : '  UNREGISTERED')
+              + (d.repaired ? '  rebuilt row' : '')
+            : '  no thermal')
+        + '</span></span>').join('')
+    : '';
   const d = await (await fetch('/stats')).json();
   document.getElementById('band').innerHTML = d.valid
     ? 'frame  min <b>' + d.min.toFixed(1) + '</b>  max <b>' + d.max.toFixed(1)
@@ -1272,6 +1876,8 @@ def make_handler(state, pipe):
                     pipe.mix = max(0, min(100, int(q.pop("mix"))))
                 if "outline" in q:
                     pipe.outline = q.pop("outline") not in ("0", "false", "")
+                if "boxes" in q:
+                    pipe.show_detections = q.pop("boxes") not in ("0", "false", "")
                 if "emissivity" in q or "reflected" in q:
                     eps = float(q.pop("emissivity", pipe.eps))
                     refl = float(q.pop("reflected", pipe.refl))
@@ -1299,6 +1905,26 @@ def make_handler(state, pipe):
                 else:
                     d = pipe.frame_stats()
                 body = json.dumps({"valid": False} if d is None else dict(d, valid=True))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body.encode())
+            elif u.path == "/timing":
+                body = json.dumps(timing(state, time.time()))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body.encode())
+            elif u.path == "/detections":
+                # `warped` rides along with every response. A consumer that logs
+                # these numbers has no other way to know whether the box and the
+                # temperature refer to the same place in the world.
+                body = json.dumps({
+                    "warped": pipe.warped,
+                    "age_s": round(time.time() - state.get("detect_t", 0), 2)
+                             if state.get("detect_t") else None,
+                    "ms": state.get("detect_ms"),
+                    "detections": state.get("detections") or []})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -1374,7 +2000,37 @@ def main():
                          "(512KB of Q8 state + a 256KB output plane)")
     ap.add_argument("--y-frames", type=int, default=8, metavar="N",
                     help="equivalent frames averaged by the visible filter (default 8)")
-    ap.add_argument("--quality", type=int, default=50, help="board-side JPEG quality")
+    # Raised from 50 on 2026-08-10, measured on captures/handwave3. The visible
+    # frame is the guided filter's *guide*, so the codec's artefacts are not
+    # cosmetic here - they are fed into the one layer whose job is to be
+    # amplified. Energy sitting exactly on the JPEG 8x8 grid, against the
+    # off-grid energy of the same frame (scene detail has no reason to prefer a
+    # period of 8, so anything above 1.0 is the codec):
+    #
+    #     q30  2.57x   q50  1.97x   q65  1.74x
+    #     q80  1.52x   q90  1.32x   q95  1.16x
+    #
+    # At q30 the fused frame carries 116% of the reference's high-frequency
+    # energy - more detail than the uncompressed original, which is the pipeline
+    # sharpening blocking artefacts into scene texture. That is the failure mode
+    # to avoid, and q50 was closer to it than it looked.
+    #
+    # The cost is link time, and this link has a hard edge: the board's
+    # out.write() discards the tail of a frame after 500ms of no progress. Frame
+    # rate at 8.772 fps including the uncompressed 18.75KB thermal plane:
+    # q50 256KB/s, q80 325KB/s, q90 420KB/s. FS CDC measures out around
+    # 700-900KB/s, so q80 sits near 40% duty and q90 near 55%. q80 buys most of
+    # the improvement for the smaller share of the pipe.
+    ap.add_argument("--quality", type=int, default=80, help="board-side JPEG quality")
+    ap.add_argument("--detect", default="off", metavar="WHAT",
+                    help="object detection: 'off', 'all' for COCO-80, or a comma-separated "
+                         "class list such as 'person,cat'. Runs yolov4-tiny on the host CPU "
+                         "and attaches a temperature to every box")
+    ap.add_argument("--detect-size", type=int, default=416, choices=[320, 416],
+                    help="detector input size. 416 is 68ms and 320 is 46ms on this host, "
+                         "against a 114ms frame period (default 416)")
+    ap.add_argument("--detect-conf", type=float, default=0.35,
+                    help="detection confidence threshold (default 0.35)")
     ap.add_argument("--seconds", type=int, default=0, help="exit after N seconds (for tests)")
     args = ap.parse_args()
 
@@ -1398,7 +2054,26 @@ def main():
 
     pipe = Pipeline(args)
     state = {}
-    stream = Streamer(args.port, pipe, args.quality, state)
+
+    detector = None
+    if args.detect != "off":
+        classes = None if args.detect == "all" else [
+            c.strip() for c in args.detect.split(",") if c.strip()]
+        if classes:
+            unknown = [c for c in classes if c not in detect.COCO]
+            if unknown:
+                raise SystemExit("not COCO classes: %s\navailable: %s"
+                                 % (", ".join(unknown), " ".join(detect.COCO)))
+        try:
+            detector = detect.Detector(size=args.detect_size, conf=args.detect_conf,
+                                       classes=classes)
+        except FileNotFoundError as e:
+            raise SystemExit("detector model missing: %s" % e)
+
+    work = Latest()
+    render = Renderer(pipe, state, work, detector)
+    render.start()
+    stream = Streamer(args.port, pipe, args.quality, state, work)
     stream.start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.http), make_handler(state, pipe))
@@ -1406,24 +2081,65 @@ def main():
     print("live fusion on http://localhost:%d  (ctrl-c to stop)" % args.http, file=sys.stderr)
     if not args.warp:
         print("NOTE: no --warp, thermal layer is stretched not registered", file=sys.stderr)
+    if detector:
+        print("detecting %s at %d px" % (args.detect, args.detect_size), file=sys.stderr)
+
+    # How long the stream may stay down before this gives up on it. The
+    # supervisor in Streamer.run() exists to survive a fault - a wedged Lepton, a
+    # resync storm, a board that fell off USB - and a restart costs ~3s of
+    # draining plus ~10s of bring-up.
+    #
+    # This loop used to `return 1` the instant state["error"] appeared, which
+    # meant the supervisor was never once allowed to finish: the process was gone
+    # a fraction of a second into a recovery designed to take thirteen. Every
+    # fault therefore read as fatal, including the ones the code already knew how
+    # to repair. The error is only cleared on #READY, so polling for it is
+    # polling for "a restart is in progress".
+    DEAD_S = 90.0
 
     t0 = time.time()
+    down_since, last_err = None, None
     try:
         while True:
             time.sleep(0.2)
-            if state.get("error"):
-                print("stream error: %s" % state["error"], file=sys.stderr)
-                return 1
+            err = state.get("error")
+            if err and err != last_err:
+                print("stream fault (recovering): %s" % err, file=sys.stderr)
+                last_err = err
+            if err or state.get("restarting_since"):
+                down_since = down_since or time.time()
+                if time.time() - down_since > DEAD_S:
+                    print("stream down for %.0fs across %d restart(s) - giving up: %s"
+                          % (time.time() - down_since, state.get("restarts", 0), err),
+                          file=sys.stderr)
+                    return 1
+            elif down_since is not None:
+                print("stream recovered after %.0fs (%d restart(s))"
+                      % (time.time() - down_since, state.get("restarts", 0)),
+                      file=sys.stderr)
+                down_since, last_err = None, None
             if args.seconds and time.time() - t0 > args.seconds:
-                print("fps %.1f, frames %d, batches %d, resyncs %d, frames flowing: %s" % (
-                    state.get("fps", 0.0), state.get("frames", 0),
-                    state.get("batches", 0), state.get("resyncs", 0),
-                    state.get("frame") is not None), file=sys.stderr)
+                tm = timing(state, time.time())
+                print("fps %.1f, frames %d, rendered %d, dropped %d, bad jpeg %d, "
+                      "batches %d, resyncs %d, restarts %d, frames flowing: %s" % (
+                          state.get("fps", 0.0), state.get("frames", 0),
+                          state.get("rendered", 0), state.get("dropped", 0),
+                          state.get("bad_jpeg", 0), state.get("batches", 0),
+                          state.get("resyncs", 0), state.get("restarts", 0),
+                          state.get("frame") is not None), file=sys.stderr)
+                # Board clock separately: the fps above is arrival times and says
+                # whether the link kept up, not what the sensors did.
+                print("board clock: thermal %s, visible +%s ms, %d FFC(s)" % (
+                    "%d ms (%.2f fps)" % (tm["thermal_ms"]["median"], tm["thermal_fps"])
+                    if tm["thermal_ms"] else "not reported",
+                    tm["skew_ms"]["median"] if tm["skew_ms"] else "?",
+                    tm["ffcs"]), file=sys.stderr)
                 return 0
     except KeyboardInterrupt:
         return 0
     finally:
         stream.stop.set()
+        render.stop.set()
         srv.shutdown()
 
 
