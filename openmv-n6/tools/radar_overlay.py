@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Draw live IWR1843 detections on the visible frame, and record a session.
+"""Draw live IWR1843 detections on the visible frame.
 
 Imported by live.py; runs nothing on its own. Two jobs:
 
   RadarReader   a thread that owns the radar DATA port and keeps the newest
-                parsed frame available, plus optional recording to disk
+                parsed frame available, plus optional recording of the radar
+                stream (radar.bin, radar.jsonl) into a session directory
   Bootstrap     radar point -> pixel, with a hand-adjustable extrinsic
+
+Session video/thermal recording lives in recorder.py - it is a mode of the
+live viewer, not a radar feature.
 
 WHAT THIS OVERLAY IS AND IS NOT. Until tools/calib/radar_extrinsics.py has been
 solved against measured correspondences, the projection here is a GUESS: the
@@ -263,6 +267,39 @@ def is_aliased(p, vmax=None):
     return abs(p['v']) > 0.6 * vmax
 
 
+def attach_range(dets, points, proj):
+    """Give each detection box the range of the radar return that lands in it.
+
+    Association is horizontal-only: elevation sigma is ~12 deg, so a point's v
+    coordinate says almost nothing about which box it belongs to, while u is
+    good to a few degrees. Static returns (|v| < 0.05) are excluded outright -
+    they are room clutter, and a box standing near a wall must not inherit the
+    wall's range. Aliased returns keep their (correct) range but carry ~9.6 deg
+    of azimuth error under radar_10hz.cfg, so they associate with a widened
+    band and lose to any non-aliased candidate.
+
+    Sets d['radar_m'] (metres) on each matched box; removes it on misses so a
+    stale range cannot outlive the return that produced it.
+    """
+    uv = proj.project(points)
+    for d in dets:
+        d.pop("radar_m", None)
+        best = None
+        for p, (u, _v, _in) in zip(points, uv):
+            if u is None or abs(p['v']) < 0.05:
+                continue
+            alias = is_aliased(p)
+            pad = 0.3 * d["w"] + (100 if alias else 0)
+            if not (d["x"] - pad <= u <= d["x"] + d["w"] + pad):
+                continue
+            snr = p['snr'] if p['snr'] is not None else 0.0
+            key = (not alias, snr)
+            if best is None or key > best[0]:
+                best = (key, p)
+        if best is not None:
+            d["radar_m"] = round(mmwave.range_of(best[1]), 2)
+
+
 def annotate(rgb, points, proj, show_whisker=True, label_nearest=True):
     """Draw detections. Returns (drawn, offscreen, aliased)."""
     uv = proj.project(points)
@@ -277,10 +314,19 @@ def annotate(rgb, points, proj, show_whisker=True, label_nearest=True):
         col = COL_ALIASED if alias else COL_STATIC
         x, y = int(round(u)), int(round(v))
         r = mmwave.range_of(p)
+        # A zero-Doppler return is room clutter (glass, furniture), not a
+        # subject - a person, even one holding still, breathes. Drawn tiny
+        # and dim so it cannot masquerade as the person standing near its
+        # azimuth, which is exactly the confusion it caused in the field.
+        static = abs(p['v']) < 0.05
         # Radius carries SNR, which is the one per-point quality the radar
         # actually reports. Clamped so a 40 dB return does not become a blob.
         snr = p['snr'] if p['snr'] is not None else 15.0
         rad = int(max(3, min(11, 3 + (snr - 11.2) / 3.0)))
+        if static:
+            cv2.circle(rgb, (x, y), 2, (110, 60, 85), 1)
+            drawn += 1
+            continue
         if show_whisker:
             # The vertical extent the elevation uncertainty actually spans.
             # sigma_el ~ 12 deg; at range r that is r*tan(12deg) metres, and
@@ -324,57 +370,3 @@ def annotate(rgb, points, proj, show_whisker=True, label_nearest=True):
                 (proj.w - 150, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                 COL_STATIC if drawn else (150, 150, 160), 1, cv2.LINE_AA)
     return drawn, off, aliased
-
-
-class SessionVideo:
-    """Writes the composed frames to an mp4 alongside the radar recording.
-
-    Opened lazily on the first frame because the writer needs the real frame
-    size, and refuses silently-broken output: if the codec is unavailable
-    VideoWriter returns an object whose write() does nothing, so isOpened() is
-    checked and reported rather than producing a 0-byte file at the end.
-
-    Every frame also gets a row in frames.jsonl. Without it the video is
-    unusable for calibration: mp4 carries a nominal frame rate, and this stream
-    is paced by a sensor that delivers at 8.772 fps with FFC gaps of 1824 ms in
-    it, so frame index times 1/fps is not when anything happened. The
-    correspondence tool pairs a radar segment to a picture through these
-    timestamps, and they are on the same monotonic clock as radar.jsonl.
-    """
-
-    def __init__(self, path, fps=8.772, index_path=None):
-        self.path = path
-        self.fps = fps
-        self.w = None
-        self.frames = 0
-        self.error = None
-        self._index_path = index_path or os.path.join(
-            os.path.dirname(path), 'frames.jsonl')
-        self._index = None
-
-    def write(self, rgb, extra=None):
-        if self.w is None:
-            h, wd = rgb.shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            self.w = cv2.VideoWriter(self.path, fourcc, self.fps, (wd, h))
-            if not self.w.isOpened():
-                self.error = 'cannot open %s for writing' % self.path
-                self.w = False
-            else:
-                self._index = open(self._index_path, 'w')
-        if self.w is False:
-            return
-        self.w.write(rgb[:, :, ::-1])
-        if self._index:
-            row = {'i': self.frames, 't_mono': time.monotonic()}
-            if extra:
-                row.update(extra)
-            self._index.write(json.dumps(row) + '\n')
-        self.frames += 1
-
-    def close(self):
-        if self.w not in (None, False):
-            self.w.release()
-        if self._index:
-            self._index.close()
-        self.w = self._index = None

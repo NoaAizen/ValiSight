@@ -29,7 +29,10 @@ Full design notes and every measurement behind the decisions: [DESIGN.md](DESIGN
 | `src/fusion.c`, `fusion.h` | the pipeline. Portable C99, no MicroPython, no floating point. One translation unit for host and Cortex-M55 |
 | `src/py_fusion.c` | thin MicroPython binding; every decision lives in `fusion.c` |
 | `host/` | harness that runs the same C over recorded frames, plus the test suites |
-| `tools/` | `capture.py` (board -> disk), `live.py` (live viewer), `mpx.py` (raw REPL) |
+| `tools/` | the live pipeline: `capture.py` (board -> disk), `live.py` (live viewer; `--radar` overlay, `--record` session) and its modules. See [tools/README.md](tools/README.md) |
+| `tools/board/` | board-side MicroPython, pushed whole via `mpx.py` |
+| `tools/diag/` | bench diagnostics: radar bring-up probes, capture comparisons |
+| `tools/tests/` | the offline test suites - no board, no radar needed |
 | `tools/calib/` | OpenCV stereo calibration -> warp LUT, and a hand-wave fallback |
 | `radar/` | the IWR1843 mmWave path: TLV parser, 10 fps config, link gate. [radar/README.md](radar/README.md) |
 | `openmv-integration/` | the eleven lines that add the module to the firmware tree |
@@ -46,7 +49,7 @@ cd host
 make                # fuse (harness) + libfusion.so (for the viewer)
 make test           # 33 synthetic assertions, under ASan + UBSan
 make real           # the same pipeline over recorded frames
-cd ../tools && python3 test_live.py    # 57 viewer assertions, no board needed
+python3 ../tools/tests/test_live.py    # 57 viewer assertions, no board needed
 ```
 
 `make test` proves the pipeline is *correct* on frames built to have a known

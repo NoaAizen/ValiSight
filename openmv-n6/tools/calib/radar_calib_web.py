@@ -15,7 +15,7 @@ corr.json and radar_calib.json next to the session.
 
 The input is a session recorded by:
 
-    ./live.py --radar /dev/ttyACM2 --radar-record DIR --view visible
+    ./live.py --radar /dev/ttyACM2 --record DIR --view visible
 
 (visible, not fused: the thermal layer is unregistered and its offset must not
 leak into the radar extrinsic through a click on a warm blob.)
@@ -60,9 +60,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import radar_correspond as rc      # noqa: E402
 import radar_extrinsics as rx      # noqa: E402
 
-# DESIGN.md: the measured FOV triple D72.5/H63.8/V42.3 is internally consistent
-# at f ~= 514 px for the 640-wide frame; the older "70 deg" assumption is not.
-MEASURED_HFOV_DEG = 63.8
+# Measured 2026-08-10 with a caliper-measured 38.3 mm checkerboard at
+# tape-measured 1.00 m (19.95 px/square -> f=521) and 2.00 m (10.13 px ->
+# f=529), subpixel corners: f = 525 +- 5 px -> HFOV = 62.7 deg. This
+# OVERTURNS the 2026-08-09 A4-sheet figure of f~=650-700 (49.8 deg), which
+# was itself a mismeasurement, and lands next to DESIGN.md's 63.8 triple.
+# Full K+distortion: calib-artifacts/calib.json (prefer -i over this nominal).
+MEASURED_HFOV_DEG = 62.7
+
+# Glass-wall specular ghosts are persistent, high-SNR, and sign-flipped in
+# azimuth - measured on this rig's lobby, they out-voted the direct return in
+# every naive picker. With the sensors measured co-aligned and f measured, a
+# pick whose radar azimuth disagrees with its pixel azimuth by more than this
+# is a ghost pairing, not evidence. (This veto leans on the ~0 deg measured
+# mount yaw; re-measure it if the bracket ever changes.)
+GHOST_TOL_DEG = 12.0
 
 
 def nominal_K(width, height, hfov_deg=MEASURED_HFOV_DEG):
@@ -78,12 +90,21 @@ class CalibSession:
     def __init__(self, session_dir, min_frames=25, intrinsics=None,
                  hfov_deg=MEASURED_HFOV_DEG, sigma_az=rx.RADAR_SIGMA_AZ_DEG,
                  sigma_el=rx.RADAR_SIGMA_EL_DEG, rig_id=None, mount_token=None,
-                 allow_tainted=False, allow_moving=False):
+                 allow_tainted=False, allow_moving=False, unmirror=False,
+                 allow_ghosts=False, ghost_tol_deg=GHOST_TOL_DEG):
+        # The video is NOT mirrored: the walk-in pixel track matches radar
+        # azimuth sign directly (measured 2026-08-09 late; the earlier
+        # raised-hand test that said otherwise used the wrong hand). The flip
+        # is kept as an option only in case a future sensor config mirrors
+        # the readout.
+        self.unmirror = unmirror
         self.dir = os.path.abspath(session_dir)
         self.lock = threading.Lock()
         self.sigma_az, self.sigma_el = sigma_az, sigma_el
         self.rig_id, self.mount_token = rig_id, mount_token
         self.allow_tainted, self.allow_moving = allow_tainted, allow_moving
+        self.allow_ghosts = allow_ghosts
+        self.ghost_tol = float(ghost_tol_deg)   # <= 0 disables the veto
 
         radar, frames, video = rc.load_session(session_dir)
         if not frames:
@@ -97,6 +118,12 @@ class CalibSession:
         holds = rc.find_holds(radar, min_frames=min_frames)
         self.n_scenery = sum(1 for h in holds if h.get('scenery'))
         subj = [h for h in holds if not h.get('scenery')]
+        # in_camera is NOT used to exclude, only displayed. It assumes the
+        # radar and camera boresights roughly agree, which is exactly what is
+        # being calibrated - measured on calib4, a hold the flag called
+        # "outside" at az -51 deg had the subject standing plainly in frame.
+        # The operator sees the picture; whether the subject is in it is their
+        # call, made by clicking or skipping.
         self.n_outside = sum(1 for h in subj if not h.get('in_camera', True))
 
         # Evidence purity, per hold: the picture it will be clicked on must be
@@ -106,7 +133,7 @@ class CalibSession:
         # --allow-tainted turns the exclusion into a recorded taint.
         self.n_tainted = 0
         picked_rows = []
-        for h in [h for h in subj if h.get('in_camera', True)]:
+        for h in subj:
             row = min(frames, key=lambda f: abs(f['t_mono']
                                                 - 0.5 * (h['t0'] + h['t1'])))
             reasons = []
@@ -140,6 +167,8 @@ class CalibSession:
             fi = row['i']
             cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
             ok, img = cap.read()
+            if ok and self.unmirror:
+                img = np.ascontiguousarray(img[:, ::-1])
             self.images.append(img if ok else None)
             self.dt_ms.append(abs(row['t_mono']
                                   - 0.5 * (h['t0'] + h['t1'])) * 1000.0)
@@ -180,24 +209,41 @@ class CalibSession:
             with open(self.corr_path) as f:
                 d = json.load(f)
             for c in d.get('correspondences', []):
-                k = c.get('hold')
-                if k is None or not 0 <= k < len(self.holds):
-                    continue
                 # The hold index is a position in a list that find_holds
                 # rebuilds every run; a different --min-frames or a code change
-                # shifts it, and then this pixel silently pairs with another
-                # hold's radar point. The saved radar xyz is the fingerprint.
+                # shifts every index. The saved radar xyz is the durable
+                # identity, so picks are re-associated by it, not by index.
                 want = np.asarray(c.get('radar', ()), float)
-                have = np.asarray(self.holds[int(k)]['xyz'], float)
-                if want.shape != (3,) or np.linalg.norm(want - have) > 0.10:
-                    print('warning: saved pick for hold %d no longer matches '
-                          'that hold\'s radar point - dropped' % k,
+                if want.shape != (3,):
+                    continue
+                dist = [float(np.linalg.norm(want - np.asarray(h['xyz'])))
+                        for h in self.holds]
+                k = int(np.argmin(dist)) if dist else -1
+                if k < 0 or dist[k] > 0.10:
+                    print('warning: saved pick at r=%.2f m no longer matches '
+                          'any hold - dropped' % float(np.linalg.norm(want)),
                           file=sys.stderr)
                     continue
-                self.picks[int(k)] = (float(c['u']), float(c['v']))
+                self.picks[k] = (float(c['u']), float(c['v']))
         except (ValueError, KeyError, TypeError):
             print('warning: %s unreadable, starting empty' % self.corr_path,
                   file=sys.stderr)
+
+    def _az_pixel_deg(self, u):
+        """Pixel column -> azimuth in the radar's empirical sign convention.
+
+        Measured on the walk-in track of the boresight session: the radar's
+        reported azimuth follows atan((u - cx)/fx) directly (left of frame =
+        negative az as reported), so that is the convention used for the
+        ghost veto. The full solve does not depend on this - R absorbs signs.
+        """
+        return float(np.degrees(np.arctan2(u - self.K[0, 2], self.K[0, 0])))
+
+    def _is_ghost(self, k, u):
+        if self.ghost_tol <= 0:
+            return False
+        return abs(self._az_pixel_deg(u)
+                   - self.holds[k]['az_deg']) > self.ghost_tol
 
     def _corrs(self):
         out = []
@@ -215,6 +261,8 @@ class CalibSession:
                 'snr_db': h['snr_db'], 'v_max_abs': h['v_max_abs'],
                 'frame_index': self.frame_idx[k], 'dt_s': self.dt_ms[k] / 1000.0,
                 'taint': self.taints[k],
+                'az_pixel_deg': self._az_pixel_deg(u),
+                'ghost_suspect': self._is_ghost(k, u),
             })
         return out
 
@@ -227,6 +275,10 @@ class CalibSession:
             'camera': 'rgb',
             'image_size': [self.w, self.h],
             'convention': 'radar x_fwd y_left z_up; image u right, v down',
+            'pixel_frame': ('unmirrored: video flipped horizontally on load '
+                            '(live.py stream is mirrored, measured 2026-08-09)'
+                            if self.unmirror else
+                            'raw video orientation (mirrored stream!)'),
             'protocol': 'stationary hold on a HUMAN subject, frames averaged '
                         'per correspondence. Bootstrap-grade: an extended '
                         'target\'s radar centroid is offset from its visual '
@@ -267,12 +319,21 @@ class CalibSession:
             corrs = [c for c in all_corrs
                      if self.allow_moving or c['v_max_abs'] <= 0.39]
             n_moving = len(all_corrs) - len(corrs)
+            n_ghost = sum(1 for c in corrs if c['ghost_suspect'])
+            if not self.allow_ghosts:
+                corrs = [c for c in corrs if not c['ghost_suspect']]
             if len(corrs) < 6:
+                dropped = []
+                if n_moving:
+                    dropped.append('%d moving' % n_moving)
+                if n_ghost and not self.allow_ghosts:
+                    dropped.append('%d ghost-suspect (radar az far from '
+                                   'pixel az - glass specular)' % n_ghost)
                 return {'error': 'need at least 6 stationary correspondences '
                                  'to solve, have %d%s (the gate wants 12+)'
                                  % (len(corrs),
-                                    ' after excluding %d moving' % n_moving
-                                    if n_moving else '')}
+                                    ' after excluding ' + ' and '.join(dropped)
+                                    if dropped else '')}
             radar = np.array([c['radar'] for c in corrs], float)
             pix = np.array([c['pixel'] for c in corrs], float)
             size = (self.w, self.h)
@@ -305,6 +366,12 @@ class CalibSession:
             if n_moving:
                 notes.append('%d moving hold(s) excluded from the fit'
                              % n_moving)
+            if n_ghost:
+                notes.append('%d ghost-suspect pick(s) %s (|az_radar - '
+                             'az_pixel| > %.0f deg)'
+                             % (n_ghost, 'INCLUDED by --allow-ghost-picks'
+                                if self.allow_ghosts else 'excluded',
+                                GHOST_TOL_DEG))
 
             # A failed fit never lands on the path a good one lives at: the
             # CLI refuses to write without --force for the same reason, and an
@@ -378,6 +445,8 @@ class CalibSession:
                 'snr_db': h['snr_db'], 'moving': h['v_max_abs'] > 0.39,
                 'taint': self.taints[k], 'dt_ms': self.dt_ms[k],
                 'picked': (list(self.picks[k]) if k in self.picks else None),
+                'ghost': (self._is_ghost(k, self.picks[k][0])
+                          if k in self.picks else False),
             } for k, h in enumerate(self.holds)],
             'spread': rep,
             'result': res,
@@ -501,7 +570,8 @@ function render(){
    '</td><td>'+h.az_sd.toFixed(2)+'</td><td>'+h.snr_db.toFixed(1)+'</td><td>'+
    (h.picked?'<span class=picked>&#10003; ('+h.picked[0].toFixed(0)+','+
     h.picked[1].toFixed(0)+')</span>':'')+
-   (h.moving?' <span class=mov>moving</span>':'')+'</td>';
+   (h.moving?' <span class=mov>moving</span>':'')+
+   (h.ghost?' <span class=mov>GHOST? az mismatch</span>':'')+'</td>';
   tr.onclick=()=>{k=h.k;pending=null;render();};
   tb.appendChild(tr);});
  const r=$('result');
@@ -518,7 +588,12 @@ function render(){
 }
 function esc(s){const d=document.createElement('div');
  d.appendChild(document.createTextNode(s||''));return d.innerHTML;}
+let lastAccept=0;
 $('frame').addEventListener('click',async e=>{
+ /* a fast double-click on the accept would otherwise land its echo on the
+    NEXT hold and stamp it with the same pixel - seen in real data as two
+    different stations sharing one pixel exactly */
+ if(Date.now()-lastAccept<600)return;
  const im=$('frame'),r=im.getBoundingClientRect();
  const u=(e.clientX-r.left)*im.naturalWidth/r.width;
  const v=(e.clientY-r.top)*im.naturalHeight/r.height;
@@ -538,6 +613,7 @@ function drawPending(){ /* re-fetch keeps it simple: server draws accepted
  d.style.display='block';}
 async function accept(){if(!pending)return;
  S=await post('/accept',{k:k,u:pending[0],v:pending[1]});pending=null;
+ lastAccept=Date.now();
  const d=$('pend');if(d)d.style.display='none';
  nav(1);}
 async function unpick(){S=await post('/remove',{k:k});render();}
@@ -618,7 +694,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('session', help='directory written by live.py --radar-record')
+    ap.add_argument('session', help='directory written by live.py --record')
     ap.add_argument('-i', '--intrinsics', default=None,
                     help='calib.json from calib.py; omit to use the nominal '
                          'measured-FOV K (output is then marked provisional)')
@@ -638,6 +714,20 @@ def main():
     ap.add_argument('--allow-moving', action='store_true',
                     help='let non-stationary holds into the fit despite their '
                          'Doppler-folded azimuth')
+    ap.add_argument('--ghost-tol', type=float, default=GHOST_TOL_DEG,
+                    help='|az_radar - az_pixel| beyond this flags a pick as a '
+                         'glass ghost (default %.0f; 0 disables). Valid only '
+                         'while the sensors are co-aligned as measured'
+                         % GHOST_TOL_DEG)
+    ap.add_argument('--allow-ghost-picks', action='store_true',
+                    help='let picks whose radar azimuth disagrees with their '
+                         'pixel azimuth by more than %.0f deg into the fit; '
+                         'they are glass-specular ghosts on this rig'
+                         % GHOST_TOL_DEG)
+    ap.add_argument('--unmirror', action='store_true',
+                    help='flip the video horizontally on load (only if a '
+                         'future sensor config mirrors the readout; measured '
+                         '2026-08-09: the current stream is NOT mirrored)')
     a = ap.parse_args()
 
     cal = CalibSession(a.session, min_frames=a.min_frames,
@@ -645,7 +735,10 @@ def main():
                        sigma_az=a.sigma_az, sigma_el=a.sigma_el,
                        rig_id=a.rig_id, mount_token=a.mount_token,
                        allow_tainted=a.allow_tainted,
-                       allow_moving=a.allow_moving)
+                       allow_moving=a.allow_moving,
+                       unmirror=a.unmirror,
+                       allow_ghosts=a.allow_ghost_picks,
+                       ghost_tol_deg=a.ghost_tol)
     print('%d holds (%d scenery, %d outside-camera, %d tainted excluded), '
           'intrinsics: %s'
           % (len(cal.holds), cal.n_scenery, cal.n_outside, cal.n_tainted,

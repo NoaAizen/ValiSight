@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the live viewer against recorded frames, with no board attached.
 
-    ./test_live.py ../captures/handwave3
+    ./test_live.py                  # defaults to captures/handwave3
 
 live.py is the only thing that drives fusion.c from outside the C - through a
 hand-written ctypes mirror of two structs that fusion_init() memsets through. A
@@ -25,9 +25,14 @@ from urllib.request import urlopen
 import cv2
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import live    # noqa: E402
 import detect  # noqa: E402
+
+# Script-relative so the test passes from any CWD - the old "../captures"
+# default silently depended on being run from tools/.
+HANDWAVE3 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "..", "captures", "handwave3")
 
 FAILS = []
 
@@ -103,7 +108,7 @@ def board_clock():
 
     # the health panel's reading of the same numbers
     pipe = live.Pipeline(Args())
-    pipe.process(*load_pair("../captures/handwave3")[:2])
+    pipe.process(*load_pair(HANDWAVE3)[:2])
     names = lambda s: {c["name"]: c for c in live.health(pipe, s, now)}  # noqa: E731
 
     h = names(st)
@@ -280,7 +285,7 @@ def threading_and_detection(y, thermal):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("capture", nargs="?", default="../captures/handwave3")
+    ap.add_argument("capture", nargs="?", default=HANDWAVE3)
     args = ap.parse_args()
 
     y, thermal, meta = load_pair(args.capture)

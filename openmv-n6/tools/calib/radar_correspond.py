@@ -5,7 +5,7 @@
     ./radar_correspond.py pick    ../../captures/walk1 -o corr.json
     ./radar_correspond.py report  corr.json
 
-A session is what `live.py --radar --radar-record DIR` writes: radar.jsonl,
+A session is what `live.py --radar --record DIR` writes: radar.jsonl,
 frames.jsonl, session.mp4. Both jsonl files carry `t_mono` from the same
 monotonic clock, which is what lets a radar segment be matched to a picture.
 

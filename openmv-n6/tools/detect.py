@@ -138,6 +138,27 @@ class Detector:
         return dets
 
 
+# A person is the detection this rig exists for, so it keeps a fixed green
+# regardless of the warped/unwarped colour convention; the (unreg) mark on the
+# temperature still carries that warning.
+PERSON_COL = (0, 230, 0)
+
+# Peak-in-box range that counts as body heat, deg C. The floor sits above a
+# warm room (29-30 C has been observed here) but below bare skin; the ceiling
+# rejects lamps and machines. With the unregistered warp the peak can be read
+# a few pixels off the body, so the flag is a cross-check, not radiometry.
+BODY_C = (31.0, 39.0)
+
+
+def _dashed_rect(img, x0, y0, x1, y1, col, dash=9):
+    for x in range(x0, x1, dash * 2):
+        cv2.line(img, (x, y0), (min(x + dash, x1), y0), col, 2)
+        cv2.line(img, (x, y1), (min(x + dash, x1), y1), col, 2)
+    for y in range(y0, y1, dash * 2):
+        cv2.line(img, (x0, y), (x0, min(y + dash, y1)), col, 2)
+        cv2.line(img, (x1, y), (x1, min(y + dash, y1)), col, 2)
+
+
 def annotate(img, dets, warped):
     """Draw the boxes and their readings. Modifies img in place.
 
@@ -151,10 +172,23 @@ def annotate(img, dets, warped):
     for d in dets:
         x, y, w, h = d["x"], d["y"], d["w"], d["h"]
         hot = d.get("max_c")
-        col = (120, 255, 120) if warped else (140, 170, 255)
-        cv2.rectangle(img, (x, y), (x + w, y + h), col, 2)
+        person = d["cls"] == "person"
+        verified = person and bool(d.get("body_heat"))
+        if person:
+            col = PERSON_COL
+        else:
+            col = (120, 255, 120) if warped else (140, 170, 255)
+        if person and not verified:
+            _dashed_rect(img, x, y, x + w, y + h, col)
+        else:
+            cv2.rectangle(img, (x, y), (x + w, y + h), col, 2)
 
-        label = "%s %.0f%%" % (d["cls"], 100 * d["conf"])
+        if person:
+            label = "person" if verified else "person ?"
+        else:
+            label = "%s %.0f%%" % (d["cls"], 100 * d["conf"])
+        if d.get("radar_m") is not None:
+            label += "  %.1fm" % d["radar_m"]
         if hot is not None:
             label += "  %.1fC" % hot
             if not warped:
@@ -163,10 +197,16 @@ def annotate(img, dets, warped):
             label += "  no thermal"
 
         (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+        mark = 16 if verified else 0                 # room for the check mark
         ty = y - 6 if y - 6 - th > 0 else y + h + th + 6
-        cv2.rectangle(img, (x, ty - th - 4), (x + tw + 6, ty + 3), (0, 0, 0), -1)
+        cv2.rectangle(img, (x, ty - th - 4), (x + tw + 6 + mark, ty + 3), (0, 0, 0), -1)
         cv2.putText(img, label, (x + 3, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1,
                     cv2.LINE_AA)
+        if verified:
+            # cv2's Hershey fonts have no U+2713, so the check is two strokes.
+            cx = x + tw + 8
+            cv2.line(img, (cx, ty - 4), (cx + 3, ty - 1), col, 2, cv2.LINE_AA)
+            cv2.line(img, (cx + 3, ty - 1), (cx + 11, ty - th + 1), col, 2, cv2.LINE_AA)
 
         # The hot pixel itself, not just the box. On an inspection frame the
         # location of the peak is most of the finding - "this motor is warm" and

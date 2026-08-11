@@ -207,7 +207,10 @@ disparity_thermal_px = 147 · 0.012 / Z
 ```
 fusion.c / fusion.h     C טהור, אפס תלות ב-MicroPython — מתקמפל גם על ה-Jetson
 py_fusion.c             binding דק ל-MicroPython
-tools/                  mpx.py (raw REPL), probe_*.py (אבחון לוח)
+tools/                  mpx.py (raw REPL), capture.py, live.py + מודולי הצפייה
+tools/board/            probe_*.py (אבחון לוח, נדחף דרך mpx.py)
+tools/diag/             אבחון ספסל: radar bring-up, השוואות capture
+tools/tests/            חבילות הבדיקה - בלי לוח, בלי רדאר
 tools/fusion_host/      main.c שקורא זוגות RAW ומוציא PNG
 tools/calib/            OpenCV: כיול → warp LUT
 ```

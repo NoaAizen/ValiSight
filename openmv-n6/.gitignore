@@ -17,7 +17,7 @@ __pycache__/
 /captures/views/
 
 # Recorded frame pairs. One sequence is kept, deliberately: `make real` and
-# tools/test_live.py need real frames to run, and handwave3 is the sequence that
+# tools/tests/test_live.py need real frames to run, and handwave3 is the sequence that
 # carries the sensor's 14 dead rows - the defect that the synthetic tests cannot
 # reproduce honestly because it was mischaracterised the first time. The other
 # nine sequences are another 26 MB of binary that git history never forgets.

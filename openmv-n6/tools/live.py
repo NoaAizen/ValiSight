@@ -3,6 +3,10 @@
 
     ./live.py                       then open http://localhost:8088
     ./live.py --warp calib/warp.lut --gain 220
+    ./live.py --radar               live + IWR1843 overlay (USB DATA port)
+    ./live.py --record              live + recording to captures/live-<stamp>/
+    ./live.py --radar --record DIR  a full calibration session: session.mp4,
+                                    frames.jsonl, thermal.bin, radar.bin+jsonl
 
 The board sends a hardware-JPEG of the visible frame (~11KB for 640x400, 4% of
 raw) plus the thermal frame *uncompressed* - the thermal data is the measurement,
@@ -38,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capture  # noqa: E402  - reuse the bring-up that is known to survive
 import detect   # noqa: E402
 import radar_overlay  # noqa: E402
+import recorder  # noqa: E402
 
 PORT = "/dev/ttyACM0"
 LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "host", "libfusion.so")
@@ -406,9 +411,11 @@ class Pipeline:
         alongside anything they quote from here.
         """
         r = Region()
+        # fusion_temp_region takes corners (x0,y0,x1,y1), not width/height -
+        # see main.c's (0,0,out_w,out_h) call, where the two happen to coincide.
         with self.lock:
             rc = self.lib.fusion_temp_region(ctypes.byref(self.f), int(x), int(y),
-                                             int(w), int(h), ctypes.byref(r))
+                                             int(x + w), int(y + h), ctypes.byref(r))
         if rc != 0:
             return None
         return {"min": r.min_milli_c / 1000.0, "max": r.max_milli_c / 1000.0,
@@ -762,6 +769,33 @@ def health(pipe, state, now):
             add("detect", "ok", "%d box%s, %.0fms"
                 % (n_det, "" if n_det == 1 else "es", state.get("detect_ms", 0)))
 
+    # --- the radar link. Separate from the "N in / M out" the overlay prints
+    # on the frame: once nothing arrives the overlay has nothing to draw, and a
+    # silently absent sensor looks exactly like an empty scene.
+    if state.get("radar_proj") is not None:
+        if state.get("radar_error"):
+            add("radar", "fail", state["radar_error"])
+        elif not state.get("radar_frames"):
+            add("radar", "warn", "no radar frame yet - was the config sent? "
+                "(tools/send_radar_cfg.py)")
+        else:
+            drop = state.get("radar_dropped", 0)
+            add("radar", "warn" if drop else "ok",
+                "%d frames, %d drawn / %d offscreen%s"
+                % (state["radar_frames"], state.get("radar_drawn", 0),
+                   state.get("radar_offscreen", 0),
+                   ", %d bytes dropped" % drop if drop else ""))
+
+    # --- recording. A recorder that died mid-session must not be discovered at
+    # the end of the campaign; the mp4 writer's failure mode is a 0-byte file.
+    rec = state.get("recording")
+    if rec:
+        if state.get("video_error"):
+            add("recording", "fail", state["video_error"])
+        else:
+            add("recording", "ok", "%d frames -> %s"
+                % (state.get("video_frames", 0), os.path.basename(rec)))
+
     # --- VoSPI tearing. Unlike the dead rows this really is random, and a torn
     #     frame is stale data in part of the image, not a marked defect.
     #
@@ -1014,10 +1048,17 @@ class Renderer(threading.Thread):
                 r = self.pipe.temp_region(d["x"], d["y"], d["w"], d["h"])
                 if r is None or r["samples"] == 0:
                     d["no_thermal"] = True
-                    continue
-                d["max_c"], d["mean_c"] = round(r["max"], 1), round(r["mean"], 1)
-                d["max_x"], d["max_y"] = r["max_x"], r["max_y"]
-                d["repaired"] = bool(r["repaired"])
+                else:
+                    d["max_c"], d["mean_c"] = round(r["max"], 1), round(r["mean"], 1)
+                    d["max_x"], d["max_y"] = r["max_x"], r["max_y"]
+                    d["repaired"] = bool(r["repaired"])
+                if d["cls"] == "person":
+                    # Body-heat cross-check: a person the thermal camera cannot
+                    # confirm (no coverage, or nothing at skin temperature in
+                    # the box) is drawn dashed with a '?' instead of a check.
+                    mx = d.get("max_c")
+                    d["body_heat"] = (mx is not None
+                                      and detect.BODY_C[0] <= mx <= detect.BODY_C[1])
             self.state["detections"] = dets
             self.state["detect_ms"] = round(self.det.ms, 1)
             self.state["detect_t"] = time.time()
@@ -1075,6 +1116,11 @@ class Renderer(threading.Thread):
                     # claim about a scene that may be gone, so drop them rather
                     # than draw a stale rectangle over a moved object.
                     if age < DETECT_STALE_S:
+                        if self.radar is not None and self.radar_proj is not None:
+                            fr = self.radar.get()
+                            if fr is not None:
+                                radar_overlay.attach_range(dets, fr["points"],
+                                                           self.radar_proj)
                         detect.annotate(rgb, dets, p.warped)
 
             if self.radar is not None and self.pipe.show_radar:
@@ -1093,13 +1139,15 @@ class Renderer(threading.Thread):
                     self.state["radar_error"] = self.radar.error
 
             if self.video is not None:
-                # The radar frame number this picture was drawn against ties the
-                # two recordings together even if a timestamp is ever doubted.
-                self.video.write(clean, {
-                    "radar_frame": self.state.get("radar_frame"),
-                    "view": self.pipe.view,
-                    "clean": True,
-                })
+                extra = {"view": self.pipe.view, "clean": True}
+                if self.radar is not None:
+                    # The radar frame number this picture was drawn against ties
+                    # the two recordings together even if a timestamp is doubted.
+                    extra["radar_frame"] = self.state.get("radar_frame")
+                # The raw thermal bytes go too: the mp4 is for looking, the
+                # thermal stream is the measurement, and a temperature must
+                # never be read back off an 8-bit lossy video.
+                self.video.write(clean, thermal=thermal, extra=extra)
                 self.state["video_frames"] = self.video.frames
                 if self.video.error:
                     self.state["video_error"] = self.video.error
@@ -1109,6 +1157,11 @@ class Renderer(threading.Thread):
                 self.state["frame"] = enc.tobytes()
             self.state["rendered"] = self.state.get("rendered", 0) + 1
             self.state["dropped"] = self.work.dropped
+
+        if self.video is not None:
+            # mp4 is finalized on release(); a recording that is never closed
+            # is a recording that may not open.
+            self.video.close()
 
 
 # Boxes older than this are not drawn. The detector runs at ~10Hz against an
@@ -2096,9 +2149,14 @@ def main():
                     metavar="PORT",
                     help="overlay IWR1843 detections from this DATA port "
                          "(default %s when the flag is given bare)" % radar_overlay.DATA_PORT)
+    ap.add_argument("--record", nargs="?", const="", default=None, metavar="DIR",
+                    help="record the session: session.mp4 (clean of overlays), "
+                         "frames.jsonl and thermal.bin - plus radar.bin and "
+                         "radar.jsonl when --radar is on, which is what an offline "
+                         "calibration is solved against. A bare --record picks "
+                         "captures/live-<timestamp>")
     ap.add_argument("--radar-record", metavar="DIR",
-                    help="record the session: radar.bin, radar.jsonl and session.mp4. "
-                         "This is what an offline calibration is solved against")
+                    help="deprecated alias for --record DIR")
     ap.add_argument("--radar-hfov", type=float, default=70.0, metavar="DEG",
                     help="assumed horizontal FOV used to guess the focal length when no "
                          "solved intrinsics exist (default 70). DESIGN.md:239 records this "
@@ -2154,8 +2212,22 @@ def main():
 
     work = Latest()
     radar = radar_proj = video = None
+
+    record_dir = args.record if args.record is not None else args.radar_record
+    if args.radar_record and args.record is None:
+        print("--radar-record is now --record (recording no longer needs the "
+              "radar); kept as an alias", file=sys.stderr)
+    if record_dir == "":                            # bare --record
+        record_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "captures",
+            time.strftime("live-%Y%m%d-%H%M%S"))
+    if record_dir:
+        video = recorder.SessionRecorder(record_dir)
+        state["recording"] = record_dir
+        print("recording to %s/" % record_dir, file=sys.stderr)
+
     if args.radar:
-        radar = radar_overlay.RadarReader(args.radar, record_dir=args.radar_record)
+        radar = radar_overlay.RadarReader(args.radar, record_dir=record_dir)
         radar.start()
         radar_proj = radar_overlay.Bootstrap(OUT_W, OUT_H, hfov_deg=args.radar_hfov,
                                              calib_path=args.radar_calib)
@@ -2165,10 +2237,6 @@ def main():
         if not args.radar_calib:
             print("  the projection is a GUESS until radar_extrinsics is solved - "
                   "nudge it with /set?yaw=..&pitch=..&tz=..", file=sys.stderr)
-        if args.radar_record:
-            video = radar_overlay.SessionVideo(
-                os.path.join(args.radar_record, "session.mp4"))
-            print("recording to %s/" % args.radar_record, file=sys.stderr)
 
     render = Renderer(pipe, state, work, detector, radar=radar,
                       radar_proj=radar_proj, video=video)
@@ -2199,9 +2267,26 @@ def main():
 
     t0 = time.time()
     down_since, last_err = None, None
+    warned_no_radar = False
     try:
         while True:
             time.sleep(0.2)
+            # A calibration recording with zero radar frames is a wasted
+            # session that looks fine on screen (the camera side records
+            # happily). The usual cause on this bench: a power cycle wiped the
+            # IWR1843's config and nobody re-sent it. Say so on the console,
+            # where the person who just typed the record command is looking.
+            # Judged on the READER's own counter, not state["radar_frames"]:
+            # that one is written by the renderer, which sits idle through the
+            # ~15 s camera bring-up, and the first version of this check fired
+            # a false alarm through exactly that window.
+            if (radar is not None and record_dir and not warned_no_radar
+                    and time.time() - t0 > 15 and radar.frames == 0):
+                print("WARNING: recording with --radar but 0 radar frames "
+                      "after 10s - the radar is probably unconfigured (a "
+                      "power cycle wipes it). Run ./send_radar_cfg.py, then "
+                      "restart this recording.", file=sys.stderr)
+                warned_no_radar = True
             err = state.get("error")
             if err and err != last_err:
                 print("stream fault (recovering): %s" % err, file=sys.stderr)
@@ -2240,6 +2325,15 @@ def main():
     finally:
         stream.stop.set()
         render.stop.set()
+        # The render thread owns the recorder, and the mp4 is only finalized by
+        # its close() - so wait for the thread rather than letting the daemon
+        # flag kill it mid-write.
+        render.join(timeout=3.0)
+        if radar is not None:
+            radar.close()
+        if video is not None and video.frames:
+            print("recorded %d frames -> %s/" % (video.frames, record_dir),
+                  file=sys.stderr)
         srv.shutdown()
 
 

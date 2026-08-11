@@ -142,7 +142,31 @@ def pack_lut(raw_th_pixels):
 
 
 def detect_corners(img, pattern):
-    """Checkerboard corners, sub-pixel refined. Returns None if not found."""
+    """Checkerboard corners, sub-pixel refined. Returns None if not found.
+
+    SB detector first: it survives small squares, cluttered backgrounds and
+    the blurry 4x thermal upscale far better than the classic detector, and
+    its corners are already subpixel. Classic path kept as fallback.
+    """
+    sb_flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_NORMALIZE_IMAGE
+    ok, corners = cv2.findChessboardCornersSB(img, pattern, sb_flags)
+    if ok:
+        return corners.reshape(-1, 2)
+
+    # Windowed fallback. Verified on this rig: a board that fails detection in
+    # the full 640x400 frame (bright glass, people, hot doors dominate the
+    # normalisation) is found cleanly when the search is restricted to a
+    # window around it. Overlapping windows, coarse-to-fine, first hit wins.
+    h, w = img.shape[:2]
+    for fy, fx in ((0.75, 0.6), (0.6, 0.45)):
+        wh, ww = int(h * fy), int(w * fx)
+        for y0 in range(0, h - wh + 1, max(1, (h - wh) // 2 or 1)):
+            for x0 in range(0, w - ww + 1, max(1, (w - ww) // 2 or 1)):
+                win = np.ascontiguousarray(img[y0:y0 + wh, x0:x0 + ww])
+                ok, corners = cv2.findChessboardCornersSB(win, pattern, sb_flags)
+                if ok:
+                    return corners.reshape(-1, 2) + np.float32([x0, y0])
+
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
     ok, corners = cv2.findChessboardCorners(img, pattern, flags)
     if not ok:
@@ -174,15 +198,20 @@ def detect_dir(pairs_dir, pattern, square_m):
         c_rgb = detect_corners(rgb, pattern)
         c_th = detect_corners(th_big, pattern)
         name = os.path.basename(stem)
-        if c_rgb is None or c_th is None:
+        if c_rgb is None:
             print("  %-10s skip (rgb=%s thermal=%s)" %
                   (name, c_rgb is not None, c_th is not None), file=sys.stderr)
             continue
 
+        # A view the thermal cannot see still constrains the RGB intrinsics.
+        # (This board's varnish hides the squares in LWIR, so whole sessions
+        # can be rgb-only; solve() calibrates stereo from the subset that has
+        # both, when that subset is big enough.)
         out["views"].append({"name": name,
                              "rgb": c_rgb.tolist(),
-                             "thermal": (c_th / 4.0).tolist()})
-        print("  %-10s ok" % name, file=sys.stderr)
+                             "thermal": (c_th / 4.0).tolist() if c_th is not None else None})
+        print("  %-10s %s" % (name, "ok" if c_th is not None else "rgb-only"),
+              file=sys.stderr)
 
     return out
 
@@ -190,42 +219,72 @@ def detect_dir(pairs_dir, pattern, square_m):
 # ------------------------------------------------------------------ solve
 
 
-def solve(corners, fix_principal=False):
+def solve(corners, fix_principal=False, fix_f=None):
     pattern = tuple(corners["pattern"])
     square = corners["square_m"]
     views = corners["views"]
+    stereo_views = [v for v in views if v.get("thermal") is not None]
     if len(views) < 6:
         raise SystemExit("need at least 6 usable views, have %d" % len(views))
 
     objp = np.zeros((pattern[0] * pattern[1], 3), np.float32)
     objp[:, :2] = np.mgrid[0:pattern[0], 0:pattern[1]].T.reshape(-1, 2) * square
 
-    obj = [objp] * len(views)
-    p_rgb = [np.asarray(v["rgb"], np.float32).reshape(-1, 1, 2) for v in views]
-    p_th = [np.asarray(v["thermal"], np.float32).reshape(-1, 1, 2) for v in views]
-
     flags = cv2.CALIB_FIX_PRINCIPAL_POINT if fix_principal else 0
     # k3 is not identifiable from a handful of views on a lens this short and
     # mostly just absorbs noise into the corners
     flags_th = flags | cv2.CALIB_FIX_K3
 
-    e1, K_rgb, d_rgb, _, _ = cv2.calibrateCamera(obj, p_rgb, (RGB_W, RGB_H), None, None,
+    obj = [objp] * len(views)
+    p_rgb = [np.asarray(v["rgb"], np.float32).reshape(-1, 1, 2) for v in views]
+    K0 = None
+    if fix_f:
+        # f from a physical measurement (board at tape-measured distances)
+        # outranks the bundle: with mostly fronto-parallel views the bundle's
+        # f is degenerate with tvec.z and converges wrong with excellent rms
+        # (measured on this rig: bundle said 445 px, tape said 521-529 px).
+        # Fix f, let the bundle solve only principal point and distortion.
+        K0 = np.array([[fix_f, 0, RGB_W / 2.0], [0, fix_f, RGB_H / 2.0], [0, 0, 1.0]])
+        # k3 with mostly-frontal views is pure overfit: freeing it moved rms
+        # 0.396 -> 0.393 while swinging (k2, k3) from (-0.04, 0) to (0.52, -0.79).
+        flags |= (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_FOCAL_LENGTH |
+                  cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_FIX_K3)
+    e1, K_rgb, d_rgb, _, _ = cv2.calibrateCamera(obj, p_rgb, (RGB_W, RGB_H), K0, None,
                                                  flags=flags)
-    e2, K_th, d_th, _, _ = cv2.calibrateCamera(obj, p_th, (TH_W, TH_H), None, None,
-                                               flags=flags_th)
 
-    e3, K_rgb, d_rgb, K_th, d_th, R, t, _, _ = cv2.stereoCalibrate(
-        obj, p_rgb, p_th, K_rgb, d_rgb, K_th, d_th, (RGB_W, RGB_H),
-        flags=cv2.CALIB_FIX_INTRINSIC)
-
-    baseline_mm = float(np.linalg.norm(t) * 1000.0)
-    return {
+    out = {
         "K_rgb": K_rgb.tolist(), "dist_rgb": np.ravel(d_rgb).tolist(),
-        "K_th": K_th.tolist(), "dist_th": np.ravel(d_th).tolist(),
-        "R": R.tolist(), "t": np.ravel(t).tolist(),
-        "rms_rgb": float(e1), "rms_th": float(e2), "rms_stereo": float(e3),
-        "baseline_mm": baseline_mm, "views": len(views),
+        "rms_rgb": float(e1), "views": len(views),
+        "stereo_views": len(stereo_views),
     }
+    if fix_f:
+        out["f_fixed_px"] = float(fix_f)
+
+    # Thermal intrinsics and the RGB->thermal extrinsic need views the thermal
+    # actually saw. With fewer than 6 the stereo problem is under-constrained;
+    # emit an rgb-only calibration rather than a garbage transform.
+    if len(stereo_views) >= 6:
+        obj_s = [objp] * len(stereo_views)
+        ps_rgb = [np.asarray(v["rgb"], np.float32).reshape(-1, 1, 2) for v in stereo_views]
+        ps_th = [np.asarray(v["thermal"], np.float32).reshape(-1, 1, 2) for v in stereo_views]
+
+        e2, K_th, d_th, _, _ = cv2.calibrateCamera(obj_s, ps_th, (TH_W, TH_H), None, None,
+                                                   flags=flags_th)
+        e3, K_rgb, d_rgb, K_th, d_th, R, t, _, _ = cv2.stereoCalibrate(
+            obj_s, ps_rgb, ps_th, K_rgb, d_rgb, K_th, d_th, (RGB_W, RGB_H),
+            flags=cv2.CALIB_FIX_INTRINSIC)
+
+        out.update({
+            "K_th": K_th.tolist(), "dist_th": np.ravel(d_th).tolist(),
+            "R": R.tolist(), "t": np.ravel(t).tolist(),
+            "rms_th": float(e2), "rms_stereo": float(e3),
+            "baseline_mm": float(np.linalg.norm(t) * 1000.0),
+        })
+    else:
+        print("only %d stereo view(s): emitting RGB-only calibration "
+              "(no thermal intrinsics / R,t / LUT input)" % len(stereo_views),
+              file=sys.stderr)
+    return out
 
 
 # ------------------------------------------------------------------ cli
@@ -246,6 +305,8 @@ def main():
     s.add_argument("corners", default="corners.json")
     s.add_argument("-o", "--out", default="calib.json")
     s.add_argument("--fix-principal", action="store_true")
+    s.add_argument("--fix-f", type=float, default=None,
+                   help="fix RGB focal length (px) from a physical measurement")
 
     l = sub.add_parser("lut")
     l.add_argument("calib", default="calib.json")
@@ -261,14 +322,18 @@ def main():
         print("%d usable view(s) -> %s" % (len(res["views"]), a.out))
 
     elif a.cmd == "solve":
-        res = solve(json.load(open(a.corners)), a.fix_principal)
+        res = solve(json.load(open(a.corners)), a.fix_principal, a.fix_f)
         json.dump(res, open(a.out, "w"), indent=2)
-        print("views=%d  rms rgb=%.3f th=%.3f stereo=%.3f px\nbaseline=%.1f mm -> %s" % (
-            res["views"], res["rms_rgb"], res["rms_th"], res["rms_stereo"],
-            res["baseline_mm"], a.out))
-        if not 5.0 < res["baseline_mm"] < 40.0:
-            print("warning: recovered baseline %.1fmm is implausible for this rig; "
-                  "check the square size and pattern" % res["baseline_mm"], file=sys.stderr)
+        if "rms_stereo" in res:
+            print("views=%d  rms rgb=%.3f th=%.3f stereo=%.3f px\nbaseline=%.1f mm -> %s" % (
+                res["views"], res["rms_rgb"], res["rms_th"], res["rms_stereo"],
+                res["baseline_mm"], a.out))
+            if not 5.0 < res["baseline_mm"] < 40.0:
+                print("warning: recovered baseline %.1fmm is implausible for this rig; "
+                      "check the square size and pattern" % res["baseline_mm"], file=sys.stderr)
+        else:
+            print("views=%d (rgb-only)  rms rgb=%.3f px -> %s" % (
+                res["views"], res["rms_rgb"], a.out))
 
     elif a.cmd == "lut":
         lut = build_lut(json.load(open(a.calib)), a.distance)

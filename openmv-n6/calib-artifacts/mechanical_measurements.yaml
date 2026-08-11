@@ -1,0 +1,52 @@
+# mechanical_measurements.yaml — A3 of the V2 calibration plan
+# Fill every null from a CALIPER / tape measurement, then freeze.
+# Convention for the baseline: position of the CAMERA optical center
+# relative to the RADAR antenna reference (the etched antenna area on the
+# 1843BOOST, NOT the PCB center), in the project radar frame
+# (x forward, y left, z up), millimetres.
+#
+# These numbers are the t-initialization and the |t| sanity gate
+# (solver refuses if |t| is off by more than ~10 mm) — they are NOT the
+# final calibration.
+
+bracket_version: "v1 — unchanged since the V2-plan photos (PDF p.1/p.3 are the A1 record)"
+measured_by: moshe
+date: 2026-08-10
+
+baseline_camera_from_radar_mm:
+  x_forward: 0               # ASSUMED flush (same bracket plane); confirm if > ~5 mm
+  y_left: 0                  # ASSUMED co-axial (camera directly above antennas)
+  z_up: 47                   # MEASURED, caliper: camera 47 mm above antenna center
+
+mount_angles_estimate_deg:   # mechanical estimate only, initialization
+  yaw: 0                     # measured co-aligned within a few deg (2026-08-09)
+  pitch: 0                   # boards vertical on table mount
+  roll: 0
+
+# Heights: table surface 745 mm; antenna center measured 96.3 mm above table.
+table_height_mm: 745
+radar_mount_height_mm: 841.3   # 745 + 96.3 (floor -> antenna center); fixes t_z
+camera_mount_height_mm: 888.3  # 841.3 + 47
+
+checkerboard:
+  squares: 8x8                 # full board; ONE ROW MASKED for capture -> 8x7
+  square_side_mm: 38.3         # caliper, 2026-08-10
+  pattern_inner_corners: 7x6   # after masking one row (see note below)
+  # NOTE: an unmasked 8x8 board has 7x7 inner corners — a 180-deg-symmetric
+  # pattern. OpenCV may order corners with opposite orientation in the RGB
+  # and thermal views of the SAME pose, silently corrupting the stereo solve
+  # (B2). Masking one full row of squares with matte white tape/paper makes
+  # the pattern 7x6 (asymmetric) and removes the ambiguity.
+
+# Target staging: TCR and checkerboard stand on same-height (745 mm) tables,
+# i.e. "Mid" holds sit at boresight height. Low/High holds (H04/H05/H09/H10,
+# V01-V03) need +-25..35 cm of stable riser (books/stool), not hand-holding.
+
+target:                      # blocks C/D, done 2026-08-10
+  tcr_geometry: "asymmetric trihedral: two 12x14 cm plates + one 14x14 cm, 90 deg"
+  marker_type: "~1 cm black ink dot AT the inner vertex (visible to the camera
+    through the open mouth since camera sits 47 mm above the radar)"
+  marker_to_vertex_offset_mm: {dx: 0, dy: 0, dz: 0}  # marker IS the vertex
+  rq_qualification: "RQ01-RQ06 in calib-artifacts/rq/: 100% availability at
+    1.5/3.0/4.6 m and +-1.2 m lateral, SNR 28->6.8 dB (R^4-consistent),
+    needs radar_10hz_calib.cfg (8 dB CFAR); left=+y confirmed"

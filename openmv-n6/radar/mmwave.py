@@ -4,7 +4,7 @@ Pure `struct`, no board imports and no numpy, so the SAME file runs three places
 
     host   (Jetson)  radar on USB: CLI /dev/ttyACM1, DATA /dev/ttyACM2
     board  (N6)      radar on UART7, P13 = PE7 = RX  (see radar/README.md)
-    tests  (pytest)  tools/test_radar.py, no hardware
+    tests  (pytest)  tools/tests/test_radar.py, no hardware
 
 Wire format: magic (8B) -> header (32B, 8x uint32 LE) -> TLVs. Everything the
 frame needs to be interpreted is in the frame; the .cfg is only needed for the
@@ -408,7 +408,16 @@ def walk_tlvs(frame):
 # --- payloads -----------------------------------------------------------
 
 def ti_to_project(x_right, y_fwd, z_up):
-    """TI sensor frame -> project radar frame (x fwd, y left, z up)."""
+    """TI sensor frame -> project radar frame (x fwd, y left, z up).
+
+    VERIFIED CORRECT 2026-08-10 with a corner reflector at 7 stations on
+    both azimuth signs: projecting the recorded (x, y, z) through the
+    canonical radar->camera rotation lands on the picked pixels within
+    ~6 px for the clean holds (captures/holds1). The "flipped azimuth"
+    anomaly of 2026-08-09 was NOT in this mapping - it is a display/veto
+    convention mix in the calib tools (radar az printed left-positive,
+    pixel az computed right-positive). Do not "fix" the sign here.
+    """
     return y_fwd, -x_right, z_up
 
 

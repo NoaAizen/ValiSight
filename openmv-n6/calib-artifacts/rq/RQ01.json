@@ -1,0 +1,27 @@
+{
+  "hold_id": "RQ01",
+  "expected": {
+    "range_m": 1.5,
+    "az_deg": 0.0
+  },
+  "gate": {
+    "rtol_m": 0.5,
+    "aztol_deg": 15.0
+  },
+  "frames": 150,
+  "frames_with_target": 150,
+  "availability": 1.0,
+  "ambiguous_frames": 0,
+  "range_median_m": 1.4878673288455353,
+  "range_sigma_m": 3.491111682302432e-08,
+  "az_median_deg": 0.0,
+  "az_sigma_deg": 0.0,
+  "el_median_deg": 0.04038227086047174,
+  "el_sigma_deg": 0.031959627867298515,
+  "snr_median_db": 28.2,
+  "xyz_median_m": [
+    1.4878668785095215,
+    -0.0,
+    0.0010486540850251913
+  ]
+}

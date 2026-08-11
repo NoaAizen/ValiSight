@@ -3,7 +3,7 @@
 
     ./radar_listen.py --stage1              # link sanity, no parsing (do this first)
     ./radar_listen.py                       # live parsed points
-    ./radar_listen.py --record ../captures/radar_calib -n 300
+    ./radar_listen.py --record ../../captures/radar_calib -n 300
 
 The radar is on USB here (XDS110 -> /dev/ttyACM2 @921600), which is the path
 that works today and the one the calibration will be done over. The board path
@@ -24,7 +24,7 @@ import time
 import serial
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                '..', 'radar'))
+                                '..', '..', 'radar'))
 import mmwave  # noqa: E402
 
 DEFAULT_PORT = '/dev/ttyACM2'

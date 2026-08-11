@@ -1,0 +1,63 @@
+# frame_conventions.txt — A2 of the V2 calibration plan (frozen 2026-08-10)
+# Authoritative source: the code actually running, not the datasheet.
+#   parser: radar/mmwave.py  (TLV1 '<4f' = x_right, y_fwd, z_up, v)
+#   cfg:    radar/configs/radar_10hz.cfg
+#           sha256 5cdd5e44cec4fef5fc1bc3af144109079d7e958945d7a8e673f5d2faa4810d68
+#           (2026-08-10, after rangeBias/RxChanPhase calibration: bias 0.0828 m,
+#           median of 299 frames, TCR at tape-measured 1.5 m boresight.
+#           pre-calibration hash was 5f5f953c...29f06e8)
+#   repo:   b074c5c
+
+## Frames
+
+R_ti      TI sensor frame as unpacked from TLV1: x right, y forward (boresight),
+          z up. Origin = antenna reference per SDK 3.x OOB demo.
+R         Project radar frame = ti_to_project(R_ti): x forward, y LEFT, z up.
+          (x,y,z) = (y_fwd, -x_right, z_up). Units metres; v m/s, FOLDED
+          (alias period 1.298 m/s at 3TX), positive = away from sensor.
+C         Reference visible camera (PAG7936), OpenCV convention:
+          x right, y down, z forward (optical axis). Image 640x400,
+          NOT mirrored (verified by walk-in pixel-track vs radar-az).
+T         Lepton 3.5 thermal frame. Reached ONLY by composition
+          T_T<-R = T_T<-C · T_C<-R, never solved independently.
+
+## Known empirical anomalies (measured 2026-08-09, must be resolved knowingly)
+
+1. az/el signs are FLIPPED vs the documented project frame:
+   empirically az_radar ≈ +atan((u-cx)/f); kneeling reported POSITIVE
+   elevation. Consistent with a 180-rolled board or a sign error in
+   ti_to_project. EXPECT the extrinsic solve to land ~180 deg from
+   R_CANONICAL. When it does: fix the convention in mmwave.py
+   ti_to_project with a documented commit, re-derive, and DO NOT mix
+   correspondences picked before and after the fix in one solve.
+2. Never rescale mmwave.py output: TLV1 floats verified bit-exact,
+   range grid 0.04363 m matches profileCfg, doppler passed dr/dt physics.
+
+## Camera geometry (B1 DONE 2026-08-10 — supersedes the 2026-08-09 A4 figure)
+
+f = 525 +- 5 px @ 640w   caliper-measured 38.3 mm squares at tape-measured
+                         1.00 m (f=521) and 2.00 m (f=529), subpixel corners.
+HFOV = 62.7 deg          The 2026-08-09 A4 figure (f~=690, 49.8 deg) was a
+                         mismeasurement; DESIGN.md's 63.8 was nearly right.
+K, dist: calib-artifacts/calib.json — f fixed at 525, principal point
+(306.4, 238.5), Brown k1=-0.117 k2=-0.041 p1=0.025 p2=0.005 k3 fixed 0,
+rms 0.396 px over 19 views. NOTE: a free-f bundle on the same views said
+f=445 with rms 0.393 — frontal-view degeneracy; never trust bundle f here
+without the tape measurement.
+
+## Config freeze notes (A4)
+
+- clutterRemoval OFF (static TCR must keep returning points).
+- rangeBias = 0.0 -> UNCALIBRATED. Must run measureRangeBiasAndRxChanPhase
+  with the TCR at 1.5 m boresight BEFORE any correspondence collection
+  that will be kept: changing the phase table moves boresight and VOIDS
+  any previously solved (R,t).
+- cfarFovCfg range ceiling = 5.0 m: place "5 m" holds at <= 4.7 m and
+  V05 (longest reliable) at ~4.7 m. Do not edit the cfg mid-calibration.
+- aoaFovCfg stays +-60/+-30 for THIS calibration (frozen); the picker's
+  ghost veto (|az_radar - az_pixel| > 12 deg) handles out-of-cone ghosts.
+- IF-HPF floor: nothing below 0.375 m, ever. All holds >= 1.5 m anyway.
+- Transport = USB (XDS110): CLI /dev/ttyACM1, DATA /dev/ttyACM2.
+  UART7 migration later requires the short re-validation of PDF sec. 11.
+- cfg must be re-sent (tools/send_radar_cfg.py) after every radar power
+  cycle; live.py warns after 15 s of radar silence.

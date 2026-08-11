@@ -100,7 +100,7 @@ what this rig can do:
 
 ## Hardware timestamping, if software pairing turns out not to be enough
 
-`../tools/radar_sync_probe.py` measured the board on 2026-08-09, with and
+`../tools/diag/radar_sync_probe.py` measured the board on 2026-08-09, with and
 without both sensors streaming — the answers are the same either way:
 
 - TIM2/3/4/5 are 32-bit at 400 MHz. TIM8, 12–17 are 16-bit. `pyb` does not
@@ -127,8 +127,8 @@ P10 (PD6) is CSI_FSYNC and the board drives it, so it is a signal to jumper
 |---|---|
 | `mmwave.py` | framing, TLV walk, points + SNR join, stats, temperature, Doppler fold, physics validators |
 | `configs/radar_10hz.cfg` | the 10 fps config, with the measurement behind each choice |
-| `../tools/test_radar.py` | 57 offline assertions |
+| `../tools/tests/test_radar.py` | 57 offline assertions |
 | `../tools/send_radar_cfg.py` | config → CLI UART, waiting on the radar's own response per line |
-| `../tools/radar_listen.py` | host: stage-1 gate, live parse, recording |
-| `../tools/radar_stage1_n6.py` | board: the same gate over UART7, optionally with both cameras running |
-| `../tools/radar_sync_probe.py` | timer and pin inventory for hardware timestamping |
+| `../tools/diag/radar_listen.py` | host: stage-1 gate, live parse, recording |
+| `../tools/diag/radar_stage1_n6.py` | board: the same gate over UART7, optionally with both cameras running |
+| `../tools/diag/radar_sync_probe.py` | timer and pin inventory for hardware timestamping |

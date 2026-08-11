@@ -3,9 +3,13 @@
 import subprocess, sys, os
 from PIL import Image, ImageDraw
 
-ROOT = "/home/moshe/.claude/projects/thermal-fusion"
+# Script-relative: the old hardcoded ROOT pointed at a project location two
+# moves ago and the output at a scratch directory that no longer exists.
+ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     "..", ".."))
 FUSE = f"{ROOT}/host/fuse"
-OUT = "/tmp/claude-1001/-home-moshe/b6231090-85a7-4f6b-8221-e2abc44543b9/scratchpad"
+OUT = f"{ROOT}/captures/views"          # preview renders, gitignored
+os.makedirs(OUT, exist_ok=True)
 
 scene = sys.argv[1] if len(sys.argv) > 1 else "person2"
 frame = sys.argv[2] if len(sys.argv) > 2 else "0000"
