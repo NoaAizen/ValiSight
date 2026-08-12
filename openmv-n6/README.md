@@ -60,8 +60,34 @@ version, while every synthetic test passed.
 ## Live viewer
 
 ```sh
-cd tools && ./live.py --warp calib/warp.lut     # http://localhost:8088
+cd tools
+./send_radar_cfg.py                             # chirp config first, or --radar sees nothing
+./live.py --radar /dev/ttyACM2 --radar-hfov 62.7 \
+          --detect person --view visible        # http://localhost:8088
 ```
+
+Three ports on this Jetson, and they are not interchangeable: `/dev/ttyACM0` is
+the OpenMV N6, `/dev/ttyACM1` is the radar CLI at 115200 (where the `.cfg`
+goes), `/dev/ttyACM2` is the radar data stream at 921600. `send_radar_cfg.py`
+must run first — the IWR1843 emits nothing until it is configured, so a
+`--radar` run against an unconfigured sensor looks like a dead link.
+
+`--radar-hfov 62.7` overrides the 70° default with the measured value (f = 525
+px at 640 wide, checkerboard against a tape measure). `--radar-calib` cannot
+carry it: `Bootstrap._load()` reads only a top-level `K`, which neither
+`calib-artifacts/calib.json` (it has `K_rgb`) nor `T_camera_radar.json` (it has
+`yaw_deg`/`R`/`t_m`) provides — so passing either file loads nothing and the
+startup line still reads `intrinsics from assumed 70.0 deg HFOV`. Until the
+loader is taught those keys, apply the solved extrinsic by hand once the viewer
+is up:
+
+```sh
+curl -s 'localhost:8088/set?yaw=-1.09&tx=17&ty=47'   # T_camera_radar.json, mm
+```
+
+Add `--warp calib-artifacts/warp.lut` once block B2 has been shot and solved.
+Until then the thermal layer is stretched, not registered, and every
+temperature it quotes is marked `(unreg)` — see [tools/calib/](tools/calib/).
 
 The board sends a hardware-JPEG of the visible frame plus the thermal frame
 *uncompressed* — the thermal data is the measurement, and lossy compression on

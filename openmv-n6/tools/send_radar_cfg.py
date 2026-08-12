@@ -53,6 +53,29 @@ def send_line(ser, line, timeout=2.0):
     return resp.strip()
 
 
+def flush_cli(ser, settle=0.4):
+    """Terminate any half-line the radar's CLI is holding, and drain the reply.
+
+    `reset_input_buffer()` clears the HOST's receive buffer; it cannot clear a
+    fragment already sitting in the radar's line parser. One gets there easily:
+    opening the port toggles DTR and can inject a byte, and anything that wrote
+    to this port by mistake leaves a fragment with no newline behind it -
+    live.py aimed at the wrong ACM number does precisely that, and the ACM
+    numbers on this rig are not stable.
+
+    The next real command is then appended to that fragment, so the radar sees
+    `<junk>sensorStop` and answers "'sensorStop' is not recognized as a CLI
+    command". That reads like firmware without the command - `help` lists it,
+    so it is not - and it costs an hour to believe. One newline fixes it.
+    """
+    ser.reset_input_buffer()
+    ser.write(b'\n')
+    time.sleep(settle)
+    if ser.in_waiting:
+        ser.read(ser.in_waiting)
+    ser.reset_input_buffer()
+
+
 def _rejected(resp):
     return any(k in resp for k in _FAILURES)
 
@@ -98,6 +121,7 @@ def main():
     args = ap.parse_args()
 
     with serial.Serial(args.port, BAUD, timeout=0.2) as ser:
+        flush_cli(ser)               # before the first command, always
         if args.stop:
             print('  cfg> sensorStop %s' % send_line(ser, 'sensorStop'))
             return 0
