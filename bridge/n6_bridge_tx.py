@@ -16,6 +16,7 @@ import bridge_protocol as bp
 RGB_QUALITY = 40
 REINIT_AFTER = 3          # consecutive dead grabs before re-initialising a sensor
 HELLO_EVERY_TICKS = 1000000   # ~1 s in ticks_us units
+MEM_PROBE = [0, 0]        # [mem_alloc after warm-up, iterations] — read from the REPL for diagnostics
 IMU_HZ = 200              # timer rate, as measured stable in src/live_server.py
 IMU_RING = 1024           # ~5 s at 200 Hz: rides out a multi-second USB host stall (3.9 s measured 2026-08-17)
 
@@ -40,11 +41,17 @@ class Bridge:
         d = (a - b) & (p - 1)
         return d - p if d >= p // 2 else d
 
-    def _send(self, rtype, ts, payload):
-        rec = bp.pack(rtype, self.ts_src, self.seq, ts, payload)
+    def _send(self, rtype, ts, payload, prefix=b""):
+        """Write one record as header(+prefix) then payload — the payload is
+        NOT copied. On the N6 every copy of a 19 KB frame is garbage, and a
+        MicroPython gc.collect() on this board takes ~1 s (25 MB heap), during
+        which the Lepton FIFO overflows and the sensor must be re-initialised
+        (measured 2026-08-17: 45 s cadence, ~6 s outage each). So: no copies."""
+        hdr = bp.pack_header(rtype, self.ts_src, self.seq, ts, prefix, payload)
         self.seq = (self.seq + 1) & 0xFFFFFFFF
-        n = self.write(rec)
-        if n != len(rec):
+        n = self.write(hdr + prefix) if prefix else self.write(hdr)
+        n += self.write(payload)
+        if n != len(hdr) + len(prefix) + len(payload):
             self.drops += 1
             return False
         self.sent += 1
@@ -62,10 +69,10 @@ class Bridge:
         return None
 
     def thermal(self, pixels, ts, w=160, h=120):
-        return self._send(bp.T_THERMAL, ts, bp.image_payload(w, h, bp.PIX_GRAY8, pixels))
+        return self._send(bp.T_THERMAL, ts, pixels, bp.image_prefix(w, h, bp.PIX_GRAY8))
 
     def rgb_jpeg(self, jpeg, ts, w=320, h=240):
-        return self._send(bp.T_RGB, ts, bp.image_payload(w, h, bp.PIX_JPEG, jpeg))
+        return self._send(bp.T_RGB, ts, jpeg, bp.image_prefix(w, h, bp.PIX_JPEG))
 
     def imu(self, accel_mg, gyro_mdps, ts):
         """One IMU sample, already in milli-g / milli-deg-per-second (the units
@@ -75,12 +82,18 @@ class Bridge:
         return self._send(bp.T_IMU, ts, bp.imu_payload(ax, ay, az, gx, gy, gz))
 
     def imu_ring(self, ring):
-        """Drain an ImuRing: one IMU record per buffered sample, oldest first.
-        Returns how many were sent."""
-        n = 0
-        for ts, a, g in ring.drain():
-            self.imu(a, g, ts)
-            n += 1
+        """Drain an ImuRing: one IMU record per buffered sample, oldest first,
+        all packed into the ring's preallocated out-buffer and written in ONE
+        call (no per-sample allocation). Returns how many were sent."""
+        n = ring.pack_records(self.ts_src, self.seq)
+        if n == 0:
+            return 0
+        self.seq = (self.seq + n) & 0xFFFFFFFF
+        total = n * ring.REC
+        if self.write(ring.outmv[:total]) != total:
+            self.drops += n
+            return 0
+        self.sent += n
         return n
 
 
@@ -93,11 +106,15 @@ class ImuRing:
     arrive while the ring is full are COUNTED (overflow), never silently lost.
     """
 
+    REC = bp.HDR_LEN + 24       # one packed IMU record
+
     def __init__(self, capacity, sample, ticks):
         import array
         self.n = capacity
         self.ts = array.array('i', [0] * capacity)
         self.v = array.array('i', [0] * (capacity * 6))
+        self.out = bytearray(capacity * self.REC)     # packed records, reused forever
+        self.outmv = memoryview(self.out)
         self.ix = 0
         self.overflow = 0
         self.busy = False
@@ -118,6 +135,19 @@ class ImuRing:
         self.v[j] = int(a[0]); self.v[j + 1] = int(a[1]); self.v[j + 2] = int(a[2])
         self.v[j + 3] = int(g[0]); self.v[j + 4] = int(g[1]); self.v[j + 5] = int(g[2])
         self.ix = i + 1
+
+    def pack_records(self, ts_src, seq0):
+        """Pack every buffered sample as a full record into self.out (in place).
+        Returns the number of records; resets the ring."""
+        self.busy = True
+        n = self.ix
+        for i in range(n):
+            j = 6 * i
+            bp.pack_imu_into(self.outmv, i * self.REC, ts_src, (seq0 + i) & 0xFFFFFFFF, self.ts[i] & 0xFFFFFFFF,
+                             self.v[j], self.v[j + 1], self.v[j + 2], self.v[j + 3], self.v[j + 4], self.v[j + 5])
+        self.ix = 0
+        self.busy = False
+        return n
 
     def drain(self):
         self.busy = True
@@ -191,6 +221,9 @@ def main():
     lep = lepton_init()
     time.sleep_ms(5000)           # Lepton settle + first FFC
 
+    import gc
+    gc.collect()
+    MEM_PROBE[0] = gc.mem_alloc(); MEM_PROBE[1] = 0   # allocated after warm-up, iterations
     br = Bridge(write, time.ticks_us)
     br.hello()
     lep_miss = rgb_miss = 0
@@ -225,6 +258,7 @@ def main():
             br.imu_ring(ring)                         # drain again after the RGB grab
         br.imu_overflow = ring.overflow if ring is not None else 0
         br.maybe_hello()
+        MEM_PROBE[1] += 1
 
 
 if __name__ == "__main__":

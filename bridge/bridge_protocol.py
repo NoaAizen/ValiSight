@@ -44,6 +44,33 @@ def image_payload(w, h, fmt, data):
     return struct.pack(_IMG, w, h, fmt, 0) + data
 
 
+def image_prefix(w, h, fmt):
+    """The 6-byte image sub-header alone (for zero-copy sends: header+prefix, then pixels)."""
+    return struct.pack(_IMG, w, h, fmt, 0)
+
+
+def pack_header(rtype, ts_src, seq, ts, prefix, payload):
+    """24-byte header for a record whose payload is prefix+payload, WITHOUT
+    concatenating them (crc is chained over body, prefix, payload)."""
+    ln = len(prefix) + len(payload)
+    body = struct.pack(_HDR_BODY, rtype, ts_src, 0, seq & 0xFFFFFFFF, ts & 0xFFFFFFFF, ln)
+    crc = binascii.crc32(payload, binascii.crc32(prefix, binascii.crc32(body))) & 0xFFFFFFFF
+    return MAGIC + body + struct.pack(_CRC, crc)
+
+
+_IMU_REC = "<4sBBHIIII" + "iiiiii"     # magic, body, crc, then the 24-byte IMU payload
+
+
+def pack_imu_into(buf, off, ts_src, seq, ts, ax, ay, az, gx, gy, gz):
+    """Pack a complete IMU record in place at buf[off:] (no allocation beyond
+    the crc computation over a memoryview)."""
+    struct.pack_into(_HDR_BODY, buf, off + 4, T_IMU, ts_src, 0, seq & 0xFFFFFFFF, ts & 0xFFFFFFFF, 24)
+    struct.pack_into(_IMU, buf, off + HDR_LEN, ax, ay, az, gx, gy, gz)
+    buf[off:off + 4] = MAGIC
+    crc = binascii.crc32(buf[off + HDR_LEN:off + HDR_LEN + 24], binascii.crc32(buf[off + 4:off + 20])) & 0xFFFFFFFF
+    struct.pack_into(_CRC, buf, off + 20, crc)
+
+
 def imu_payload(ax_mg, ay_mg, az_mg, gx_mdps, gy_mdps, gz_mdps):
     return struct.pack(_IMU, int(ax_mg), int(ay_mg), int(az_mg), int(gx_mdps), int(gy_mdps), int(gz_mdps))
 
