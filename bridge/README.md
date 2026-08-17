@@ -24,6 +24,14 @@ python3 n6_bridge_start.py && ./bridge_rx /dev/serial/by-id/usb-MicroPython_Pybo
 `out/` יכיל `<seq>_thermal.bin` / `<seq>_rgb.bin` (הנתונים כפי שנשלחו) ו-`imu.csv`
 עם חותמות זמן **פרוסות** (בלי גלישה).
 
+## תצוגה חיה בדפדפן
+```
+python3 n6_bridge_start.py                                   # 1. מפעיל את השולח על ה-N6
+./bridge_rx /dev/serial/by-id/usb-MicroPython* -o out/ > stats.txt &   # 2. מקלט
+python3 bridge_view.py out/ --port 8090 --stats stats.txt    # 3. תצוגה: http://<jetson>:8090
+```
+(`bridge_view.py` קורא רק את מה ש-`bridge_rx` כתב — אין קורא שני על ה-USB. `out/` גדל ~10 MB/דקה — לנקות.)
+
 ## מה נמדד חי (17.8.2026, ג'ייסון ↔ N6 אמיתי)
 - **תרמי 8.6 Hz · RGB 8.7 Hz · IMU ~190 Hz · ~190 KB/s**, אפס אובדן בצד השולח, אפס CRC שגוי — במצב יציב.
 - IMU אומת: |a| = 1002 mg במנוחה, ציר **X** מצביע לכובד כשהלוח מונח כרגיל.
