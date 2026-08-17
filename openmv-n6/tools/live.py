@@ -2727,6 +2727,49 @@ def make_handler(state, pipe):
     return H
 
 
+def session_meta(args):
+    """Everything about a recording that cannot be recovered from the data.
+
+    The radar cannot be asked which config it is running and the config is
+    sent by a separate tool, so the one claim that matters - which chirp
+    profile and which RX phase table produced these points - is copied from
+    the stamp send_radar_cfg.py leaves behind. It is carried with its own
+    timestamp beside the recording's, because the check a reader has to make
+    is not "is there a stamp" but "was it stamped BEFORE this session, with no
+    power cycle in between". Changing the phase table moves boresight and
+    voids any extrinsic solved on older data (frame_conventions.txt), and that
+    is invisible in the points themselves.
+    """
+    stamp, stamp_note = None, 'no stamp: send_radar_cfg.py has not run since ' \
+                              'this checkout, so the radar config is UNKNOWN'
+    try:
+        import send_radar_cfg
+        if os.path.exists(send_radar_cfg.STAMP_PATH):
+            with open(send_radar_cfg.STAMP_PATH) as f:
+                stamp = json.load(f)
+            age = time.monotonic() - stamp.get('sent_at_mono', 0)
+            stamp_note = ('sent %.0f s before this session started; valid only '
+                          'if the radar was not power-cycled since' % age)
+            if age < 0:
+                stamp_note = ('STAMP IS FROM A PREVIOUS BOOT (negative age): '
+                              'the monotonic clock restarted, so this cannot '
+                              'be the config now on the sensor')
+    except Exception as e:                     # provenance never breaks a run
+        stamp_note = 'stamp unreadable: %s' % e
+    return {
+        'tool': 'live.py',
+        'argv': sys.argv[1:],
+        'board_port': args.port,
+        'radar_port': args.radar,
+        'view': args.view,
+        'warp_lut': args.warp,
+        'radar_calib': args.radar_calib,
+        'detector': args.detect,
+        'radar_cfg_stamp': stamp,
+        'radar_cfg_stamp_note': stamp_note,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -2886,7 +2929,7 @@ def main():
             os.path.dirname(os.path.abspath(__file__)), "..", "captures",
             time.strftime("live-%Y%m%d-%H%M%S"))
     if record_dir:
-        video = recorder.SessionRecorder(record_dir)
+        video = recorder.SessionRecorder(record_dir, meta=session_meta(args))
         state["recording"] = record_dir
         print("recording to %s/" % record_dir, file=sys.stderr)
 

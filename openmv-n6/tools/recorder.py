@@ -42,7 +42,7 @@ class SessionRecorder:
     open.
     """
 
-    def __init__(self, dirpath, fps=8.772):
+    def __init__(self, dirpath, fps=8.772, meta=None):
         os.makedirs(dirpath, exist_ok=True)
         self.dir = dirpath
         self.path = os.path.join(dirpath, 'session.mp4')
@@ -55,6 +55,43 @@ class SessionRecorder:
         self._index = None
         self._thermal = None
         self._thermal_off = 0
+        # Set by the operator between poses; stamped onto every row from then
+        # on. A calibration session is a sequence of deliberate placements,
+        # and 'which rows belong to pose V07' is otherwise reconstructed from
+        # timestamps and memory after the fact.
+        self.pose_id = None
+        self._write_meta(meta or {})
+
+    def _write_meta(self, meta):
+        """Write meta.json FIRST, before a single frame exists.
+
+        Provenance written at close() is provenance a crash destroys, and a
+        calibration session that died halfway is still evidence - it just has
+        to be readable as what it is. What goes in here is what cannot be
+        recovered from the data afterwards: which radar config was on the
+        sensor, which ports, when the clock started.
+        """
+        doc = {
+            'created_wall': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+            'created_mono': time.monotonic(),
+            'fps_nominal': self.fps,
+            'thermal_frame_bytes': None,      # filled by the first write()
+        }
+        doc.update(meta)
+        try:
+            with open(os.path.join(self.dir, 'meta.json'), 'w') as f:
+                json.dump(doc, f, indent=2)
+        except OSError as e:                  # never fail a recording over it
+            self.error = 'meta.json: %s' % e
+        self._meta = doc
+
+    def _update_meta(self, **kw):
+        self._meta.update(kw)
+        try:
+            with open(os.path.join(self.dir, 'meta.json'), 'w') as f:
+                json.dump(self._meta, f, indent=2)
+        except OSError:
+            pass
 
     def write(self, rgb, thermal=None, extra=None):
         if self.w is None:
@@ -76,14 +113,29 @@ class SessionRecorder:
             self._thermal.write(thermal)
             row['thermal_off'] = self._thermal_off
             row['thermal_len'] = len(thermal)
+            if self._meta.get('thermal_frame_bytes') is None:
+                self._update_meta(thermal_frame_bytes=len(thermal))
             self._thermal_off += len(thermal)
         if extra:
             row.update(extra)
+        if self.pose_id is not None:
+            row['pose_id'] = self.pose_id
         if self._index:
             self._index.write(json.dumps(row) + '\n')
         self.frames += 1
 
+    def set_pose(self, pose_id):
+        """Name the placement the next frames belong to. None clears it."""
+        self.pose_id = str(pose_id) if pose_id not in (None, '') else None
+        poses = self._meta.setdefault('poses', [])
+        poses.append({'pose_id': self.pose_id, 'first_frame': self.frames,
+                      't_mono': time.monotonic()})
+        self._update_meta(poses=poses)
+        return self.pose_id
+
     def close(self):
+        self._update_meta(closed_wall=time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                          frames=self.frames)
         if self.w not in (None, False):
             self.w.release()
         for f in (self._index, self._thermal):

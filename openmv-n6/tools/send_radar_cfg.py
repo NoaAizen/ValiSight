@@ -15,6 +15,8 @@ from then on every response is attributed to the previous command, so the run
 looks clean while reporting a different command's "Done" for a failure.
 """
 import argparse
+import hashlib
+import json
 import os
 import sys
 import time
@@ -111,6 +113,63 @@ def send_config(ser, cfg_path, verbose=True, retries=2):
     return log
 
 
+STAMP_PATH = os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), '.radar-cfg-stamp.json')
+
+
+def cfg_digest(cfg_path):
+    """sha256 of the config as sent, plus the phase-table line it carries.
+
+    The digest alone is not enough to read later: two configs can differ only
+    in compRangeBiasAndRxChanPhase, and that one line is the difference
+    between a valid extrinsic and one that was silently voided (the phase
+    table moves boresight - frame_conventions.txt). So it is carried in clear
+    beside the hash.
+    """
+    with open(cfg_path, 'rb') as f:
+        raw = f.read()
+    phase = None
+    for line in raw.decode('utf-8', 'replace').splitlines():
+        if line.strip().startswith('compRangeBiasAndRxChanPhase'):
+            phase = line.strip()
+    return {
+        'path': os.path.abspath(cfg_path),
+        'name': os.path.basename(cfg_path),
+        'sha256': hashlib.sha256(raw).hexdigest(),
+        'range_bias_m': (float(phase.split()[1]) if phase and
+                         len(phase.split()) > 1 else None),
+        'phase_line': phase,
+    }
+
+
+def write_stamp(cfg_path, port, log):
+    """Record what was actually put on the radar, for the recorder to copy.
+
+    The radar cannot be asked which config it is running, and the config is
+    sent by this tool while sessions are recorded by another. Without this
+    stamp a session's provenance is the operator's memory, which is exactly
+    what PDF 01 sec 11 ("use exactly the same radar configuration during
+    validation that you used for calibration") cannot be checked against.
+
+    The stamp is a CLAIM, not proof: it says what this tool sent and when. A
+    reader must still check that it predates the recording and that the radar
+    was not power-cycled in between - meta.json carries both timestamps so
+    that check is possible.
+    """
+    stamp = dict(cfg_digest(cfg_path),
+                 port=port,
+                 sent_at_wall=time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                 sent_at_mono=time.monotonic(),
+                 commands=len(log))
+    try:
+        with open(STAMP_PATH, 'w') as f:
+            json.dump(stamp, f, indent=2)
+    except OSError as e:                       # never fail a send over this
+        print('warning: could not write %s (%s)' % (STAMP_PATH, e),
+              file=sys.stderr)
+    return stamp
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -130,8 +189,16 @@ def main():
             return 2
         print('sending %s to %s @%d' % (os.path.basename(args.cfg),
                                         args.port, BAUD))
-        send_config(ser, args.cfg)
-    print('\nsensor started. next: ./radar_listen.py --stage1')
+        log = send_config(ser, args.cfg)
+    stamp = write_stamp(args.cfg, args.port, log)
+    print('\nstamped %s  sha256 %s  rangeBias %s'
+          % (stamp['name'], stamp['sha256'][:12],
+             '%.4f m' % stamp['range_bias_m']
+             if stamp['range_bias_m'] is not None else 'ABSENT'))
+    if not stamp['range_bias_m']:
+        print('  NOTE: rangeBias is 0/absent - this config is UNCALIBRATED. '
+              'Any (R,t) solved from a session recorded on it is provisional.')
+    print('sensor started. next: ./radar_listen.py --stage1')
     return 0
 
 

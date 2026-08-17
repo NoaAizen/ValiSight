@@ -28,3 +28,9 @@ __pycache__/
 # FLASH.md is the procedure and is worth keeping; the binaries are not.
 /firmware-out/*.bin
 /firmware-out/SHA256SUMS
+
+# What send_radar_cfg.py last put on the radar. Machine state, not source: it
+# describes THIS board at THIS moment, and a committed copy would assert a
+# config that is not loaded. Sessions copy it into their own meta.json, which
+# is where it belongs permanently.
+.radar-cfg-stamp.json
