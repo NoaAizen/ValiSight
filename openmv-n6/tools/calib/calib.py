@@ -296,6 +296,31 @@ def detect_dir(pairs_dir, pattern, square_m):
                       file=sys.stderr)
                 c_th = None
 
+        # Make the two orderings agree before they are ever paired.
+        #
+        # findChessboardCornersSB orients the grid from corner polarity, and the
+        # polarity is INVERTED between these two sensors: the foil is light in
+        # visible and cold (dark) in LWIR, while the matte squares are dark in
+        # visible and hot (bright) in LWIR. So the detector routinely numbers the
+        # thermal grid 180 degrees round from the RGB one. Measured 2026-08-17 on
+        # the first full B2 set: 7 of 8 views came back flipped, every view still
+        # reported 'ok', and the only symptom was downstream - stereo rms 14.07 px
+        # and a recovered baseline of 1027 mm against a real 12-24 mm. Reversing
+        # the flipped views took the same eight views to 0.930 px and 24.3 mm.
+        #
+        # The test is geometric, not radiometric, so it does not care which sensor
+        # is inverted: the two cameras are co-aligned to a few degrees, so the
+        # grid's first-to-last diagonal must point the same way in both images. A
+        # 180-degree renumbering negates that vector, which is exactly what the
+        # sign of the dot product detects.
+        if c_th is not None:
+            d_rgb = c_rgb.reshape(-1, 2)[-1] - c_rgb.reshape(-1, 2)[0]
+            d_th = c_th.reshape(-1, 2)[-1] - c_th.reshape(-1, 2)[0]
+            if float(np.dot(d_rgb, d_th)) < 0.0:
+                c_th = c_th[::-1].copy()
+                print("  %-10s thermal corner order reversed (inverted contrast "
+                      "flipped the grid 180 deg)" % name, file=sys.stderr)
+
         # A view the thermal cannot see still constrains the RGB intrinsics.
         # (This board's varnish hides the squares in LWIR, so whole sessions
         # can be rgb-only; solve() calibrates stereo from the subset that has
@@ -312,7 +337,19 @@ def detect_dir(pairs_dir, pattern, square_m):
 # ------------------------------------------------------------------ solve
 
 
-def solve(corners, fix_principal=False, fix_f=None):
+def solve(corners, fix_principal=False, fix_f=None, fix_principal_th=True,
+          k_rgb_from=None):
+    """fix_principal applies to the RGB camera; fix_principal_th to the thermal.
+
+    They are separate on purpose. The thermal principal point is degenerate here
+    and must be pinned - measured 2026-08-17, freeing it walked it to (110, 72.6)
+    on a 160x120 sensor and inflated R to 7-9 deg with plausible rms throughout.
+    The RGB principal point is NOT degenerate: 19 tape-fixed views put it at
+    (306.4, 238.5) at rms 0.396, and pinning it to the image centre moves it
+    13.6 px in u. That matters far outside this file - T_camera_radar.json was
+    fitted against that K and gates du at a median of 0.96 px, so pinning the RGB
+    would silently invalidate the radar extrinsic by 14x its own tolerance.
+    """
     pattern = tuple(corners["pattern"])
     square = corners["square_m"]
     views = corners["views"]
@@ -325,8 +362,11 @@ def solve(corners, fix_principal=False, fix_f=None):
 
     flags = cv2.CALIB_FIX_PRINCIPAL_POINT if fix_principal else 0
     # k3 is not identifiable from a handful of views on a lens this short and
-    # mostly just absorbs noise into the corners
-    flags_th = flags | cv2.CALIB_FIX_K3
+    # mostly just absorbs noise into the corners. The principal-point decision
+    # is taken per camera, not inherited - see the docstring.
+    flags_th = cv2.CALIB_FIX_K3
+    if fix_principal_th:
+        flags_th |= cv2.CALIB_FIX_PRINCIPAL_POINT
 
     obj = [objp] * len(views)
     p_rgb = [np.asarray(v["rgb"], np.float32).reshape(-1, 1, 2) for v in views]
@@ -342,8 +382,26 @@ def solve(corners, fix_principal=False, fix_f=None):
         # 0.396 -> 0.393 while swinging (k2, k3) from (-0.04, 0) to (0.52, -0.79).
         flags |= (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_FOCAL_LENGTH |
                   cv2.CALIB_FIX_ASPECT_RATIO | cv2.CALIB_FIX_K3)
-    e1, K_rgb, d_rgb, _, _ = cv2.calibrateCamera(obj, p_rgb, (RGB_W, RGB_H), K0, None,
-                                                 flags=flags)
+    if k_rgb_from is not None:
+        # Take the RGB intrinsics as given and do not touch them.
+        #
+        # This is the safe default once anything downstream has been fitted
+        # against them. Measured 2026-08-17: the RGB principal point is NOT
+        # stable across view sets - 19 tape-fixed views put it at (306.4, 238.5)
+        # at rms 0.396, adding 14 foil views moved it to (344.2, 216.6), and
+        # pinning it to the image centre gives (320, 200). Nearly 38 px of
+        # spread. T_camera_radar.json was fitted against the first of those and
+        # gates du at a median of 0.96 px, so recomputing K_rgb here silently
+        # invalidates the radar extrinsic by up to 40x its own tolerance, with
+        # no error anywhere. The RGB intrinsics are their own artifact; a
+        # thermal session has no business moving them.
+        ref = json.load(open(k_rgb_from)) if isinstance(k_rgb_from, str) else k_rgb_from
+        K_rgb = np.array(ref["K_rgb"], np.float64)
+        d_rgb = np.array(ref["dist_rgb"], np.float64).reshape(1, -1)
+        e1 = float(ref.get("rms_rgb", float("nan")))
+    else:
+        e1, K_rgb, d_rgb, _, _ = cv2.calibrateCamera(obj, p_rgb, (RGB_W, RGB_H), K0, None,
+                                                     flags=flags)
 
     out = {
         "K_rgb": K_rgb.tolist(), "dist_rgb": np.ravel(d_rgb).tolist(),
@@ -391,13 +449,23 @@ def main():
     d = sub.add_parser("detect")
     d.add_argument("pairs_dir")
     d.add_argument("-o", "--out", default="corners.json")
-    d.add_argument("--pattern", default="7x5", help="inner corners, e.g. 7x5")
-    d.add_argument("--square", type=float, default=0.030, help="square size in metres")
+    # Defaults are this rig's target, not generic ones: 8x7 squares after one
+    # row is masked -> 7x6 inner corners, 38.3 mm caliper-measured
+    # (calib-artifacts/mechanical_measurements.yaml). The old 7x5/30mm defaults
+    # were a trap: 7x5 is findable as a sub-window of a 7x6 board, subgrid_risk()
+    # then rejects every view to rgb-only, and a correctly masked target reads as
+    # one that was never fixed.
+    d.add_argument("--pattern", default="7x6", help="inner corners, e.g. 7x6")
+    d.add_argument("--square", type=float, default=0.0383, help="square size in metres")
 
     s = sub.add_parser("solve")
     s.add_argument("corners", default="corners.json")
     s.add_argument("-o", "--out", default="calib.json")
     s.add_argument("--fix-principal", action="store_true")
+    s.add_argument("--k-rgb", metavar="CALIB_JSON",
+                   help="take K_rgb/dist_rgb from an existing calib.json instead of "
+                        "recomputing them; use this whenever something downstream "
+                        "(T_camera_radar.json) was fitted against them")
     s.add_argument("--fix-f", type=float, default=None,
                    help="fix RGB focal length (px) from a physical measurement")
 
@@ -415,7 +483,8 @@ def main():
         print("%d usable view(s) -> %s" % (len(res["views"]), a.out))
 
     elif a.cmd == "solve":
-        res = solve(json.load(open(a.corners)), a.fix_principal, a.fix_f)
+        res = solve(json.load(open(a.corners)), a.fix_principal, a.fix_f,
+                    k_rgb_from=a.k_rgb)
         json.dump(res, open(a.out, "w"), indent=2)
         if "rms_stereo" in res:
             print("views=%d  rms rgb=%.3f th=%.3f stereo=%.3f px\nbaseline=%.1f mm -> %s" % (

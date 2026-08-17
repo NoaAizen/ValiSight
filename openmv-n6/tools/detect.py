@@ -138,6 +138,43 @@ class Detector:
         return dets
 
 
+def _gpu_comes_up(timeout_s=120):
+    """Can TensorRT actually start right now? Asked in a process we can lose.
+
+    On Tegra a CUDA/nvmap allocation failure does not raise - it takes the whole
+    process down with SIGSEGV. Measured 2026-08-17 on this box:
+
+        NvMapMemAllocInternalTagged: ... error 12
+        [TRT] [E] createInferRuntime: ... CUDA initialization failure with error: 2
+        [TRT] [E] ... Cuda Runtime (out of memory)
+        Segmentation fault (core dumped)
+
+    A try/except around TrtDetector() cannot catch that, so live.py died at
+    startup rather than falling back - the failure the fallback exists to absorb
+    was the one thing it could not absorb.
+
+    A free-memory threshold is not a usable guard either: the same failure was
+    reproduced with 1386 MB MemAvailable, because nvmap needs large contiguous
+    blocks out of the carveout the GPU shares with the CPU, and a box that is
+    74% into swap is fragmented rather than empty. Available memory says nothing
+    about contiguity. So the question is not estimated, it is asked - in a child,
+    where a segfault costs an exit code instead of the viewer. Measured 0.66 s
+    against live.py's ~23 s bring-up.
+    """
+    import subprocess
+    import sys
+    here = os.path.dirname(os.path.abspath(__file__))
+    code = ("import sys; sys.path.insert(0, %r); import trt_detect; "
+            "d = trt_detect.TrtDetector(); d.close()" % here)
+    try:
+        rc = subprocess.call([sys.executable, "-c", code],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             timeout=timeout_s)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return rc == 0
+
+
 def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None):
     """Pick a detector. Both backends return the same [{cls,conf,x,y,w,h}].
 
@@ -151,16 +188,28 @@ def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None):
         raise ValueError("backend must be auto, gpu or cpu, not %r" % (backend,))
 
     if backend != "cpu":
-        try:
-            import trt_detect
-            det = trt_detect.TrtDetector(conf=conf, classes=classes, names=COCO)
-            det.backend = "gpu"
-            return det
-        except Exception as e:
+        # Probe first. 'gpu' asks for the GPU explicitly, so it is entitled to
+        # the real error rather than a fallback - but it should still get a
+        # message instead of a core dump.
+        if not _gpu_comes_up():
+            msg = ("the GPU backend cannot start (TensorRT/CUDA failed to "
+                   "initialise - usually no contiguous memory; check free -m)")
             if backend == "gpu":
-                raise
-            print("detector: no GPU backend (%s: %s), falling back to yolov4-tiny "
-                  "on the CPU" % (type(e).__name__, e), file=sys.stderr)
+                raise RuntimeError(msg)
+            print("detector: %s, falling back to yolov4-tiny on the CPU" % msg,
+                  file=sys.stderr)
+        else:
+            try:
+                import trt_detect
+                det = trt_detect.TrtDetector(conf=conf, classes=classes, names=COCO)
+                det.backend = "gpu"
+                return det
+            except Exception as e:
+                if backend == "gpu":
+                    raise
+                print("detector: no GPU backend (%s: %s), falling back to "
+                      "yolov4-tiny on the CPU" % (type(e).__name__, e),
+                      file=sys.stderr)
 
     det = Detector(size=size, conf=conf, classes=classes)
     det.backend = "cpu"
