@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <zlib.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 
 #include "bridge_protocol.h"
 
@@ -49,9 +50,12 @@ typedef struct {
     uint64_t  seq_gaps;       /* number of gap events */
     uint64_t  seq_lost;       /* records missing inside those gaps */
     uint64_t  sender_drops;   /* last value reported by HELLO */
+    uint64_t  imu_overflow;   /* last value reported by HELLO */
     uint32_t  last_seq;
     int       have_seq;
     uint64_t  bytes;
+    int64_t   max_read_gap_ms;   /* longest silence between two successful reads: a host stall shows here */
+    int64_t   last_read_ms;
     /* unwrapped timestamp of the last record, in ticks */
     int64_t   ts_unwrapped;   /* signed: an out-of-order record must not underflow */
     uint32_t  ts_last;
@@ -103,6 +107,7 @@ static void rx_deliver(bridge_rx_t *r, const bridge_hdr_t *h, const uint8_t *pay
 
     if (h->type == BRIDGE_T_HELLO && h->len >= 8) {
         r->sender_drops = rd32(payload + 4);
+        if (h->len >= 12) r->imu_overflow = rd32(payload + 8);
     } else if (h->type == BRIDGE_T_IMU && h->len >= 24 && r->imu_csv) {
         fprintf(r->imu_csv, "%u,%lld,%u,%d,%d,%d,%d,%d,%d\n", h->seq,
                 (long long)r->ts_unwrapped, h->ts_src,
@@ -130,10 +135,14 @@ static void bridge_feed(bridge_rx_t *r, const uint8_t *chunk, size_t n)
         /* find magic */
         size_t i = pos;
         while (i + BRIDGE_MAGIC_LEN <= r->len && memcmp(r->buf + i, BRIDGE_MAGIC, BRIDGE_MAGIC_LEN) != 0) i++;
-        if (i + BRIDGE_MAGIC_LEN > r->len) {     /* no magic: keep a 3-byte tail */
-            size_t keep = r->len >= 3 ? 3 : r->len;
+        if (i + BRIDGE_MAGIC_LEN > r->len) {
+            /* No magic from pos on. Bytes [pos,i) were checked and cannot start a
+             * record; bytes [i,len) (< 4 of them) may be a split magic — keep
+             * exactly those, never a fixed tail (a fixed 3-byte tail re-injected
+             * the end of the previous record and produced false resyncs). */
+            size_t keep = r->len - i;
             if (i > pos) r->resyncs++;
-            memmove(r->buf, r->buf + r->len - keep, keep); r->len = keep;
+            memmove(r->buf, r->buf + i, keep); r->len = keep;
             return;
         }
         if (i > pos) r->resyncs++;
@@ -154,7 +163,7 @@ static void bridge_feed(bridge_rx_t *r, const uint8_t *chunk, size_t n)
 static void rx_stats(const bridge_rx_t *r, double elapsed_s, FILE *out)
 {
     fprintf(out, "[%7.1fs] hello %llu  thermal %llu (%.1f Hz)  rgb %llu (%.1f Hz)  imu %llu (%.1f Hz)  "
-                 "| gaps %llu (lost %llu)  bad_crc %llu  resyncs %llu  sender_drops %llu  | %.1f KB/s\n",
+                 "| gaps %llu (lost %llu)  bad_crc %llu  resyncs %llu  sender_drops %llu  imu_overflow %llu  | %.1f KB/s  max_read_gap %lld ms\n",
             elapsed_s,
             (unsigned long long)r->recs[0],
             (unsigned long long)r->recs[1], elapsed_s > 0 ? r->recs[1] / elapsed_s : 0.0,
@@ -162,8 +171,9 @@ static void rx_stats(const bridge_rx_t *r, double elapsed_s, FILE *out)
             (unsigned long long)r->recs[3], elapsed_s > 0 ? r->recs[3] / elapsed_s : 0.0,
             (unsigned long long)r->seq_gaps, (unsigned long long)r->seq_lost,
             (unsigned long long)r->bad_crc, (unsigned long long)r->resyncs,
-            (unsigned long long)r->sender_drops,
-            elapsed_s > 0 ? r->bytes / elapsed_s / 1024.0 : 0.0);
+            (unsigned long long)r->sender_drops, (unsigned long long)r->imu_overflow,
+            elapsed_s > 0 ? r->bytes / elapsed_s / 1024.0 : 0.0,
+            (long long)r->max_read_gap_ms);
     fflush(out);
 }
 
@@ -183,20 +193,30 @@ static int open_input(const char *path)
         cfmakeraw(&tio);
         cfsetispeed(&tio, B115200); cfsetospeed(&tio, B115200);
         tio.c_cc[VMIN] = 0; tio.c_cc[VTIME] = 1;    /* 100 ms read timeout */
+        tio.c_cflag |= CLOCAL | CREAD;
+        tio.c_cflag &= ~CRTSCTS;
         tcsetattr(fd, TCSANOW, &tio);
+        tcflush(fd, TCIFLUSH);
+        /* Assert DTR+RTS like pyserial does: MicroPython's USB CDC treats DTR as
+         * "host connected" and throttles/drops TX without it (measured 2026-08-17:
+         * 2.8 Hz + hundreds of resyncs without, 8+ Hz clean with). */
+        int bits = TIOCM_DTR | TIOCM_RTS;
+        ioctl(fd, TIOCMBIS, &bits);
     }
     return fd;
 }
 
 int main(int argc, char **argv)
 {
-    const char *path = NULL, *dump = NULL; int quiet = 0;
+    const char *path = NULL, *dump = NULL, *rawpath = NULL; int quiet = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) dump = argv[++i];
+        else if (!strcmp(argv[i], "-r") && i + 1 < argc) rawpath = argv[++i];   /* raw byte dump, for debugging */
         else if (!strcmp(argv[i], "-q")) quiet = 1;
         else path = argv[i];
     }
-    if (!path) { fprintf(stderr, "usage: %s <device|file|-> [-o dump_dir] [-q]\n", argv[0]); return 2; }
+    if (!path) { fprintf(stderr, "usage: %s <device|file|-> [-o dump_dir] [-r raw.bin] [-q]\n", argv[0]); return 2; }
+    FILE *raw = rawpath ? fopen(rawpath, "wb") : NULL;
     int fd = open_input(path);
     if (fd < 0) return 1;
 
@@ -209,17 +229,23 @@ int main(int argc, char **argv)
         ssize_t n = read(fd, chunk, READ_CHUNK);
         if (n < 0) { if (errno == EINTR) continue; perror("read"); break; }
         if (n == 0) { if (fd != 0 && isatty(fd)) { /* timeout */ } else break; }   /* EOF on file/pipe */
-        else bridge_feed(&rx, chunk, (size_t)n);
         int64_t now = mono_ms();
+        if (n > 0) {
+            if (rx.last_read_ms && now - rx.last_read_ms > rx.max_read_gap_ms) rx.max_read_gap_ms = now - rx.last_read_ms;
+            rx.last_read_ms = now;
+            if (raw) fwrite(chunk, 1, (size_t)n, raw);
+            bridge_feed(&rx, chunk, (size_t)n);
+        }
         if (!quiet && now - last_stats >= STATS_EVERY_MS) { rx_stats(&rx, (now - t0) / 1000.0, stdout); last_stats = now; }
     }
     rx_stats(&rx, (mono_ms() - t0) / 1000.0, stdout);
-    printf("FINAL recs hello=%llu thermal=%llu rgb=%llu imu=%llu other=%llu gaps=%llu lost=%llu bad_crc=%llu resyncs=%llu sender_drops=%llu\n",
+    printf("FINAL recs hello=%llu thermal=%llu rgb=%llu imu=%llu other=%llu gaps=%llu lost=%llu bad_crc=%llu resyncs=%llu sender_drops=%llu imu_overflow=%llu max_read_gap_ms=%lld\n",
            (unsigned long long)rx.recs[0], (unsigned long long)rx.recs[1], (unsigned long long)rx.recs[2],
            (unsigned long long)rx.recs[3], (unsigned long long)rx.other, (unsigned long long)rx.seq_gaps,
            (unsigned long long)rx.seq_lost, (unsigned long long)rx.bad_crc, (unsigned long long)rx.resyncs,
-           (unsigned long long)rx.sender_drops);
+           (unsigned long long)rx.sender_drops, (unsigned long long)rx.imu_overflow, (long long)rx.max_read_gap_ms);
     fflush(stdout);
+    if (raw) fclose(raw);
     if (rx.imu_csv) fclose(rx.imu_csv);
     free(rx.buf); free(chunk);
     if (fd > 0) close(fd);

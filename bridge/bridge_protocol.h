@@ -21,9 +21,10 @@
  *   RGB     : u16 w, u16 h, u8 fmt(BRIDGE_PIX_JPEG), u8 pad, then bytes
  *   IMU     : i32 ax,ay,az [milli-g]  i32 gx,gy,gz [milli-deg/s]
  *   HELLO   : u32 proto_ver, u32 sender_drops (records the N6 itself gave up
- *             on because USB was not draining), sent once at start and then
- *             every ~1 s as a heartbeat so silence is distinguishable from
- *             "nothing to send".
+ *             on because USB was not draining), u32 imu_overflow (IMU samples
+ *             the on-board ring could not hold — happens when a USB stall
+ *             blocks the sender), sent once at start and then every ~1 s as a
+ *             heartbeat so silence is distinguishable from "nothing to send".
  *
  * A receiver that reads a bad crc drops that record and rescans for magic.
  * The same file is mirrored in bridge_protocol.py — keep them identical.

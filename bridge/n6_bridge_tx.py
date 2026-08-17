@@ -17,7 +17,7 @@ RGB_QUALITY = 40
 REINIT_AFTER = 3          # consecutive dead grabs before re-initialising a sensor
 HELLO_EVERY_TICKS = 1000000   # ~1 s in ticks_us units
 IMU_HZ = 200              # timer rate, as measured stable in src/live_server.py
-IMU_RING = 128            # > IMU_HZ * (thermal period 0.114 s) * 2 drains-per-frame margin
+IMU_RING = 1024           # ~5 s at 200 Hz: rides out a multi-second USB host stall (3.9 s measured 2026-08-17)
 
 
 class Bridge:
@@ -53,7 +53,7 @@ class Bridge:
     def hello(self, now=None):
         now = self.ticks() if now is None else now
         self.last_hello = now
-        return self._send(bp.T_HELLO, now, bp.hello_payload(self.drops))
+        return self._send(bp.T_HELLO, now, bp.hello_payload(self.drops, self.imu_overflow))
 
     def maybe_hello(self, now=None):
         now = self.ticks() if now is None else now
@@ -137,7 +137,6 @@ class ImuRing:
 def main():
     import csi
     import time
-    import pyb
 
     MIN_C, MAX_C = 15.0, 45.0
 
@@ -169,11 +168,13 @@ def main():
             time.sleep_ms(10)
         return None, None
 
-    vcp = pyb.USB_VCP()
-    vcp.setinterrupt(-1)          # binary payload may contain 0x03 — never treat it as Ctrl-C
+    # OpenMV v5 / MicroPython 1.28 on the N6 has no pyb.USB_VCP; the binary-safe
+    # path is sys.stdout.buffer (verified live 2026-08-17: bytes pass unchanged).
+    import sys
+    out = sys.stdout.buffer
 
     def write(b):
-        return vcp.write(b) or 0
+        return out.write(b) or 0
 
     ring = None
     try:

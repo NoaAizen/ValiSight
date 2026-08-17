@@ -27,7 +27,7 @@ _HDR_BODY = "<BBHIII"          # 16 bytes: offsets 4..20
 _CRC = "<I"                    # offset 20..24
 _IMG = "<HHBB"                 # w, h, fmt, pad
 _IMU = "<iiiiii"               # ax ay az [mg], gx gy gz [mdeg/s]
-_HELLO = "<II"                 # proto_ver, sender_drops
+_HELLO = "<III"                # proto_ver, sender_drops, imu_overflow
 
 
 def _crc(body, payload):
@@ -48,8 +48,8 @@ def imu_payload(ax_mg, ay_mg, az_mg, gx_mdps, gy_mdps, gz_mdps):
     return struct.pack(_IMU, int(ax_mg), int(ay_mg), int(az_mg), int(gx_mdps), int(gy_mdps), int(gz_mdps))
 
 
-def hello_payload(sender_drops):
-    return struct.pack(_HELLO, PROTO_VER, sender_drops & 0xFFFFFFFF)
+def hello_payload(sender_drops, imu_overflow=0):
+    return struct.pack(_HELLO, PROTO_VER, sender_drops & 0xFFFFFFFF, imu_overflow & 0xFFFFFFFF)
 
 
 def ts_period(ts_src):
@@ -116,4 +116,8 @@ def unpack_imu(payload):
 
 
 def unpack_hello(payload):
-    return struct.unpack(_HELLO, payload[:8])
+    """(proto_ver, sender_drops, imu_overflow) — tolerates the older 8-byte HELLO."""
+    if len(payload) >= 12:
+        return struct.unpack(_HELLO, payload[:12])
+    v, d = struct.unpack("<II", payload[:8])
+    return v, d, 0

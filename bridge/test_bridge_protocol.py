@@ -31,7 +31,7 @@ assert [g[0] for g in got] == [0, 1, 2, 3], got
 assert [g[2] for g in got] == [0, 1, 2, 3]
 w, hh, fmt, px = bp.unpack_image(got[1][4]); assert (w, hh, fmt, len(px)) == (160, 120, 0, 19200)
 assert bp.unpack_imu(got[3][4]) == (12, -7, 1004, 150, -20, 3)
-assert bp.unpack_hello(got[0][4]) == (1, 0)
+assert bp.unpack_hello(got[0][4]) == (1, 0, 0)
 assert d.resyncs == 1 and d.bad_crc == 0
 
 # 3. a flipped payload byte is rejected, and the NEXT record still decodes

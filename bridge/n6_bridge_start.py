@@ -93,6 +93,10 @@ def main():
     tx = open(os.path.join(HERE, "n6_bridge_tx.py"), "rb").read()
     repl = RawRepl(port)
     print(put_file(repl, "bridge_protocol.py", proto).decode())
+    # MicroPython keeps imported modules cached across raw-REPL execs, so a
+    # sender started earlier would still see the OLD bridge_protocol (bit us
+    # 2026-08-17: TypeError from a stale hello_payload). Drop the cache first.
+    repl.exec_and_wait(b"import sys\nsys.modules.pop('bridge_protocol', None)\nprint('cache cleared')\n")
     print("starting sender on", port)
     repl.exec_background(tx + b"\nmain()\n")
 

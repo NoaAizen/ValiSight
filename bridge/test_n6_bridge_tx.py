@@ -62,7 +62,7 @@ def test_short_write_counts_as_drop_and_leaves_a_gap():
     assert [r[2] for r in recs] == [0, 2], "receiver must see the seq gap"
     br.hello()
     recs, _ = decode(link)
-    assert bp.unpack_hello(recs[-1][4]) == (bp.PROTO_VER, 1), "HELLO reports the sender's drop count"
+    assert bp.unpack_hello(recs[-1][4]) == (bp.PROTO_VER, 1, 0), "HELLO reports the sender's drop count"
 
 
 def test_hello_cadence():
@@ -92,6 +92,9 @@ def test_imu_ring_drains_in_order_and_counts_overflow():
     assert [r[0] for r in recs] == [bp.T_IMU] * 4
     assert [r[3] for r in recs] == [100, 101, 102, 103], "each sample keeps its own timestamp"
     assert [bp.unpack_imu(r[4])[0] for r in recs] == [0, 1, 2, 3], "oldest first"
+    br.imu_overflow = ring.overflow; br.hello()
+    recs, _ = decode(link)
+    assert bp.unpack_hello(recs[-1][4]) == (bp.PROTO_VER, 0, 2), "HELLO carries the ring overflow"
     # busy flag: a tick during drain is skipped, not corrupting
     ring.busy = True; ring.tick(); assert ring.ix == 0; ring.busy = False
 
