@@ -20,6 +20,8 @@ something to quote a number off — so the number a user reads is never the pixe
 they see, it is the thermal pixel behind it.
 
 Full design notes and every measurement behind the decisions: [DESIGN.md](DESIGN.md)
+(Hebrew). How the four streams — thermal, visible, radar and the detector — reach
+the same frame, on which clock and with what left unsynchronised: [SYNC.md](SYNC.md)
 (Hebrew).
 
 ## Layout

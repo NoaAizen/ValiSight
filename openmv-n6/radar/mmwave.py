@@ -79,6 +79,37 @@ CFG_10HZ = {
     'cfar_threshold_scale': 15,
 }
 
+# The active config's limits. Every default argument below reads THIS, not
+# CFG_10HZ, so switching profiles is one call rather than an audit of every
+# call site -- and a call site that was never updated is invisible: it goes on
+# rejecting good points using the old profile's v_max, and a rejected point
+# looks exactly like a point the radar never reported.
+CFG = CFG_10HZ
+
+_DERIVED = {}
+
+
+def use_config(name):
+    """Point CFG at a named config in radar/configs, deriving its limits.
+
+    Host-side only -- it reads the .cfg file, and chirp.py is imported lazily so
+    that importing mmwave on the N6, where there is no configs directory, stays
+    free of file I/O. Returns the limits dict it installed.
+
+    radar_10hz keeps its MEASURED table rather than the derived one. The two
+    agree to 0.3% (tools/tests/test_chirp.py asserts it), and where a
+    measurement exists it outranks a derivation.
+    """
+    global CFG
+    if name in ('radar_10hz', CFG_10HZ):
+        CFG = CFG_10HZ
+        return CFG
+    if name not in _DERIVED:
+        import chirp
+        _DERIVED[name] = chirp.limits_for(name)
+    CFG = _DERIVED[name]
+    return CFG
+
 
 # --- framing ------------------------------------------------------------
 
@@ -561,7 +592,7 @@ def parse_frame(frame, convention='project'):
 def fold_velocity(v, vmax=None):
     """What the radar reports for a true velocity v."""
     if vmax is None:
-        vmax = CFG_10HZ['v_max_m_s']
+        vmax = CFG['v_max_m_s']
     span = 2.0 * vmax
     return ((v + vmax) % span) - vmax
 
@@ -569,7 +600,7 @@ def fold_velocity(v, vmax=None):
 def unfold_candidates(v_measured, vmax=None, kmax=2):
     """Every true velocity within +-kmax folds consistent with a reading."""
     if vmax is None:
-        vmax = CFG_10HZ['v_max_m_s']
+        vmax = CFG['v_max_m_s']
     return [v_measured + 2.0 * k * vmax for k in range(-kmax, kmax + 1)]
 
 
@@ -590,9 +621,9 @@ def validate_points(points, vmax=None, max_range=None, min_range=None):
     wrong endianness or stride.
     """
     if vmax is None:
-        vmax = CFG_10HZ['v_max_m_s']
+        vmax = CFG['v_max_m_s']
     if max_range is None:
-        max_range = CFG_10HZ['range_max_unambiguous_m']
+        max_range = CFG['range_max_unambiguous_m']
     issues = []
     for i, p in enumerate(points):
         if not (_finite(p['x']) and _finite(p['y']) and

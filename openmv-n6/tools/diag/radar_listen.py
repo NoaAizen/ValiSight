@@ -144,16 +144,42 @@ def listen(ser, args):
                     gaps += 1
                 prev_frame_no = fr['frame_number']
 
+                # mmwave.CFG, not CFG_10HZ: the blind zone is a function of
+                # freqSlopeConst, so it moves with the profile (0.375 m under
+                # radar_10hz, 0.604 under radar_people). Pinned to the wrong
+                # config this validator reports every good point between the
+                # two floors as impossible, and every point above the OLD
+                # v_max -- which under Mode P is every walker there is.
                 issues = mmwave.validate_points(
-                    fr['points'], min_range=mmwave.CFG_10HZ['hpf_blind_m'])
+                    fr['points'], min_range=mmwave.CFG['hpf_blind_m'])
                 if json_f:
-                    json_f.write(json.dumps({
+                    row = {
                         't': t_frame,
                         'frame': fr['frame_number'],
                         'points': [[p['x'], p['y'], p['z'], p['v'],
                                     p['snr'], p['noise']] for p in fr['points']],
                         'convention': 'x_fwd_y_left_z_up',
-                    }) + '\n')
+                        'cfg': args.config,
+                    }
+                    # The radar's own health, recorded rather than only printed.
+                    # SCAN-MODES-PLAN gate 3 reads interframe_margin_us off a
+                    # recording, and a sensor-side overrun is invisible in the
+                    # points themselves: frames simply are not produced, which
+                    # offline looks exactly like a link that dropped them.
+                    if fr['stats']:
+                        row['interframe_margin_us'] = \
+                            fr['stats']['interframe_margin_us']
+                    # 'rx_c', not 'die_c' -- radar_overlay.py already maps the
+                    # one to the other, and this is the field the range-bias
+                    # drift check reads. temp_valid is carried with it because
+                    # the return code is 0 on success, so an absent flag and a
+                    # good report are the same value.
+                    if fr.get('temperature'):
+                        row['die_c'] = fr['temperature']['rx_c']
+                        row['temp_valid'] = fr['temperature']['valid']
+                    row['dropped_bytes'] = sync.dropped_bytes
+                    row['resyncs'] = sync.resync_count
+                    json_f.write(json.dumps(row) + '\n')
                 if args.quiet:
                     continue
                 line = 'frame %6d  t=%8.3f  %2d pts  tlv=%s  len=%s' % (
@@ -208,10 +234,22 @@ def main():
                     help='stop after N frames (0 = until Ctrl-C)')
     ap.add_argument('--record', metavar='DIR',
                     help='write radar.bin (raw) + radar.jsonl (parsed)')
+    # Which .cfg the radar is actually running. It cannot be inferred from the
+    # stream -- the frames carry no profile -- and it decides what counts as a
+    # physically impossible point, so a wrong value here turns good detections
+    # into '!!' lines and a right one is worth recording alongside the data.
+    ap.add_argument('--config', default='radar_10hz',
+                    help='config the sensor is running, for the validator '
+                         'limits and the recording (default radar_10hz)')
     ap.add_argument('--show', type=int, default=4,
                     help='print at most this many points per frame')
     ap.add_argument('-q', '--quiet', action='store_true')
     args = ap.parse_args()
+
+    lim = mmwave.use_config(args.config)
+    print('%s: v_max +-%.3f m/s, R_max %.1f m, blind %.2f m, %.4f m grid' % (
+        args.config, lim['v_max_m_s'], lim['range_max_unambiguous_m'],
+        lim['hpf_blind_m'], lim['range_res_m']))
 
     with serial.Serial(args.port, BAUD, timeout=0.05) as ser:
         if args.stage1:

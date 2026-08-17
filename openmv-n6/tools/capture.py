@@ -240,6 +240,11 @@ def good_snapshot(csi_dev, tries=6):
 _alloc_tear_buffers(lep.height())
 
 
+# ~2.3 s at 8.8 fps. The startup FFC is the thing being waited out; the shutter
+# is closed for well under a second, so this clears it with margin and still
+# costs less than the 1.7 s the first VoSPI sync already costs.
+_SETTLE_FRAMES = 20
+
 if __AUTORANGE__:
     # Percentile clip off a real histogram. Two summary-statistic attempts failed
     # here: min/max let a few hot pixels stretch the range fivefold (40 of 255
@@ -247,6 +252,21 @@ if __AUTORANGE__:
     # scene with a person in it. Percentiles do neither - the 1st/99.5th cover
     # the scene while letting a genuinely hot target saturate, which is the
     # behaviour you want on an inspection camera anyway.
+    # Settle first. The frame this histogram is built from decides the window
+    # for the WHOLE session, and the first frames after bring-up are not the
+    # scene: the Lepton runs an FFC on start-up and outputs the closed shutter,
+    # a near-uniform surface at the camera's own internal temperature.
+    #
+    # Measured on this board 2026-08-16, and the reason this loop exists: with a
+    # wide window pinned open the room reads 24.5..31.3 C and holds there for
+    # minutes. Auto-range off the first frame chose 30..47 C across three
+    # independent bring-ups - a floor sitting at the scene's CEILING. 57% of the
+    # frame was pinned immediately and 100% of it four minutes later, so every
+    # pixel reported TMIN exactly and the thermal channel measured nothing at
+    # all, while the health panel's range check read "ok" because the step size
+    # was fine. A wrong window is not a coarse measurement, it is no measurement.
+    for _ in range(_SETTLE_FRAMES):
+        lep.snapshot()
     _b = lep.snapshot().bytearray()
     _W, _H = lep.width(), lep.height()
 

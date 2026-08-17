@@ -5,7 +5,13 @@ Approach: calibrate each camera's intrinsics and distortion, stereo-calibrate fo
 the rigid transform between them, then derive the plane-induced homography
 analytically for whatever working distance we want:
 
-    H = K_th @ (R - t @ n.T / Z) @ inv(K_rgb),     n = [0,0,1]
+    H = K_th @ (R + t @ n.T / Z) @ inv(K_rgb),     n = [0,0,1]
+
+PLUS, not minus. The subtracting form appears in most references and assumes t
+points the other way; with the sign flipped the error is 2|t|f/Z, which is 3.4
+thermal pixels at 0.5 m -- more than the entire registration budget the 12 mm
+baseline buys, and it reads as "the fusion is misaligned, maybe we need a range
+sensor". plane_homography() below has always been right; this line was not.
 
 This matters. Fitting a homography from one shot pins you to the distance you
 happened to shoot at; deriving it from (R,t) lets 0.8m - the optimal calibration
@@ -141,6 +147,72 @@ def pack_lut(raw_th_pixels):
 # ------------------------------------------------------------------ detection
 
 
+# Preprocessing ladder, in the order that was measured to help on this rig.
+# The foil target is the reason it exists: crinkled aluminium is a superb LWIR
+# checker (emissivity ~0.05, so it mirrors the cold ceiling) and a poor visible
+# one -- every crease is a specular highlight, so the "white" squares are not
+# uniform quads and SB rejects them. A 3x3 blur before CLAHE kills the creases
+# without moving the corners. Measured on captures/foil_preview2: the raw frame
+# yields nothing at any pattern size, `blur3+clahe2` yields a full grid.
+def _ladder(img):
+    clahe = cv2.createCLAHE
+    yield 'raw', img
+    yield 'clahe2', clahe(2.0, (8, 8)).apply(img)
+    yield 'blur3+clahe2', clahe(2.0, (8, 8)).apply(cv2.GaussianBlur(img, (3, 3), 0))
+    yield 'blur5+clahe3', clahe(3.0, (8, 8)).apply(cv2.GaussianBlur(img, (5, 5), 0))
+    yield 'bilat+clahe2', clahe(2.0, (8, 8)).apply(cv2.bilateralFilter(img, 9, 60, 60))
+
+
+def find_pattern(img, pattern):
+    """First hit from the preprocessing ladder. (corners, variant_name) or None."""
+    sb_flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_NORMALIZE_IMAGE
+    for name, im in _ladder(img):
+        ok, corners = cv2.findChessboardCornersSB(im, pattern, sb_flags)
+        if ok:
+            return corners.reshape(-1, 2), name
+    return None
+
+
+def subgrid_risk(img, pattern, variant=None):
+    """True if a LARGER grid than `pattern` is also findable in this image.
+
+    THE CHECK THAT MATTERS, and the reason it is separate from detection.
+
+    findChessboardCorners asks "is there a pattern-sized grid here", not "is
+    this THE grid". On a board with more inner corners than the declared
+    pattern it happily locks onto a sub-window, and it may lock onto a
+    different sub-window in each camera -- offset by one square, say. That
+    offset is a pure translation in the target plane, and a homography absorbs
+    a planar translation EXACTLY. So the residuals stay sub-pixel, every
+    quality metric passes, and the solved (R,t) is wrong by one square width.
+
+    Inverted contrast makes it likelier rather than less: foil reads bright in
+    the visible and dark in LWIR, so the two detectors do not even start from
+    the same square.
+
+    No amount of solver cleverness recovers from this; the fix is a board whose
+    full inner grid IS the declared pattern. This function refuses the view
+    instead of letting it through.
+
+    `variant` restricts the search to the preprocessing that found the pattern
+    in the first place. That is both faster and the sharper question: whether
+    the SAME view of the image also contains a larger grid. Running the whole
+    ladder here would flag boards that only reveal an extra row under contrast
+    settings the real detection never used.
+    """
+    sb_flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_NORMALIZE_IMAGE
+    if variant is not None:
+        img = dict(_ladder(img))[variant]
+    pw, ph = pattern
+    for bigger in ((pw + 1, ph), (pw, ph + 1), (pw + 1, ph + 1)):
+        if variant is not None:
+            if cv2.findChessboardCornersSB(img, bigger, sb_flags)[0]:
+                return True
+        elif find_pattern(img, bigger) is not None:
+            return True
+    return False
+
+
 def detect_corners(img, pattern):
     """Checkerboard corners, sub-pixel refined. Returns None if not found.
 
@@ -149,9 +221,9 @@ def detect_corners(img, pattern):
     its corners are already subpixel. Classic path kept as fallback.
     """
     sb_flags = cv2.CALIB_CB_EXHAUSTIVE | cv2.CALIB_CB_NORMALIZE_IMAGE
-    ok, corners = cv2.findChessboardCornersSB(img, pattern, sb_flags)
-    if ok:
-        return corners.reshape(-1, 2)
+    hit = find_pattern(img, pattern)
+    if hit is not None:
+        return hit[0]
 
     # Windowed fallback. Verified on this rig: a board that fails detection in
     # the full 640x400 frame (bright glass, people, hot doors dominate the
@@ -163,9 +235,15 @@ def detect_corners(img, pattern):
         for y0 in range(0, h - wh + 1, max(1, (h - wh) // 2 or 1)):
             for x0 in range(0, w - ww + 1, max(1, (w - ww) // 2 or 1)):
                 win = np.ascontiguousarray(img[y0:y0 + wh, x0:x0 + ww])
-                ok, corners = cv2.findChessboardCornersSB(win, pattern, sb_flags)
-                if ok:
-                    return corners.reshape(-1, 2) + np.float32([x0, y0])
+                # The ladder here too, not just on the full frame. Measured on
+                # the foil board: the full frame yields nothing at any variant
+                # (the backlit windows dominate CLAHE's normalisation), while
+                # a window around the board plus blur3+clahe2 yields the grid.
+                # Restricting the search and fixing the local contrast are two
+                # different repairs and this target needs both.
+                hit = find_pattern(win, pattern)
+                if hit is not None:
+                    return hit[0] + np.float32([x0, y0])
 
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH | cv2.CALIB_CB_NORMALIZE_IMAGE
     ok, corners = cv2.findChessboardCorners(img, pattern, flags)
@@ -202,6 +280,21 @@ def detect_dir(pairs_dir, pattern, square_m):
             print("  %-10s skip (rgb=%s thermal=%s)" %
                   (name, c_rgb is not None, c_th is not None), file=sys.stderr)
             continue
+
+        # A stereo view is only usable if BOTH detections are the whole board.
+        # Checked per modality because the board can be fully visible to one
+        # camera and clipped for the other, and a clipped board is exactly the
+        # sub-window case. Rejecting to rgb-only is safe: the view still
+        # constrains the RGB intrinsics, it just cannot constrain (R,t).
+        if c_th is not None:
+            risky = [m for m, im in (("rgb", rgb), ("thermal", th_big))
+                     if subgrid_risk(im, pattern)]
+            if risky:
+                print("  %-10s rgb-only  SUBGRID RISK in %s: a larger grid is "
+                      "also findable, so the %s detection is a sub-window at an "
+                      "unverifiable position" % (name, "+".join(risky), pattern),
+                      file=sys.stderr)
+                c_th = None
 
         # A view the thermal cannot see still constrains the RGB intrinsics.
         # (This board's varnish hides the squares in LWIR, so whole sessions

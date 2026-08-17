@@ -138,6 +138,35 @@ class Detector:
         return dets
 
 
+def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None):
+    """Pick a detector. Both backends return the same [{cls,conf,x,y,w,h}].
+
+    'auto' prefers the GPU and says so on stderr when it falls back, because a
+    silent fallback here is a 10x slowdown that would otherwise be diagnosed as
+    a link problem. `size` is ignored by the GPU backend: its engine is built
+    for a fixed 640x640 input and changing it means rebuilding the engine.
+    """
+    import sys
+    if backend not in ("auto", "gpu", "cpu"):
+        raise ValueError("backend must be auto, gpu or cpu, not %r" % (backend,))
+
+    if backend != "cpu":
+        try:
+            import trt_detect
+            det = trt_detect.TrtDetector(conf=conf, classes=classes, names=COCO)
+            det.backend = "gpu"
+            return det
+        except Exception as e:
+            if backend == "gpu":
+                raise
+            print("detector: no GPU backend (%s: %s), falling back to yolov4-tiny "
+                  "on the CPU" % (type(e).__name__, e), file=sys.stderr)
+
+    det = Detector(size=size, conf=conf, classes=classes)
+    det.backend = "cpu"
+    return det
+
+
 # A person is the detection this rig exists for, so it keeps a fixed green
 # regardless of the warped/unwarped colour convention; the (unreg) mark on the
 # temperature still carries that warning.

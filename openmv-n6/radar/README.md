@@ -125,8 +125,12 @@ P10 (PD6) is CSI_FSYNC and the board drives it, so it is a signal to jumper
 
 | path | what |
 |---|---|
-| `mmwave.py` | framing, TLV walk, points + SNR join, stats, temperature, Doppler fold, physics validators |
-| `configs/radar_10hz.cfg` | the 10 fps config, with the measurement behind each choice |
+| `mmwave.py` | framing, TLV walk, points + SNR join, stats, temperature, Doppler fold, physics validators. `use_config(name)` points the validators at a profile |
+| `chirp.py` | .cfg → physical limits, derived. Anchored on the three numbers measured off `radar_10hz.cfg`; run it as a script to print any config's envelope |
+| `configs/radar_10hz.cfg` | Mode C: the 10 fps close-range config, with the measurement behind each choice |
+| `configs/radar_people.cfg` | **Mode P**: people, 2–15 m, `v_max ±4.99 m/s`. The operational config. Derived, not yet run on hardware |
+| `configs/radar_people_measure_bias.cfg` | range-bias/phase calibration for Mode P. Run before trusting any projection from that profile |
+| `../tools/tests/test_chirp.py` | 28 offline assertions on the derivation and on the cfg lines that are decisions |
 | `../tools/tests/test_radar.py` | 57 offline assertions |
 | `../tools/send_radar_cfg.py` | config → CLI UART, waiting on the radar's own response per line |
 | `../tools/diag/radar_listen.py` | host: stage-1 gate, live parse, recording |

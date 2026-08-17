@@ -167,6 +167,47 @@ def board_clock():
           live.Streamer._want_heap(type("S", (), {"state": {}})(), 7) is True)
 
 
+def host_soc():
+    """The host panel, off synthetic readings.
+
+    The thresholds are the whole content of this module - the sysfs reads either
+    work or return None - and they encode a judgment that is easy to get wrong in
+    the direction that matters: a busy host must not raise the same alarm as a
+    starved sensor, or an operator learns to discount both. So the point of these
+    checks is mostly that CPU and heat cannot reach 'fail', and memory can.
+    """
+    import soc as hostsoc
+
+    print("\nhost soc")
+    r = hostsoc.Soc().read()
+    check("a reading comes back with the fields the panel draws",
+          {"cpu_pct", "mem_avail_mb", "t_max", "ncpu"} <= set(r),
+          "%d cores, %s MB free, %s C" % (r["ncpu"], r["mem_avail_mb"], r["t_max"]))
+
+    def levels(**kw):
+        base = {"cpu_pct": 10.0, "self_pct": 5.0, "ncpu": 6, "load1": 1.0,
+                "mem_avail_mb": 4000, "mem_total_mb": 8000, "t_max": 45.0,
+                "t_crit": 100.0, "power_w": None, "power": {}}
+        base.update(kw)
+        return {c["name"]: c["level"] for c in hostsoc.checks(base)}
+
+    check("an idle host says so", levels() == {"host cpu": "ok", "host memory": "ok",
+                                               "host thermal": "ok"})
+    check("a saturated host warns but never fails - the board's clock owns that verdict",
+          levels(cpu_pct=97.0)["host cpu"] == "warn")
+    check("a host near its thermal trip warns rather than failing, for the same reason",
+          levels(t_max=93.0)["host thermal"] == "warn"
+          and levels(t_max=99.5)["host thermal"] == "warn"
+          and levels(t_max=80.0)["host thermal"] == "ok")
+    # The exception, and the reason for it: an OOM kill during a recording is not
+    # a risk to the numbers, it is a session that ends without a finalised mp4.
+    check("memory about to run out does fail", levels(mem_avail_mb=180)["host memory"] == "fail")
+    check("a part with no critical trip still reports its temperature",
+          levels(t_crit=None)["host thermal"] == "ok")
+    check("a host with no power rail simply omits the row",
+          "host power" not in levels() and "host power" in levels(power_w=7.2, power={}))
+
+
 def failure_reporting():
     """The board's own exception must survive the port dying while it is read.
 
@@ -612,10 +653,36 @@ def main():
         get("/set?boxes=0")
         check("/set can turn the overlay off", pipe.show_detections is False)
         get("/set?boxes=1")
+
+        # /ui is the page's only poll, so a field it stops carrying is a panel
+        # that silently goes blank rather than an error anyone sees.
+        code, body = get("/ui")
+        d = json.loads(body)
+        check("/ui carries every panel the page draws",
+              code == 200 and {"worst", "checks", "timing", "stats", "detections",
+                               "cfg", "heap_free", "coverage"} <= set(d),
+              "keys: %s" % ", ".join(sorted(d)))
+        check("/ui agrees with /health on the overall level",
+              d["worst"] == json.loads(get("/health")[1])["worst"],
+              d["worst"])
+
+        # The controls are initialised from here rather than from the HTML. The
+        # old page hardcoded its slider positions, so --gain 220 drew a handle at
+        # 200 over a pipeline running at 220 and the first touch of it moved the
+        # pipeline to wherever the handle happened to be.
+        get("/set?gain=333&mix=17&palette=gray")
+        cfg = json.loads(get("/ui")[1])["cfg"]
+        check("/ui reports the live control state, not the page's defaults",
+              cfg["gain"] == 333 and cfg["mix"] == 17 and cfg["palette"] == "gray"
+              and cfg["warped"] is False,
+              "gain %d, mix %d, palette %s" % (cfg["gain"], cfg["mix"], cfg["palette"]))
+        check("a session with no radar reports none rather than dead knobs",
+              cfg["radar"] is None)
     finally:
         srv.shutdown()
 
     board_clock()
+    host_soc()
     failure_reporting()
     threading_and_detection(y, thermal)
 

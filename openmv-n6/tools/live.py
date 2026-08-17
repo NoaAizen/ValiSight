@@ -43,6 +43,7 @@ import capture  # noqa: E402  - reuse the bring-up that is known to survive
 import detect   # noqa: E402
 import radar_overlay  # noqa: E402
 import recorder  # noqa: E402
+import soc as hostsoc  # noqa: E402
 
 PORT = "/dev/ttyACM0"
 LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "host", "libfusion.so")
@@ -718,6 +719,14 @@ def health(pipe, state, now):
         add("thermal load", "ok", "no write stalls, longest gap %dms of %dms"
             % (tm["thermal_ms"]["max"], tm["safe_gap_ms"]))
 
+    # --- the machine this is running on. Deliberately next to the check above:
+    # they are the same subject seen from opposite ends. "thermal load" is the
+    # damage, measured on the board's own clock and therefore already in the
+    # past by the time it appears; these are the causes, and they move first.
+    s = state.get("soc")
+    if s is not None:
+        out.extend(hostsoc.checks(s.read()))
+
     if tm["ffc_ago_s"] is not None and tm["ffc_ago_s"] < 3.0:
         # The sensor needs time to settle after the shutter. Quoting through one
         # is the kind of error that survives into a report.
@@ -1183,6 +1192,16 @@ class Streamer(threading.Thread):
     def __init__(self, port, pipeline, quality, state, work, batch=20):
         super().__init__(daemon=True)
         self.port, self.pipe, self.quality, self.state = port, pipeline, quality, state
+        # Range policy for the board's Lepton. None = auto-range (the default,
+        # a percentile clip off one early frame); a (tmin, tmax) pair pins the
+        # window instead. Pinning exists because auto-range samples ONCE, and
+        # the sensor's output drifts for minutes after bring-up: measured here
+        # 2026-08-16, a window chosen at start-up had 56.6% of the frame pinned
+        # at its floor immediately and 100.0% pinned four minutes later, i.e.
+        # the whole scene had fallen out of the bottom of it. A pinned wide
+        # window is how you SEE that drift, and how a calibration session gets
+        # a window that is still right at the end of it.
+        self.fixed_range = None
         self.work = work
         self.batch = batch
         self.buf = bytearray()
@@ -1505,9 +1524,11 @@ class Streamer(threading.Thread):
 
     def _run(self):
         self.s = serial.Serial(self.port, 115200, timeout=0.2, write_timeout=10)
+        tmin, tmax = self.fixed_range if self.fixed_range else (-10, 140)
         setup = (SETUP_CODE
-                 .replace("__TMIN__", "-10").replace("__TMAX__", "140")
-                 .replace("__AUTORANGE__", "True").replace("__Q__", str(self.quality)))
+                 .replace("__TMIN__", str(tmin)).replace("__TMAX__", str(tmax))
+                 .replace("__AUTORANGE__", str(self.fixed_range is None))
+                 .replace("__Q__", str(self.quality)))
         self._attention()
         self._submit(setup)
 
@@ -1738,128 +1759,500 @@ SKEW_WARN = 0.25
 # ---------------------------------------------------------------- http
 
 
-PAGE = b"""<!doctype html><meta charset=utf-8><title>thermal fusion - live</title>
-<style>body{background:#111;color:#ddd;font:14px system-ui;margin:0;padding:16px}
-#wrap{position:relative;display:inline-block}
-img{max-width:100%;border-radius:6px;display:block}
-.row{display:flex;gap:16px;align-items:center;margin:10px 0;flex-wrap:wrap}
-label{display:flex;gap:6px;align-items:center}input[type=range]{width:120px}
-button{background:#222;color:#ccc;border:1px solid #444;border-radius:4px;padding:4px 10px;
-cursor:pointer}button.on{background:#385;color:#fff;border-color:#5a7}
-#s{color:#8b8}
-#read{position:absolute;padding:3px 7px;background:#000c;border:1px solid #666;
-border-radius:4px;font:13px ui-monospace,monospace;pointer-events:none;display:none;
-white-space:nowrap}
-#read.warn{border-color:#c84;color:#fc9}
-#band{font:13px ui-monospace,monospace;color:#bbb}
-#band b{color:#fda;font-weight:600}
-#clock{font:12px ui-monospace,monospace;color:#999;gap:14px}
-#clock b{font-weight:600}
-#clock .th{color:#f0a860}#clock .vis{color:#6cc8ff}#clock .warn{color:#f0c060}
-#health{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start}
-.pill{border:1px solid #444;border-radius:4px;padding:3px 9px;font-size:12px;
-background:#1a1a1a;line-height:1.5}
-.pill .n{font-weight:600;letter-spacing:.02em}
-.pill .t{color:#999;margin-left:7px}
-.pill.ok{border-color:#2f5d3f}.pill.ok .n{color:#7fd39b}
-.pill.warn{border-color:#7a5a1e}.pill.warn .n{color:#f0c060}.pill.warn .t{color:#c8ae7c}
-.pill.fail{border-color:#7d2f2f;background:#2a1616}.pill.fail .n{color:#ff8a8a}
-.pill.fail .t{color:#e0a5a5}
-.note{color:#987;font-size:12px;max-width:60em;line-height:1.5}</style>
-<h3>thermal + visible fusion &mdash; live</h3>
-<div id=wrap><img id=im src="/stream"><div id=read></div></div>
-<div class=row>
-<label>gain <input type=range id=gain min=0 max=512 value=200></label>
-<label>eps <input type=range id=eps min=1 max=1000 value=200></label>
-<label>radius <input type=range id=radius min=1 max=8 value=4></label>
-<label>agc <input type=range id=agc min=0 max=100 value=0></label>
-</div>
-<div class=row>
-<span>view</span><span id=view></span>
-<label>mix <input type=range id=mix min=0 max=100 value=50></label>
-<label><input type=checkbox id=outline> thermal footprint</label>
-<label><input type=checkbox id=boxes checked> detections</label>
-</div>
-<div class=row id=dets></div>
-<div class=row>
-<span>palette</span><span id=pal></span>
-<label>&epsilon; <input type=number id=emis min=0.05 max=1 step=0.01 value=1 style=width:5em></label>
-<label>reflected &deg;C <input type=number id=refl step=1 value=20 style=width:5em></label>
-</div>
-<div class=row id=band></div>
-<div class=row id=clock></div>
-<div class=row id=health></div>
-<div class=row><span id=s></span></div>
-<p class=note>Hover for a reading. The number comes from the thermal frame behind
-that pixel &mdash; before the AGC and before the guided filter, which borrows the
-visible camera's edges to sharpen the picture and must not be quoted off.
-Absolute accuracy is &plusmn;5&deg;C at best. The board runs the Lepton in
-<b>high gain</b> since 2026-08-09; before that it was silently in low gain, whose
-specified accuracy is the greater of &plusmn;10&deg;C or 10%, so any reading quoted
-off a frame recorded earlier than that carries the looser number. The <b>delta</b> between two nearby points of the same
-material in one frame is far better than either, and is what a finding should rest
-on &mdash; provided neither point is clipped, neither sits on a rebuilt row, and no
-shutter event separates them. Readings keep working in every view.</p>
-<p class=note><b>Judging registration.</b> The fused view cannot tell you whether the
-warp is right: the guided filter puts crisp edges in the right places even when the
-thermal layer is offset, so a misregistered frame still looks sharp &mdash; it just
-colours the wrong side of the edge. Use <b>blink</b> (the eye catches motion far
-better than offset), <b>mix</b> to judge how far off it is, or <b>edges</b>, which
-draws the thermal layer's own edges over the plain visible image: where the warp is
-right they land on the object's outline. <b>thermal footprint</b> outlines where the
-thermal camera stops seeing at all &mdash; outside it the grey is not a cold reading,
-it is no reading.</p>
-<p class=note><b>The health row</b> is what only a live stream can tell you: the
-offline suites prove the pipeline is correct on frames that sit still, not that the
-board in front of you is producing numbers worth writing down.
-<span style="color:#f0c060">Amber</span> means the readings are usable but qualified
-&mdash; the qualification changes how to read them, it is not a nag to clear.
-<span style="color:#ff8a8a">Red</span> means do not record anything. All green is not
-a claim that the measurement is accurate; it is a claim that none of the failures
-this code can see are happening.</p>
-<script>
-const im = document.getElementById('im'), read = document.getElementById('read');
-for (const k of ['gain','eps','radius','agc']) {
-  const el = document.getElementById(k);
-  el.oninput = () => fetch('/set?'+k+'='+el.value);
-}
-for (const k of ['emis','refl']) {
-  document.getElementById(k).onchange = () => fetch('/set?emissivity='
-    + document.getElementById('emis').value + '&reflected='
-    + document.getElementById('refl').value);
-}
-function buttons(boxId, names, current, param) {
-  const box = document.getElementById(boxId);
-  for (const p of names) {
-    const b = document.createElement('button');
-    b.textContent = p; b.className = (p === current) ? 'on' : '';
-    b.onclick = async () => { await fetch('/set?'+param+'='+p);
-      for (const c of box.children) c.className = (c.textContent === p) ? 'on' : ''; };
-    box.appendChild(b);
-  }
-}
-buttons('pal', ['ironbow','white','black','gray'], 'ironbow', 'palette');
-buttons('view', ['fused','visible','blink','mix','edges'], 'fused', 'view');
-document.getElementById('mix').oninput = (e) => fetch('/set?mix='+e.target.value);
-document.getElementById('outline').onchange =
-  (e) => fetch('/set?outline='+(e.target.checked ? 1 : 0));
-document.getElementById('boxes').onchange =
-  (e) => fetch('/set?boxes='+(e.target.checked ? 1 : 0));
+def worst_level(checks):
+    return ("fail" if any(c["level"] == "fail" for c in checks) else
+            "warn" if any(c["level"] == "warn" for c in checks) else "ok")
 
+
+def ui_payload(pipe, state, now):
+    """Everything the page redraws each second, in one response.
+
+    The page used to poll five endpoints a second - /health, /timing, /stats,
+    /detections, /stat. That is five handler threads a second competing with the
+    MJPEG writer on a ThreadingHTTPServer for numbers that all come out of the
+    same state dict, and it read them at five *different* instants: a health row
+    taken before an FFC could sit on screen beside a temperature band taken after
+    it, with nothing on the page to say so. One payload is one moment.
+
+    The five endpoints stay. They are the debugging surface - `curl /timing` is
+    worth having - and nothing else in the tree consumes them, so there is no
+    compatibility argument either way; this is about what the browser does 86400
+    times an hour.
+
+    `cfg` is the part that is new rather than merely moved. The old page hardcoded
+    its slider positions in the HTML, so `--gain 220` drew a slider sitting at 200
+    over a pipeline running at 220, and the first touch of that slider silently
+    moved the pipeline to wherever the handle happened to be.
+    """
+    checks = health(pipe, state, now)
+    stats = pipe.frame_stats()
+    lo, hi = state.get("range", (0, 0))
+    rp = state.get("radar_proj")
+    c = pipe.f.cfg
+    return {
+        "worst": worst_level(checks),
+        "checks": checks,
+        "timing": timing(state, now),
+        "stats": dict(stats, valid=True) if stats else {"valid": False},
+        "detections": {
+            "warped": pipe.warped,
+            "age_s": round(now - state["detect_t"], 2) if state.get("detect_t") else None,
+            "ms": state.get("detect_ms"),
+            "list": state.get("detections") or [],
+        },
+        # Quantities that drift rather than jump, and which the page draws as a
+        # 60s trace: a heap reading is not interesting, a heap reading that is
+        # 0.6MB lower than a minute ago is the whole early-warning system.
+        "heap_free": state.get("heap_free"),
+        "restarts": state.get("restarts", 0),
+        "coverage": round(float(pipe.cover_grid().mean()), 4) if pipe.f.have_frame else None,
+        "recording": os.path.basename(state["recording"]) if state.get("recording") else None,
+        # Cached inside Soc for 0.4s, so health() above and this share one sample
+        # rather than each taking a delta over a near-zero interval.
+        "soc": state["soc"].read() if state.get("soc") else None,
+        "cfg": {
+            "gain": c.detail_gain, "eps": c.gf_eps, "radius": c.gf_radius,
+            "agc": c.agc_permille, "palette": pipe.palette_name, "view": pipe.view,
+            "mix": pipe.mix, "outline": pipe.outline, "boxes": pipe.show_detections,
+            "emissivity": round(pipe.eps, 3), "reflected": pipe.refl,
+            "warped": pipe.warped, "range": [lo, hi],
+            # None, not a zeroed dict: "no radar attached" and "radar attached
+            # and pointing straight ahead" are different states, and the page
+            # hides the whole card on the first rather than offering knobs that
+            # move nothing.
+            "radar": None if rp is None else {
+                "on": pipe.show_radar, "whisker": pipe.radar_whisker,
+                "yaw": round(rp.yaw, 2), "pitch": round(rp.pitch, 2),
+                "roll": round(rp.roll, 2),
+                "tx": round(rp.t[0] * 1000), "ty": round(rp.t[1] * 1000),
+                "tz": round(rp.t[2] * 1000)},
+        },
+    }
+
+
+PAGE = b"""<!doctype html><meta charset=utf-8><title>thermal fusion - live</title>
+<style>
+/* Two colour systems, deliberately disjoint. THERMAL/VISIBLE/RADAR name the
+   sensors and appear on data; OK/WARN/FAIL name trust and appear on status. The
+   old page used amber for both, so "this line is about the thermal camera" and
+   "this line is a warning" were the same colour. */
+:root{
+  --bg:#0c0e10;--panel:#141719;--panel2:#191d20;--line:#242a2f;
+  --txt:#d8dee4;--dim:#79838d;--dimmer:#525b64;
+  --thermal:#f0a860;--visible:#6cc8ff;--radar:#b98cff;--host:#8fa2b5;
+  --ok:#7fd39b;--ok-bd:#2c5a3e;
+  --warn:#f0c060;--warn-bd:#6d5220;--warn-bg:#211c11;
+  --fail:#ff7d7d;--fail-bd:#7a2f2f;--fail-bg:#241414;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+/* tabular-nums so a figure that changes every second does not shift the ones
+   beside it - a number that jitters horizontally is a number nobody reads */
+body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.45 system-ui,-apple-system,
+Segoe UI,sans-serif;font-variant-numeric:tabular-nums;display:flex;flex-direction:column}
+b{font-weight:600}
+.mono{font-family:var(--mono)}
+
+/* --- trust bar: the only line you need before writing a number down */
+#trust{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:9px 16px;
+border-bottom:1px solid var(--line);background:var(--panel)}
+#trust.ok{box-shadow:inset 3px 0 0 var(--ok)}
+#trust.warn{box-shadow:inset 3px 0 0 var(--warn);
+background:linear-gradient(90deg,#1d1a12,var(--panel) 320px)}
+#trust.fail{box-shadow:inset 3px 0 0 var(--fail);
+background:linear-gradient(90deg,#231414,var(--panel) 320px)}
+#verdict{display:flex;align-items:center;gap:9px;font-weight:650;letter-spacing:.06em;font-size:12px}
+#verdict .dot{width:9px;height:9px;border-radius:50%}
+#verdict small{font-weight:400;letter-spacing:0;color:var(--dim);font-size:11px}
+.ok #verdict{color:var(--ok)}.ok #verdict .dot{background:var(--ok);box-shadow:0 0 8px #7fd39b60}
+.warn #verdict{color:var(--warn)}.warn #verdict .dot{background:var(--warn);box-shadow:0 0 8px #f0c06060}
+.fail #verdict{color:var(--fail)}.fail #verdict .dot{background:var(--fail);
+box-shadow:0 0 10px #ff7d7d70;animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
+#qual{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;font-family:var(--mono)}
+#qual span{color:var(--dim)}
+#qual span i{font-style:normal;color:var(--txt)}
+#qual span.bad i{color:var(--warn)}
+#brand{margin-left:auto;color:var(--dimmer);font-size:11px;letter-spacing:.08em}
+
+/* --- main split */
+#main{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;padding:14px;
+align-items:start}
+body.field #main{grid-template-columns:minmax(0,1fr)}
+body.field aside,body.field #notes{display:none}
+#stage{display:flex;flex-direction:column;gap:12px;min-width:0}
+/* Sized so the health panel stays above the fold on a laptop: the picture is
+   what you look at, but the panel is what says whether to believe it, and a
+   viewer that hides the panel below a scroll is back to being a webcam. 88vh
+   is 55vh of height at this 1.6 aspect. */
+#wrap{position:relative;line-height:0;align-self:start;border:1px solid var(--line);
+border-radius:8px;overflow:hidden;background:#000;width:min(100%,1024px,88vh)}
+img{display:block;width:100%;height:auto}
+#ovl{position:absolute;inset:0;pointer-events:none}
+#read{position:absolute;padding:4px 8px;background:#000000d9;border:1px solid #5a636b;
+border-radius:5px;font:12px/1.3 var(--mono);pointer-events:none;white-space:nowrap;
+display:none;transform:translate(14px,14px)}
+#read.warn{border-color:var(--warn-bd);color:var(--warn)}
+
+/* the delta between two pinned points is what a finding rests on, so it gets a
+   card rather than being something you compute in your head off two hovers */
+#probes{position:absolute;left:10px;bottom:10px;display:flex;background:#000000cc;
+border:1px solid var(--line);border-radius:6px;font-family:var(--mono);overflow:hidden}
+#probes .p{padding:6px 11px;border-right:1px solid var(--line);line-height:1.25}
+#probes em{font-style:normal;display:block;font-size:10px;color:var(--dim);letter-spacing:.08em}
+#probes b{font-size:15px;font-weight:600}
+#probes .d{padding:6px 13px;background:#ffffff08}
+#probes .d b{font-size:17px;color:var(--thermal)}
+#probes .hint{padding:6px 11px;color:var(--dim);font-size:11px;align-self:center}
+#probes .flag{color:var(--warn);font-size:10px}
+
+/* --- sidebar */
+aside{display:flex;flex-direction:column;gap:10px;overflow:auto;min-height:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.card>h4{margin:0;padding:8px 12px;font-size:10.5px;font-weight:650;letter-spacing:.11em;
+color:var(--dim);text-transform:uppercase;border-bottom:1px solid var(--line);
+display:flex;align-items:center;gap:8px}
+.card>h4 .k{margin-left:auto;color:var(--dimmer);font-family:var(--mono);font-size:10px;
+border:1px solid var(--line);border-radius:3px;padding:0 4px;text-transform:none;letter-spacing:0}
+.card .body{padding:10px 12px;display:flex;flex-direction:column;gap:9px}
+.seg{display:flex;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+padding:2px;gap:2px}
+.seg button{flex:1;background:none;border:0;color:var(--dim);font:inherit;font-size:11.5px;
+padding:5px 2px;border-radius:4px;cursor:pointer;transition:background .12s,color .12s}
+.seg button:hover{color:var(--txt);background:#ffffff0a}
+.seg button.on{background:#2b3238;color:var(--txt);box-shadow:inset 0 0 0 1px #3a444c}
+.seg.pal button.on{color:#0c0e10;font-weight:600}
+.seg.pal button[data-v=ironbow].on{background:linear-gradient(90deg,#5a1a70,#e05020,#ffd23c)}
+.seg.pal button[data-v=white].on{background:linear-gradient(90deg,#333,#fff)}
+.seg.pal button[data-v=black].on{background:linear-gradient(90deg,#fff,#333);color:#fff}
+.seg.pal button[data-v=gray].on{background:linear-gradient(90deg,#222,#bbb)}
+.sl{display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:center}
+.sl label{font-size:11.5px;color:var(--dim)}
+.sl output{font-family:var(--mono);font-size:11.5px}
+.sl input[type=range]{grid-column:1/-1;width:100%;height:16px;-webkit-appearance:none;
+background:none;margin:0}
+input[type=range]::-webkit-slider-runnable-track{height:3px;background:#2c3338;border-radius:2px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;
+margin-top:-4.5px;border-radius:50%;background:var(--txt);border:0;cursor:pointer}
+input[type=range]:hover::-webkit-slider-thumb{background:var(--visible)}
+input[type=range]::-moz-range-track{height:3px;background:#2c3338;border-radius:2px}
+input[type=range]::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;
+background:var(--txt)}
+.chk{display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer}
+.chk input{accent-color:#4d7f9e;width:14px;height:14px}
+.chk .sub{color:var(--dim);font-size:11px;margin-left:auto;font-family:var(--mono)}
+.num{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--dim)}
+.num input{width:66px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;
+color:var(--txt);font:12px var(--mono);padding:3px 6px}
+.num input:focus{outline:none;border-color:#3f5a6b}
+.hintline{font-size:11px;color:var(--dimmer);line-height:1.45}
+.nudge{display:grid;grid-template-columns:auto 1fr auto auto;gap:4px 7px;align-items:center;
+font-size:11.5px}
+.nudge label{color:var(--dim);font-family:var(--mono)}
+.nudge output{font-family:var(--mono);text-align:right}
+.nudge button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+width:22px;height:20px;border-radius:4px;cursor:pointer;font:12px var(--mono);line-height:1}
+.nudge button:hover{color:var(--txt);border-color:#3c454c}
+
+/* --- clock strip */
+#clock,#socstrip{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+padding:10px 14px;display:flex;align-items:flex-start;gap:14px 20px;flex-wrap:wrap}
+.tag{font:10px/1.3 var(--mono);letter-spacing:.1em;color:var(--dimmer);border:1px solid var(--line);
+border-radius:4px;padding:3px 6px;align-self:center;white-space:pre}
+.kv{display:flex;flex-direction:column;gap:1px;font-family:var(--mono)}
+.kv em{font-style:normal;font-size:10px;letter-spacing:.07em;color:var(--dim);text-transform:uppercase}
+.kv b{font-size:14px;font-weight:600}
+.kv .u{font-size:11px;color:var(--dim);font-weight:400}
+.kv.th b{color:var(--thermal)}.kv.vis b{color:var(--visible)}.kv.host b{color:var(--host)}
+.kv.bad b{color:var(--warn)}
+.spark{display:block;margin-top:1px}
+
+/* --- health, four groups */
+#health{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px;
+padding:0 14px 14px;align-items:start}
+.grp{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.grp>summary{list-style:none;cursor:pointer;padding:9px 12px;display:flex;align-items:center;
+gap:9px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);font-weight:650}
+.grp>summary::-webkit-details-marker{display:none}
+.grp>summary .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+.grp>summary .cnt{margin-left:auto;font-family:var(--mono);font-size:11px;letter-spacing:0;
+text-transform:none;color:var(--dimmer)}
+.grp>summary .chev{color:var(--dimmer);transition:transform .15s}
+.grp[open]>summary .chev{transform:rotate(90deg)}
+.grp.ok>summary .dot{background:var(--ok)}
+.grp.warn{border-color:var(--warn-bd)}
+.grp.warn>summary{color:var(--warn)}.grp.warn>summary .dot{background:var(--warn)}
+.grp.fail{border-color:var(--fail-bd);background:var(--fail-bg)}
+.grp.fail>summary{color:var(--fail)}.grp.fail>summary .dot{background:var(--fail)}
+.checks{padding:2px 10px 10px;display:flex;flex-direction:column}
+.chk-row{display:grid;grid-template-columns:8px 94px 1fr;gap:8px;align-items:baseline;
+padding:5px 2px;border-top:1px solid #ffffff08;font-size:11.5px}
+.chk-row i{width:6px;height:6px;border-radius:50%;align-self:center;font-style:normal}
+.chk-row .n{font-weight:600;font-size:11px}
+.chk-row .t{color:var(--dim);font-family:var(--mono);font-size:11px;line-height:1.4}
+.chk-row.ok i{background:var(--ok-bd)}.chk-row.ok .n{color:#9db4a6}
+.chk-row.warn i{background:var(--warn)}.chk-row.warn .n{color:var(--warn)}.chk-row.warn .t{color:#cbb184}
+.chk-row.fail i{background:var(--fail)}.chk-row.fail .n{color:var(--fail)}.chk-row.fail .t{color:#e5a8a8}
+
+/* --- detections */
+.detrow{display:flex;gap:8px;flex-wrap:wrap;min-height:0}
+.det{display:flex;align-items:center;gap:9px;border:1px solid var(--line);background:var(--panel);
+border-radius:6px;padding:4px 10px;font-size:11.5px}
+.det.unreg{border-color:var(--warn-bd);background:var(--warn-bg)}
+.det .cls{font-weight:650}
+.det .m{font-family:var(--mono);color:var(--dim)}
+.det .c{font-family:var(--mono);color:var(--thermal);font-weight:600}
+.det .flag{font-family:var(--mono);font-size:10px;color:var(--warn);letter-spacing:.05em}
+
+/* --- notes */
+#notes{padding:0 14px 20px;max-width:78em;color:#8e8579;font-size:12px;line-height:1.6}
+#notes details{border-top:1px solid var(--line);padding:9px 0}
+#notes summary{cursor:pointer;color:var(--dim);font-size:11.5px}
+#notes summary:hover{color:var(--txt)}
+#notes p{margin:8px 0 0}
+#notes b{color:#b6ab99}
+kbd{font:11px var(--mono);border:1px solid var(--line);border-bottom-width:2px;border-radius:3px;
+padding:1px 5px;color:var(--dim);background:var(--panel2)}
+@media(max-width:1100px){#health{grid-template-columns:repeat(2,1fr)}
+#main{grid-template-columns:minmax(0,1fr)}}
+</style>
+
+<div id=trust>
+  <div id=verdict><span class=dot></span><span id=vtext>connecting</span>
+    <small id=vsub></small></div>
+  <div id=qual></div>
+  <div id=brand>THERMAL + VISIBLE FUSION &middot; LIVE</div>
+</div>
+
+<div id=main>
+  <div id=stage>
+    <div id=wrap>
+      <img id=im src="/stream">
+      <svg id=ovl viewBox="0 0 640 400" preserveAspectRatio=none></svg>
+      <div id=read></div>
+      <div id=probes></div>
+    </div>
+    <div class=detrow id=dets></div>
+    <div id=clock>
+      <div class=tag>BOARD
+&amp; LINK</div>
+      <svg id=clocksvg width=420 height=46></svg>
+      <div class="kv th"><em>thermal</em><b id=k_th>&ndash;</b>
+        <svg class=spark id=sp_th width=90 height=16></svg></div>
+      <div class="kv vis" id=kv_sk><em>visible skew</em><b id=k_sk>&ndash;</b>
+        <svg class=spark id=sp_sk width=90 height=16></svg></div>
+      <div class=kv><em>link</em><b id=k_fps>&ndash;</b>
+        <svg class=spark id=sp_fps width=90 height=16></svg></div>
+      <div class=kv><em>board heap</em><b id=k_heap>&ndash;</b>
+        <svg class=spark id=sp_heap width=90 height=16></svg></div>
+      <div class=kv><em>coverage</em><b id=k_cov>&ndash;</b>
+        <svg class=spark id=sp_cov width=90 height=16></svg></div>
+      <div class=kv><em>last ffc</em><b id=k_ffc>&ndash;</b></div>
+      <div class=kv id=kv_load><em>sensor load</em><b id=k_load>&ndash;</b></div>
+      <div class=kv><em>frame band</em><b id=k_band>&ndash;</b></div>
+    </div>
+
+    <!-- The machine the viewer runs on. A separate strip rather than more items
+         on the clock: those are the board's numbers and these are this host's,
+         and one row of figures that mixes the two is a row nobody can read. -->
+    <div id=socstrip style=display:none>
+      <div class=tag>HOST
+SOC</div>
+      <div class="kv host" id=kv_cpu><em>cpu</em><b id=k_cpu>&ndash;</b>
+        <svg class=spark id=sp_cpu width=90 height=16></svg></div>
+      <div class="kv host"><em>gpu</em><b id=k_gpu>&ndash;</b>
+        <svg class=spark id=sp_gpu width=90 height=16></svg></div>
+      <div class="kv host" id=kv_mem><em>memory</em><b id=k_mem>&ndash;</b>
+        <svg class=spark id=sp_mem width=90 height=16></svg></div>
+      <div class="kv host" id=kv_tj><em>soc temp</em><b id=k_tj>&ndash;</b>
+        <svg class=spark id=sp_tj width=90 height=16></svg></div>
+      <div class="kv host"><em>power</em><b id=k_pw>&ndash;</b>
+        <svg class=spark id=sp_pw width=90 height=16></svg></div>
+      <div class="kv host"><em>cpu clock</em><b id=k_clk>&ndash;</b></div>
+    </div>
+  </div>
+
+  <aside>
+    <div class=card>
+      <h4>view <span class=k>1-5</span></h4>
+      <div class=body>
+        <div class=seg id=view></div>
+        <div class=sl><label>mix &mdash; fused vs visible</label><output id=o_mix>50</output>
+          <input type=range id=mix min=0 max=100 value=50></div>
+        <label class=chk><input type=checkbox id=outline> thermal footprint
+          <span class=sub id=s_cov></span></label>
+        <label class=chk><input type=checkbox id=boxes checked> detection boxes
+          <span class=sub id=s_det></span></label>
+      </div>
+    </div>
+
+    <div class=card>
+      <h4>image</h4>
+      <div class=body>
+        <div class=sl><label>detail gain</label><output id=o_gain>200</output>
+          <input type=range id=gain min=0 max=512 value=200></div>
+        <div class=sl><label>guided-filter eps</label><output id=o_eps>200</output>
+          <input type=range id=eps min=1 max=1000 value=200></div>
+        <div class=sl><label>guided-filter radius</label><output id=o_radius>4</output>
+          <input type=range id=radius min=1 max=8 value=4></div>
+        <div class=sl><label>scene agc &permil; <span id=agcwarn></span></label>
+          <output id=o_agc>0</output>
+          <input type=range id=agc min=0 max=100 value=0></div>
+      </div>
+    </div>
+
+    <div class=card>
+      <h4>radiometry</h4>
+      <div class=body>
+        <div class="seg pal" id=pal></div>
+        <div class=num><span>emissivity &epsilon;</span>
+          <input type=number id=emis value=1 step=0.01 min=0.05 max=1></div>
+        <div class=num><span>reflected &deg;C</span>
+          <input type=number id=refl value=20 step=1></div>
+        <div class=hintline>bright metal is &asymp;0.10 and reads tens of degrees cold
+          at &epsilon;=1</div>
+      </div>
+    </div>
+
+    <div class=card id=radarcard style=display:none>
+      <h4>radar <span class=k>iwr1843</span></h4>
+      <div class=body>
+        <label class=chk><input type=checkbox id=radar checked> overlay
+          <span class=sub id=s_radar></span></label>
+        <label class=chk><input type=checkbox id=whisker checked> elevation whisker
+          <span class=sub>2-element</span></label>
+        <div class=nudge id=nudge></div>
+        <div class=hintline>the whisker is the honest width of the elevation
+          uncertainty &mdash; the bare dot flatters a two-element aperture</div>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<div id=health></div>
+
+<div id=notes>
+  <details open><summary>How to read this page</summary>
+  <p><b>The trust bar</b> is the only thing to check before writing a number down.
+  <span style="color:#f0c060">Amber</span> means the readings are usable but qualified
+  &mdash; the qualification changes how to read them, it is not a nag to clear.
+  <span style="color:#ff7d7d">Red</span> means do not record anything. All green is not a
+  claim that the measurement is accurate; it is a claim that none of the failures this code
+  can see are happening.</p></details>
+
+  <details><summary>Hover readings, pinned probes, and the delta</summary>
+  <p>Hover for a reading. The number comes from the thermal frame behind that pixel &mdash;
+  before the AGC and before the guided filter, which borrows the visible camera's edges to
+  sharpen the picture and must not be quoted off. Absolute accuracy is &plusmn;5&deg;C at
+  best. The board runs the Lepton in <b>high gain</b> since 2026-08-09; before that it was
+  silently in low gain, whose specified accuracy is the greater of &plusmn;10&deg;C or 10%,
+  so any reading quoted off a frame recorded earlier than that carries the looser number.
+  The <b>&Delta;</b> between two pinned points of the same material in one frame is far
+  better than either, and is what a finding should rest on &mdash; provided neither point is
+  clipped, neither sits on a rebuilt row, and no shutter event separates them. Click the
+  image to pin a probe; readings keep working in every view.</p></details>
+
+  <details><summary>Judging registration</summary>
+  <p>The fused view cannot tell you whether the warp is right: the guided filter puts crisp
+  edges in the right places even when the thermal layer is offset, so a misregistered frame
+  still looks sharp &mdash; it just colours the wrong side of the edge. Use <b>blink</b> (the
+  eye catches motion far better than offset), <b>mix</b> to judge how far off it is, or
+  <b>edges</b>, which draws the thermal layer's own edges over the plain visible image: where
+  the warp is right they land on the object's outline. <b>thermal footprint</b> outlines where
+  the thermal camera stops seeing at all &mdash; outside it the grey is not a cold reading, it
+  is no reading.</p></details>
+
+  <details><summary>The clock</summary>
+  <p>One thermal period drawn to scale, with the moment the visible frame was actually grabbed
+  marked inside it. Both timestamps come off the board's own clock; arrival times on this host
+  have been through a 4KB-chunked CDC write, a 500ms stall retry and the host's scheduler, and
+  measure the link rather than the sensors. The grey band at the right is the spread of the
+  thermal interval, which on this part is a three-valued delta function (113/114/115 ms) &mdash;
+  so a wide band there is a real anomaly, not ordinary jitter.</p></details>
+
+  <details><summary>Keys</summary>
+  <p><kbd>1</kbd>-<kbd>5</kbd> view &middot; <kbd>f</kbd> field mode (hide everything but the
+  stream and the health) &middot; <kbd>o</kbd> footprint &middot; <kbd>b</kbd> boxes &middot;
+  <kbd>x</kbd> clear probes</p></details>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+const set = (q) => fetch('/set?' + q);
+
+// ------------------------------------------------------------------ controls
+// Wired once, then initialised from /ui's cfg rather than from the values in the
+// HTML: the page is not the source of truth for what the pipeline is doing, and
+// --gain 220 used to draw a slider parked at 200 over a pipeline running at 220.
+const SLIDERS = ['gain','eps','radius','agc','mix'];
+for (const k of SLIDERS) {
+  const el = $(k);
+  el.oninput = () => { $('o_' + k).textContent = el.value; set(k + '=' + el.value); };
+}
+for (const k of ['emis','refl'])
+  $(k).onchange = () => set('emissivity=' + $('emis').value + '&reflected=' + $('refl').value);
+for (const [id, param] of [['outline','outline'],['boxes','boxes'],
+                           ['radar','radar'],['whisker','whisker']])
+  $(id).onchange = (e) => set(param + '=' + (e.target.checked ? 1 : 0));
+
+function seg(boxId, names, param, onpick) {
+  const box = $(boxId);
+  box.innerHTML = names.map(n => '<button data-v="' + n + '">' + n + '</button>').join('');
+  box.onclick = (e) => {
+    if (e.target.tagName !== 'BUTTON') return;
+    pick(boxId, e.target.dataset.v);
+    set(param + '=' + e.target.dataset.v);
+    if (onpick) onpick(e.target.dataset.v);
+  };
+}
+function pick(boxId, v) {
+  for (const b of $(boxId).children) b.className = (b.dataset.v === v) ? 'on' : '';
+}
+const VIEWS = ['fused','visible','blink','mix','edges'];
+seg('view', VIEWS, 'view');
+seg('pal', ['ironbow','white','black','gray'], 'palette');
+
+// The radar extrinsics. Nudges rather than free text: these are being adjusted
+// against a live image, and the question being asked is always "is it better or
+// worse than a moment ago", never "what if it were 7.3 degrees".
+const NUDGE = [['yaw','&deg;',0.2],['pitch','&deg;',0.2],['roll','&deg;',0.2],
+               ['tx',' mm',5],['ty',' mm',5],['tz',' mm',5]];
+const rstate = {};
+$('nudge').innerHTML = NUDGE.map(([k,u]) =>
+  '<label>' + k + '</label><output id="o_' + k + '">-</output>'
+  + '<button data-k="' + k + '" data-d="-1">-</button>'
+  + '<button data-k="' + k + '" data-d="1">+</button>').join('');
+$('nudge').onclick = (e) => {
+  const k = e.target.dataset && e.target.dataset.k;
+  if (!k) return;
+  const step = NUDGE.find(n => n[0] === k)[2] * Number(e.target.dataset.d);
+  rstate[k] = Math.round((rstate[k] + step) * 100) / 100;
+  $('o_' + k).textContent = rstate[k] + (k[0] === 't' ? ' mm' : '\\u00b0');
+  set(k + '=' + rstate[k]);
+};
+
+// ------------------------------------------------------------------ readings
 // The image is scaled to fit, so client coords have to be mapped back to the
 // 640x400 the pipeline actually indexes - otherwise the reading is off by the
 // zoom factor and silently wrong rather than obviously broken.
+const im = $('im'), read = $('read'), ovl = $('ovl');
+function pixel(e) {
+  const r = im.getBoundingClientRect();
+  if (!im.naturalWidth) return [0, 0, 0, 0];   // no frame decoded yet
+  return [Math.round((e.clientX - r.left) * im.naturalWidth / r.width),
+          Math.round((e.clientY - r.top) * im.naturalHeight / r.height),
+          e.clientX - r.left, e.clientY - r.top];
+}
 let pending = false, last = 0;
 im.onmousemove = async (e) => {
-  const r = im.getBoundingClientRect();
-  const x = Math.round((e.clientX - r.left) * im.naturalWidth / r.width);
-  const y = Math.round((e.clientY - r.top) * im.naturalHeight / r.height);
-  read.style.left = (e.clientX - r.left + 14) + 'px';
-  read.style.top = (e.clientY - r.top + 14) + 'px';
-  if (pending || performance.now() - last < 80) return;   // ~12 Hz is plenty
+  const [x, y, lx, ly] = pixel(e);
+  read.style.left = lx + 'px'; read.style.top = ly + 'px';
+  if (pending || performance.now() - last < 80) return;      // ~12 Hz is plenty
   pending = true; last = performance.now();
   try {
-    const d = await (await fetch('/temp?x='+x+'&y='+y)).json();
+    const d = await (await fetch('/temp?x=' + x + '&y=' + y)).json();
     read.style.display = 'block';
     read.className = d.repaired ? 'warn' : '';
     read.textContent = d.valid
@@ -1869,88 +2262,340 @@ im.onmousemove = async (e) => {
 };
 im.onmouseleave = () => { read.style.display = 'none'; };
 
-setInterval(async () => {
-  const h = await (await fetch('/health')).json();
-  document.getElementById('health').innerHTML = h.checks.map(c =>
-    '<span class="pill '+c.level+'"><span class=n>'+c.name+'</span>'
-    + '<span class=t>'+c.text.replace(/&/g,'&amp;').replace(/</g,'&lt;')+'</span></span>'
-  ).join('');
+// Two pins at a time, A then B then back to A. Two is not a limitation: the
+// delta is a statement about a PAIR of points on the same material, and a list
+// of six probes invites averaging things that are not comparable.
+let probes = [];
+im.onclick = (e) => {
+  const [x, y] = pixel(e);
+  if (!im.naturalWidth) return;
+  probes = probes.length >= 2 ? [{x, y}] : probes.concat([{x, y}]);
+  refreshProbes();
+};
+addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'x') { probes = []; refreshProbes(); }
+  if (e.key === 'f') document.body.classList.toggle('field');
+  if (e.key === 'o') { $('outline').click(); }
+  if (e.key === 'b') { $('boxes').click(); }
+  const i = Number(e.key) - 1;
+  if (i >= 0 && i < VIEWS.length) { pick('view', VIEWS[i]); set('view=' + VIEWS[i]); }
+});
 
-  document.getElementById('s').textContent = await (await fetch('/stat')).text();
+async function refreshProbes() {
+  for (const p of probes) {
+    const d = await (await fetch('/temp?x=' + p.x + '&y=' + p.y)).json();
+    p.c = d.valid ? d.c : null;
+    p.repaired = !!d.repaired;
+  }
+  const NAME = ['A','B'], COL = ['#ffffff','#8fd0ff'];
+  ovl.innerHTML = probes.map((p, i) =>
+    '<g stroke="' + COL[i] + '" fill="none" stroke-width="1.4">'
+    + '<circle cx="' + p.x + '" cy="' + p.y + '" r="9"/>'
+    + '<line x1="' + (p.x - 13) + '" y1="' + p.y + '" x2="' + (p.x - 4) + '" y2="' + p.y + '"/>'
+    + '<line x1="' + (p.x + 4) + '" y1="' + p.y + '" x2="' + (p.x + 13) + '" y2="' + p.y + '"/>'
+    + '<line x1="' + p.x + '" y1="' + (p.y - 13) + '" x2="' + p.x + '" y2="' + (p.y - 4) + '"/>'
+    + '<line x1="' + p.x + '" y1="' + (p.y + 4) + '" x2="' + p.x + '" y2="' + (p.y + 13) + '"/>'
+    + '<text x="' + (p.x + 13) + '" y="' + (p.y + 4) + '" fill="' + COL[i] + '" stroke="none"'
+    + ' font-family="ui-monospace,monospace" font-size="12">' + NAME[i]
+    + (p.c === null ? '' : ' ' + p.c.toFixed(1)) + '</text></g>').join('');
 
-  // The clock. One thermal period drawn to scale, with the moment the visible
-  // frame was actually grabbed marked inside it - which is the question the two
-  // sensors raise and the fused picture cannot answer. Both timestamps come off
-  // the board's own clock; arrival times here have been through USB and measure
-  // the link, not the sensors.
-  const t = await (await fetch('/timing')).json();
-  const c = document.getElementById('clock');
-  if (!t.thermal_ms) { c.innerHTML = '<span>waiting for board timing</span>'; }
-  else {
-    const per = t.thermal_ms.median, W = 380, X = 8;
-    const frac = t.skew_frac === null ? 0 : Math.min(1, t.skew_frac);
-    const vx = X + W * frac;
-    // Jitter drawn as a band, not a number: the Lepton's interval is a
-    // three-valued delta function (113/114/115ms), so a wide band here is a real
-    // anomaly rather than ordinary spread.
-    const jl = X + W * Math.max(0, (t.thermal_ms.min - per) / per + 1) - W;
-    const jw = W * (t.thermal_ms.max - t.thermal_ms.min) / per;
-    const bad = t.skew_frac !== null && t.skew_frac > 0.25;
-    c.innerHTML =
-      '<svg width="'+(W+2*X)+'" height="40">'
-      + '<rect x="'+X+'" y="14" width="'+W+'" height="10" fill="#1e1e1e" stroke="#3a3a3a"/>'
-      + '<rect x="'+X+'" y="14" width="'+(vx-X)+'" height="10" fill="'
-        + (bad?'#5a4418':'#1d3346')+'"/>'
-      + '<rect x="'+(X+W-jw)+'" y="14" width="'+jw+'" height="10" fill="#2a2a2a"/>'
-      + '<line x1="'+X+'" y1="8" x2="'+X+'" y2="30" stroke="#f0a860" stroke-width="2"/>'
-      + '<line x1="'+vx+'" y1="8" x2="'+vx+'" y2="30" stroke="#6cc8ff" stroke-width="2"/>'
-      + '<line x1="'+(X+W)+'" y1="8" x2="'+(X+W)+'" y2="30" stroke="#f0a860" stroke-width="2"'
-        + ' stroke-dasharray="2 2"/>'
-      + '<text x="'+(X+2)+'" y="38" fill="#f0a860" font-size="10">thermal</text>'
-      + '<text x="'+(vx+3)+'" y="12" fill="#6cc8ff" font-size="10">visible</text>'
-      + '<text x="'+(X+W)+'" y="38" fill="#777" font-size="10" text-anchor="end">'
-        + per+' ms</text></svg>'
-      + '<span class=th>thermal <b>'+per+' ms</b> = '+t.thermal_fps+' fps'
-        + (t.thermal_ms.min!==t.thermal_ms.max
-            ? ' <span style=color:#666>('+t.thermal_ms.min+'-'+t.thermal_ms.max+')</span>' : '')
-        + '</span>'
-      + '<span class="vis'+(bad?' warn':'')+'">visible <b>+'
-        + (t.skew_ms ? t.skew_ms.median : '?')+' ms</b> ('
-        + (t.skew_frac===null?'?':Math.round(100*t.skew_frac))+'% of a frame)</span>'
-      + '<span>link <b>'+t.host_fps+' fps</b></span>'
-      + '<span>'+(t.ffc_ago_s===null ? 'no FFC seen yet'
-          : 'FFC <b>'+t.ffc_ago_s+'s</b> ago ('+t.ffcs+')')+'</span>'
-      // Load reaching the sensor. Always on screen, including when it is zero:
-      // this is the number that decides whether more host work is affordable,
-      // and it is worth watching go up rather than discovering afterwards.
-      + '<span'+(t.starved||t.stalls ? ' class=warn' : '')+'>sensor '
-        + (t.starved ? '<b>STARVED '+t.starved+'x</b> (worst '+t.last_starve_ms+' ms)'
-           : t.stalls ? '<b>'+t.stalls+'</b> write stall(s)'
-           : 'unstarved')+'</span>';
+  if (!probes.length) {
+    $('probes').innerHTML = '<div class=hint>click the image to pin a probe</div>';
+    return;
+  }
+  let html = probes.map((p, i) =>
+    '<div class=p><em>PROBE ' + NAME[i] + '</em><b>'
+    + (p.c === null ? '--' : p.c.toFixed(1)) + '</b>'
+    + (p.repaired ? ' <span class=flag>rebuilt</span>' : '') + '</div>').join('');
+  if (probes.length === 2 && probes[0].c !== null && probes[1].c !== null) {
+    const dc = probes[0].c - probes[1].c;
+    // The delta is only the trustworthy number while both ends are trustworthy.
+    // A rebuilt row is a linear ramp spliced into real data, so a probe sitting
+    // on one is not a measurement of the scene - say so beside the delta rather
+    // than three paragraphs down the page.
+    const dirty = probes.some(p => p.repaired);
+    html += '<div class=d><em>' + '\\u0394' + ' A-B</em><b>' + dc.toFixed(1)
+      + ' \\u00b0C</b>' + (dirty ? '<span class=flag>rebuilt row</span>' : '') + '</div>';
+  }
+  $('probes').innerHTML = html + '<div class=hint><kbd>x</kbd> clears</div>';
+}
+refreshProbes();
+
+// ------------------------------------------------------------------ history
+// fps, skew, heap, coverage all drift rather than jump, and a single reading
+// hides drift entirely. The heap one is the point of the exercise: 12.4MB is not
+// interesting, 12.4MB where a minute ago it was 13.0MB is the early warning.
+const hist = {th: [], sk: [], fps: [], heap: [], cov: [],
+              cpu: [], gpu: [], mem: [], tj: [], pw: []};
+function push(k, v) {
+  if (v === null || v === undefined || !isFinite(v)) return;
+  hist[k].push(v);
+  if (hist[k].length > 60) hist[k].shift();
+}
+function spark(id, key, colour, lo, hi) {
+  const v = hist[key], W = 90, H = 16, el = $(id);
+  if (v.length < 2) { el.innerHTML = ''; return; }
+  const clamp = (t) => Math.max(0, Math.min(1, (t - lo) / (hi - lo)));
+  const pts = v.map((t, i) => (i / (v.length - 1) * (W - 2) + 1).toFixed(1) + ','
+                              + (H - 1 - clamp(t) * (H - 2)).toFixed(1));
+  el.innerHTML = '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + colour
+    + '" stroke-width="1.2" stroke-linejoin="round" opacity=".85"/>';
+}
+
+// ------------------------------------------------------------------ the clock
+function drawClock(t) {
+  const per = t.thermal_ms.median, X = 10, W = 330;
+  const frac = t.skew_frac === null ? 0 : Math.min(1, t.skew_frac);
+  const vx = X + W * frac, bad = t.skew_frac !== null && t.skew_frac > 0.25;
+  const jw = W * (t.thermal_ms.max - t.thermal_ms.min) / per;
+  $('clocksvg').innerHTML =
+    '<rect x="' + X + '" y="16" width="' + W + '" height="12" fill="#181c1f" stroke="#2a3136" rx="2"/>'
+    + '<rect x="' + X + '" y="16" width="' + (vx - X) + '" height="12" fill="'
+      + (bad ? '#4a3714' : '#173044') + '" rx="2"/>'
+    + '<rect x="' + (X + W - jw) + '" y="16" width="' + jw + '" height="12" fill="#2b3237"/>'
+    + '<line x1="' + X + '" y1="9" x2="' + X + '" y2="35" stroke="#f0a860" stroke-width="2"/>'
+    + '<line x1="' + vx + '" y1="9" x2="' + vx + '" y2="35" stroke="#6cc8ff" stroke-width="2"/>'
+    + '<line x1="' + (X + W) + '" y1="9" x2="' + (X + W) + '" y2="35" stroke="#f0a860"'
+      + ' stroke-width="2" stroke-dasharray="2 2"/>'
+    + '<text x="' + (X + 3) + '" y="45" fill="#f0a860" font-size="9.5"'
+      + ' font-family="ui-monospace,monospace">thermal grab</text>'
+    + '<text x="' + (vx + 4) + '" y="13" fill="#6cc8ff" font-size="9.5"'
+      + ' font-family="ui-monospace,monospace">visible</text>'
+    + '<text x="' + (X + W) + '" y="45" fill="#6b747c" font-size="9.5" text-anchor="end"'
+      + ' font-family="ui-monospace,monospace">' + per + ' ms period &#183; jitter '
+      + t.thermal_ms.min + '-' + t.thermal_ms.max + '</text>';
+}
+
+// ------------------------------------------------------------------ health
+// The same checks health() already produces, grouped by the question each group
+// answers. Grouping is the whole point: thirteen flat pills read as thirteen
+// equal facts, and "8.7 fps" is not equal to "the sensor went unserviced".
+const GROUPS = [
+  ['link', ['stream','framing','jpeg','render']],
+  ['sensor', ['cadence','pairing','thermal load','ffc','tearing','dead rows','board heap']],
+  ['measurement', ['registration','coverage','range','clipping','agc','emissivity']],
+  ['perception', ['detect','radar','recording']],
+  ['host', ['host cpu','host memory','host thermal','host power']],
+];
+const RANK = {ok: 0, warn: 1, fail: 2}, LVL = ['ok','warn','fail'];
+// Which groups the operator has opened by hand. Rebuilding the panel every
+// second must not slam shut a group somebody is reading.
+const opened = {};
+$('health').onclick = (e) => {
+  const d = e.target.closest('details');
+  if (d) setTimeout(() => { opened[d.dataset.g] = d.open; }, 0);
+};
+function drawHealth(checks) {
+  const by = {};
+  for (const c of checks) by[c.name] = c;
+  const seen = new Set();
+  const groups = GROUPS.map(([name, names]) => {
+    const cs = names.map(n => by[n]).filter(Boolean);
+    cs.forEach(c => seen.add(c.name));
+    return [name, cs];
+  });
+  // Anything health() grows later lands here rather than vanishing off the page.
+  const rest = checks.filter(c => !seen.has(c.name));
+  if (rest.length) groups.push(['other', rest]);
+
+  $('health').innerHTML = groups.map(([name, cs]) => {
+    if (!cs.length) return '<details class="grp ok" data-g="' + name + '">'
+      + '<summary><span class=dot style=background:#2f363c></span>' + name
+      + '<span class=cnt>nothing to report</span><span class=chev>&rsaquo;</span></summary></details>';
+    const worst = LVL[Math.max.apply(null, cs.map(c => RANK[c.level]))];
+    const bad = cs.filter(c => c.level !== 'ok').length;
+    // Not-ok groups open themselves; ok groups stay shut unless opened by hand.
+    const open = (opened[name] !== undefined) ? opened[name] : worst !== 'ok';
+    return '<details class="grp ' + worst + '" data-g="' + name + '"' + (open ? ' open' : '') + '>'
+      + '<summary><span class=dot></span>' + name + '<span class=cnt>'
+      + (bad ? bad + ' of ' + cs.length : cs.length + ' ok')
+      + '</span><span class=chev>&rsaquo;</span></summary><div class=checks>'
+      + cs.map(c => '<div class="chk-row ' + c.level + '"><i></i><span class=n>' + c.name
+          + '</span><span class=t>' + esc(c.text) + '</span></div>').join('')
+      + '</div></details>';
+  }).join('');
+}
+
+// ------------------------------------------------------------------ poll
+const VERDICT = {
+  ok: ['CLEAR', 'nothing this code can see is wrong'],
+  warn: ['QUALIFIED', 'usable, but read them the way the amber says'],
+  fail: ['DO NOT RECORD', 'the numbers on screen are wrong or absent'],
+};
+let inited = false;
+function initControls(cfg) {
+  for (const k of SLIDERS) { $(k).value = cfg[k]; $('o_' + k).textContent = cfg[k]; }
+  $('emis').value = cfg.emissivity;
+  $('refl').value = cfg.reflected;
+  $('outline').checked = cfg.outline;
+  $('boxes').checked = cfg.boxes;
+  pick('view', cfg.view);
+  pick('pal', cfg.palette);
+  if (cfg.radar) {
+    $('radarcard').style.display = '';
+    $('radar').checked = cfg.radar.on;
+    $('whisker').checked = cfg.radar.whisker;
+    for (const [k] of NUDGE) {
+      rstate[k] = cfg.radar[k];
+      $('o_' + k).textContent = rstate[k] + (k[0] === 't' ? ' mm' : '\\u00b0');
+    }
+  }
+  inited = true;
+}
+
+async function poll() {
+  let d;
+  try {
+    d = await (await fetch('/ui')).json();
+  } catch (err) {
+    $('trust').className = 'fail';
+    $('vtext').textContent = 'VIEWER DISCONNECTED';
+    $('vsub').textContent = 'the page cannot reach live.py - is it still running?';
+    return;
+  }
+  if (!inited) initControls(d.cfg);
+
+  const [vt, vs] = VERDICT[d.worst];
+  $('trust').className = d.worst;
+  $('vtext').textContent = vt;
+  $('vsub').textContent = vs;
+
+  // The facts that qualify every number on screen, in one place. They used to be
+  // spread across /stat, a health pill and the word UNREGISTERED on each box.
+  const cfg = d.cfg, q = [];
+  q.push(['warp', cfg.warped ? 'calibrated' : 'PLACEHOLDER', !cfg.warped]);
+  q.push(['agc', cfg.agc ? cfg.agc + '\\u2030 - tone is scene-relative' : 'off', !!cfg.agc]);
+  q.push(['\\u03b5', cfg.emissivity.toFixed(2) + ' / refl ' + Math.round(cfg.reflected)
+          + ' \\u00b0C', cfg.emissivity < 1]);
+  q.push(['range', cfg.range[1] > cfg.range[0]
+          ? cfg.range[0] + '-' + cfg.range[1] + ' \\u00b0C' : 'none', cfg.range[1] <= cfg.range[0]]);
+  if (d.recording) q.push(['rec', d.recording, false]);
+  $('qual').innerHTML = q.map(([k, v, bad]) =>
+    '<span class="' + (bad ? 'bad' : '') + '">' + k + ' <i>' + esc(v) + '</i></span>').join('');
+
+  drawHealth(d.checks);
+
+  // --- the clock and the traces
+  const t = d.timing;
+  if (t.thermal_ms) {
+    drawClock(t);
+    push('th', t.thermal_ms.median);
+    $('k_th').innerHTML = t.thermal_ms.median + '<span class=u> ms &#183; '
+      + t.thermal_fps + ' fps</span>';
+    if (t.skew_ms) {
+      push('sk', t.skew_ms.median);
+      $('kv_sk').className = 'kv vis' + (t.skew_frac > 0.25 ? ' bad' : '');
+      $('k_sk').innerHTML = '+' + t.skew_ms.median + '<span class=u> ms &#183; '
+        + Math.round(100 * t.skew_frac) + '% of a frame</span>';
+    }
+  }
+  push('fps', t.host_fps);
+  $('k_fps').innerHTML = t.host_fps.toFixed(1) + '<span class=u> fps</span>';
+  $('k_ffc').innerHTML = t.ffc_ago_s === null ? 'none yet'
+    : t.ffc_ago_s + '<span class=u> s ago &#183; ' + t.ffcs + '</span>';
+  // Load reaching the sensor. On screen even when it is zero: this is the number
+  // that decides whether more host work is affordable, and it is worth watching
+  // go up rather than discovering afterwards.
+  $('kv_load').className = 'kv' + (t.starved || t.stalls ? ' bad' : '');
+  $('k_load').innerHTML = t.starved
+    ? 'STARVED ' + t.starved + 'x<span class=u> worst ' + t.last_starve_ms + ' ms</span>'
+    : t.stalls ? t.stalls + '<span class=u> write stall(s)</span>'
+    : '<span style=color:#7fd39b>unstarved</span>';
+
+  if (d.heap_free !== null && d.heap_free !== undefined) {
+    const mb = d.heap_free / (1 << 20);
+    push('heap', mb);
+    $('k_heap').innerHTML = mb.toFixed(1) + '<span class=u> MB'
+      + (d.restarts ? ' &#183; ' + d.restarts + ' restart(s)' : '') + '</span>';
+  }
+  if (d.coverage !== null && d.coverage !== undefined) {
+    push('cov', 100 * d.coverage);
+    $('k_cov').innerHTML = Math.round(100 * d.coverage) + '<span class=u> %</span>';
+    $('s_cov').textContent = Math.round(100 * d.coverage) + '%';
+  }
+  $('k_band').innerHTML = d.stats.valid
+    ? d.stats.min.toFixed(1) + '<span class=u>..</span>' + d.stats.max.toFixed(1)
+      + '<span class=u> \\u00b0C &#183; \\u0394 ' + d.stats.delta.toFixed(1) + '</span>'
+    : '<span class=u>no thermal coverage</span>';
+  $('agcwarn').innerHTML = cfg.agc
+    ? '<span style=color:#f0c060>scene-relative</span>' : '';
+
+  // --- the host. The same subject as the starve counter above, seen from the
+  // other end: that one says the sensor went unserviced, this one says why, and
+  // it is the half that moves first.
+  const s = d.soc;
+  if (s) {
+    $('socstrip').style.display = '';
+    if (s.cpu_pct !== null) {
+      push('cpu', s.cpu_pct);
+      $('kv_cpu').className = 'kv host' + (s.cpu_pct > 85 ? ' bad' : '');
+      $('k_cpu').innerHTML = Math.round(s.cpu_pct) + '<span class=u>% of ' + s.ncpu
+        + ' cores' + (s.self_pct === null ? ''
+            : ' &#183; ' + Math.round(s.self_pct) + '% mine') + '</span>';
+    }
+    if (s.gpu_pct !== null) {
+      push('gpu', s.gpu_pct);
+      $('k_gpu').innerHTML = Math.round(s.gpu_pct) + '<span class=u>%</span>';
+    }
+    if (s.mem_total_mb) {
+      push('mem', s.mem_avail_mb);
+      $('kv_mem').className = 'kv host' + (s.mem_avail_mb < 600 ? ' bad' : '');
+      $('k_mem').innerHTML = (s.mem_avail_mb / 1024).toFixed(1) + '<span class=u> GB free of '
+        + (s.mem_total_mb / 1024).toFixed(1) + '</span>';
+    }
+    if (s.t_max !== null) {
+      push('tj', s.t_max);
+      // Headroom, not the raw temperature: 84 C is alarming on a part that trips
+      // at 90 and unremarkable on one that trips at 105.
+      const head = s.t_crit ? s.t_crit - s.t_max : null;
+      $('kv_tj').className = 'kv host' + (head !== null && head < 8 ? ' bad' : '');
+      $('k_tj').innerHTML = Math.round(s.t_max) + '<span class=u> &#176;C'
+        + (head === null ? '' : ' &#183; ' + Math.round(head) + ' to trip') + '</span>';
+    }
+    if (s.power_w) {
+      push('pw', s.power_w);
+      $('k_pw').innerHTML = s.power_w.toFixed(1) + '<span class=u> W</span>';
+    }
+    if (s.freq_mhz)
+      $('k_clk').innerHTML = s.freq_mhz + '<span class=u>/' + s.freq_max_mhz + ' MHz</span>';
+    spark('sp_cpu', 'cpu', '#8fa2b5', 0, 100);
+    spark('sp_gpu', 'gpu', '#8fa2b5', 0, 100);
+    spark('sp_mem', 'mem', '#8fa2b5', 0, s.mem_total_mb || 1);
+    spark('sp_tj', 'tj', '#8fa2b5', 20, s.t_crit || 100);
+    spark('sp_pw', 'pw', '#8fa2b5', 0, 20);
   }
 
-  // The detection list in text as well as boxes. A box you have to squint at is
-  // not a reading you would write down, and the peak location matters as much as
-  // the value - "this motor is warm" and "this motor's near bearing is warm" are
-  // different findings.
-  const dd = await (await fetch('/detections')).json();
-  document.getElementById('dets').innerHTML = dd.detections.length
-    ? dd.detections.map(d => '<span class="pill '+(dd.warped?'ok':'warn')+'">'
-        + '<span class=n>'+d.cls+'</span><span class=t>'+Math.round(100*d.conf)+'%'
-        + (d.max_c !== undefined
-            ? '  '+d.max_c.toFixed(1)+'\\u00b0C peak @'+d.max_x+','+d.max_y
-              + (dd.warped ? '' : '  UNREGISTERED')
-              + (d.repaired ? '  rebuilt row' : '')
-            : '  no thermal')
-        + '</span></span>').join('')
-    : '';
-  const d = await (await fetch('/stats')).json();
-  document.getElementById('band').innerHTML = d.valid
-    ? 'frame  min <b>' + d.min.toFixed(1) + '</b>  max <b>' + d.max.toFixed(1)
-      + '</b>  mean ' + d.mean.toFixed(1) + '  &Delta; <b>' + d.delta.toFixed(1) + ' \\u00b0C</b>'
-    : 'no thermal coverage';
-}, 1000);
-</script>"""
+  spark('sp_th', 'th', '#f0a860', 108, 120);
+  spark('sp_sk', 'sk', '#6cc8ff', 0, 40);
+  spark('sp_fps', 'fps', '#7fd39b', 0, 9.5);
+  spark('sp_heap', 'heap', '#7fd39b', 0, 26);
+  spark('sp_cov', 'cov', '#9aa4ad', 0, 100);
+
+  // --- detections. A box you have to squint at is not a reading you would write
+  // down, and the peak location matters as much as the value: "this motor is
+  // warm" and "this motor's near bearing is warm" are different findings.
+  const dd = d.detections;
+  $('s_det').textContent = dd.list.length + (dd.ms ? ' \\u00b7 ' + Math.round(dd.ms) + 'ms' : '');
+  $('dets').innerHTML = dd.list.map(x =>
+    '<div class="det' + (dd.warped ? '' : ' unreg') + '">'
+    + '<span class=cls>' + esc(x.cls) + '</span>'
+    + '<span class=m>' + Math.round(100 * x.conf) + '%</span>'
+    + (x.max_c !== undefined
+        ? '<span class=c>' + x.max_c.toFixed(1) + ' \\u00b0C</span>'
+          + '<span class=m>peak @' + x.max_x + ',' + x.max_y + '</span>'
+        : '<span class=m>no thermal in box</span>')
+    + (x.body_heat === false ? '<span class=flag>NO BODY HEAT</span>' : '')
+    + (x.repaired ? '<span class=flag>REBUILT ROW</span>' : '')
+    + (dd.warped ? '' : '<span class=flag>UNREGISTERED</span>')
+    + '</div>').join('');
+
+  if (probes.length) refreshProbes();
+}
+poll();
+setInterval(poll, 1000);
+</script>
+"""
 
 
 def make_handler(state, pipe):
@@ -2001,11 +2646,16 @@ def make_handler(state, pipe):
                               "agc_permille" if k == "agc" else k): v for k, v in q.items()})
                 self.send_response(204)
                 self.end_headers()
+            elif u.path == "/ui":
+                # The page's one poll. Everything else here is for curl.
+                body = json.dumps(ui_payload(pipe, state, time.time()))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body.encode())
             elif u.path == "/health":
                 checks = health(pipe, state, time.time())
-                worst = ("fail" if any(c["level"] == "fail" for c in checks) else
-                         "warn" if any(c["level"] == "warn" for c in checks) else "ok")
-                body = json.dumps({"worst": worst, "checks": checks})
+                body = json.dumps({"worst": worst_level(checks), "checks": checks})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
@@ -2134,13 +2784,25 @@ def main():
     # 700-900KB/s, so q80 sits near 40% duty and q90 near 55%. q80 buys most of
     # the improvement for the smaller share of the pipe.
     ap.add_argument("--quality", type=int, default=80, help="board-side JPEG quality")
+    ap.add_argument("--range", metavar="TMIN:TMAX",
+                    help="pin the sensor range instead of auto-ranging, e.g. "
+                         "--range 10:45. Auto-range picks off ONE frame at "
+                         "bring-up and the sensor drifts for minutes after; pin "
+                         "it when the session must outlast that (calibration, "
+                         "long recordings) or to measure the drift itself")
     ap.add_argument("--detect", default="off", metavar="WHAT",
                     help="object detection: 'off', 'all' for COCO-80, or a comma-separated "
-                         "class list such as 'person,cat'. Runs yolov4-tiny on the host CPU "
-                         "and attaches a temperature to every box")
+                         "class list such as 'person,cat'. Attaches a temperature to "
+                         "every box")
+    ap.add_argument("--detect-backend", default="auto", choices=["auto", "gpu", "cpu"],
+                    help="'gpu' runs yolov10n on TensorRT (~7ms, and leaves the cores "
+                         "for the serial reader); 'cpu' runs yolov4-tiny on cv2.dnn "
+                         "(~68-126ms, four of six cores). 'auto' prefers the GPU and "
+                         "warns on stderr if it falls back (default auto)")
     ap.add_argument("--detect-size", type=int, default=416, choices=[320, 416],
-                    help="detector input size. 416 is 68ms and 320 is 46ms on this host, "
-                         "against a 114ms frame period (default 416)")
+                    help="detector input size, CPU backend only. 416 is 68ms and 320 is "
+                         "46ms on this host, against a 114ms frame period. The GPU "
+                         "backend is fixed at 640 by its engine (default 416)")
     ap.add_argument("--detect-conf", type=float, default=0.35,
                     help="detection confidence threshold (default 0.35)")
     # Radar overlay. Off unless a port is given, because live.py must keep
@@ -2193,7 +2855,9 @@ def main():
 
     pipe = Pipeline(args)
     pipe.view = args.view
-    state = {}
+    # One sampler for the process; it primes its own counters, so the first
+    # /ui already carries a CPU figure rather than a null.
+    state = {"soc": hostsoc.Soc()}
 
     detector = None
     if args.detect != "off":
@@ -2205,8 +2869,8 @@ def main():
                 raise SystemExit("not COCO classes: %s\navailable: %s"
                                  % (", ".join(unknown), " ".join(detect.COCO)))
         try:
-            detector = detect.Detector(size=args.detect_size, conf=args.detect_conf,
-                                       classes=classes)
+            detector = detect.make_detector(args.detect_backend, size=args.detect_size,
+                                            conf=args.detect_conf, classes=classes)
         except FileNotFoundError as e:
             raise SystemExit("detector model missing: %s" % e)
 
@@ -2242,6 +2906,14 @@ def main():
                       radar_proj=radar_proj, video=video)
     render.start()
     stream = Streamer(args.port, pipe, args.quality, state, work)
+    if args.range:
+        lo, hi = (int(v) for v in args.range.split(":"))
+        stream.fixed_range = (lo, hi)
+        # Told, not inferred: the board reports its own range on #READY, but the
+        # host must know NOW that the tone is absolute rather than scene-relative,
+        # because temp_at() converts codes with it.
+        pipe.set_range(lo, hi)
+        print("range pinned to %d..%d C (auto-range off)" % (lo, hi), file=sys.stderr)
     stream.start()
 
     srv = ThreadingHTTPServer(("0.0.0.0", args.http), make_handler(state, pipe))
@@ -2250,7 +2922,10 @@ def main():
     if not args.warp:
         print("NOTE: no --warp, thermal layer is stretched not registered", file=sys.stderr)
     if detector:
-        print("detecting %s at %d px" % (args.detect, args.detect_size), file=sys.stderr)
+        gpu = getattr(detector, "backend", "cpu") == "gpu"
+        print("detecting %s at %d px (%s)"
+              % (args.detect, detector.net_w if gpu else args.detect_size,
+                 "yolov10n/TensorRT" if gpu else "yolov4-tiny/CPU"), file=sys.stderr)
 
     # How long the stream may stay down before this gives up on it. The
     # supervisor in Streamer.run() exists to survive a fault - a wedged Lepton, a
