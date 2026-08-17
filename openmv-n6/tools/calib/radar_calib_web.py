@@ -4,6 +4,7 @@
     ./radar_calib_web.py ../../captures/walk3            # then open :8081
     ./radar_calib_web.py ../../captures/walk3 -i calib.json
     ./radar_calib_web.py ../../captures/walk3 --port 8090
+    ./radar_calib_web.py ../../captures/v3_01 -i calib.json --camera thermal
 
 Wraps the two tools that already exist into the one workflow that was missing:
 radar_correspond.py finds the stationary holds in a recorded session but its
@@ -17,8 +18,23 @@ The input is a session recorded by:
 
     ./live.py --radar /dev/ttyACM2 --record DIR --view visible
 
-(visible, not fused: the thermal layer is unregistered and its offset must not
-leak into the radar extrinsic through a click on a warm blob.)
+(visible, not fused: the FUSED view is a composite and its thermal offset must
+not leak into the radar extrinsic through a click on a warm blob.)
+
+TWO CAMERAS, TWO SOLVES. --camera rgb (default) picks on session.mp4 and gives
+T_camera<-radar, the shipping transform: 0.109 deg/px against the thermal's
+0.360, so it conditions R over three times better. --camera thermal picks the
+heated marker on thermal.bin and gives T_thermal<-radar directly - the
+INDEPENDENT check on the composed T_th<-c . T_c<-r that
+CALIBRATION-PLAN-V3-THERMAL.md sec 6a calls for, and PASS C of the validation
+procedure. They write separate corr/calib files and are never mixed.
+
+Thermal picking needs a target with a real LWIR signature. Bare aluminium has
+emissivity ~0.05 - a trihedral reflector is a mirror for the ceiling, not a hot
+object - so the marker must be a heated high-emissivity patch whose offset from
+the radar vertex is measured. That is what makes this mode possible at all, and
+it is why the older rule "reach the thermal only by composition" no longer
+holds.
 
 EVIDENCE PURITY. Two per-frame flags in frames.jsonl are enforced, not assumed:
 'clean' says the frame was recorded BEFORE the guessed radar overlay and the
@@ -76,6 +92,48 @@ MEASURED_HFOV_DEG = 62.7
 # mount yaw; re-measure it if the bracket ever changes.)
 GHOST_TOL_DEG = 12.0
 
+# -- thermal picking (--camera thermal) ---------------------------------------
+#
+# The Lepton frame the recorder stores in thermal.bin is 160x120 8-bit, written
+# byte-for-byte as the board sent it (recorder.py). That matters twice over:
+# it is the ONLY picture in a session that no overlay can have been composited
+# into, and it is AGC-normalised, so it carries a marker's SHAPE but not its
+# temperature. Centroiding a heated marker on it is legitimate; reading a
+# temperature off it is not.
+THERMAL_W, THERMAL_H = 160, 120
+THERMAL_FRAME_BYTES = THERMAL_W * THERMAL_H
+
+# f_th = 159.3 px measured in the B2 stereo round (calib-artifacts/calib.json),
+# independently confirmed against the Lepton's 0.356 deg/px (-> 160.9) to under
+# 1%. Prefer -i; this is only the fallback.
+MEASURED_THERMAL_HFOV_DEG = 53.3
+
+# A 160x120 picture is unclickable at native size, so it is served upscaled by
+# this integer factor and picks are divided back down on the way in. The
+# browser reports fractional client coordinates, so this BUYS precision (a
+# quarter of a thermal pixel) rather than costing any.
+THERMAL_DISP_SCALE = 4
+
+# Dead-row test, taken verbatim from src/fusion.h - measured across 46 frames,
+# not guessed. A row is dead if it is FLAT (spread <= 24 codes: no scene in it)
+# AND LIFTED (mean >= frame median + 64 codes). Both are needed: flat alone
+# condemns a blank wall, lifted alone condemns any hot target - which here
+# would be the calibration marker itself.
+#
+# This is a hard veto rather than a warning because the live pipeline REPAIRS
+# these rows by blending the nearest live rows above and below. That blend is
+# plausible, not measured, and a marker centroid taken from it is an
+# interpolated pixel entering the calibration as if it were evidence.
+DEADROW_FLAT, DEADROW_LIFT = 24, 64
+
+
+def dead_rows(frame):
+    """Row indices condemned by the fusion.h test. frame is (H, W) uint8."""
+    f = frame.astype(np.int16)
+    spread = f.max(axis=1) - f.min(axis=1)
+    lift = f.mean(axis=1) - float(np.median(f))
+    return np.nonzero((spread <= DEADROW_FLAT) & (lift >= DEADROW_LIFT))[0]
+
 
 def nominal_K(width, height, hfov_deg=MEASURED_HFOV_DEG):
     f = (width / 2.0) / math.tan(math.radians(hfov_deg) / 2.0)
@@ -91,7 +149,12 @@ class CalibSession:
                  hfov_deg=MEASURED_HFOV_DEG, sigma_az=rx.RADAR_SIGMA_AZ_DEG,
                  sigma_el=rx.RADAR_SIGMA_EL_DEG, rig_id=None, mount_token=None,
                  allow_tainted=False, allow_moving=False, unmirror=False,
-                 allow_ghosts=False, ghost_tol_deg=GHOST_TOL_DEG):
+                 allow_ghosts=False, ghost_tol_deg=GHOST_TOL_DEG,
+                 camera='rgb'):
+        if camera not in ('rgb', 'thermal'):
+            raise SystemExit('camera must be rgb or thermal, got %r' % camera)
+        self.camera = camera
+        self.disp_scale = THERMAL_DISP_SCALE if camera == 'thermal' else 1
         # The video is NOT mirrored: the walk-in pixel track matches radar
         # azimuth sign directly (measured 2026-08-09 late; the earlier
         # raised-hand test that said otherwise used the wrong hand). The flip
@@ -111,8 +174,14 @@ class CalibSession:
             raise SystemExit('%s has no frames.jsonl - pictures cannot be '
                              'matched to radar holds. Re-record with a current '
                              'live.py.' % session_dir)
-        if not video:
+        if not video and camera == 'rgb':
             raise SystemExit('%s has no session.mp4' % session_dir)
+        self.thermal_path = os.path.join(self.dir, 'thermal.bin')
+        if camera == 'thermal' and not os.path.exists(self.thermal_path):
+            raise SystemExit(
+                '%s has no thermal.bin - the thermal layer was not recorded, '
+                'so there is no picture to pick the heated marker on. '
+                'Re-record with a current live.py.' % session_dir)
         self.frames_meta = frames
 
         holds = rc.find_holds(radar, min_frames=min_frames)
@@ -137,12 +206,21 @@ class CalibSession:
             row = min(frames, key=lambda f: abs(f['t_mono']
                                                 - 0.5 * (h['t0'] + h['t1'])))
             reasons = []
-            view = row.get('view')
-            if view not in (None, 'visible'):
-                reasons.append('recorded in view=%s, not visible' % view)
-            if not row.get('clean'):
-                reasons.append('no clean flag: the guessed radar overlay may '
-                               'be burned into this picture (older live.py)')
+            if camera == 'rgb':
+                view = row.get('view')
+                if view not in (None, 'visible'):
+                    reasons.append('recorded in view=%s, not visible' % view)
+                if not row.get('clean'):
+                    reasons.append('no clean flag: the guessed radar overlay '
+                                   'may be burned into this picture (older '
+                                   'live.py)')
+            # For thermal the 'view' and 'clean' flags describe session.mp4,
+            # which is the COMPOSED picture. thermal.bin is the board's own
+            # bytes and never passes through the compositor, so no overlay can
+            # be burned into it and neither flag applies. This is a stronger
+            # purity guarantee than the RGB path has, not a waived check - but
+            # it is only true as long as the recorder keeps writing thermal.bin
+            # straight from the transport (recorder.py).
             if reasons and not allow_tainted:
                 self.n_tainted += 1
                 continue
@@ -161,43 +239,102 @@ class CalibSession:
         # Decode every hold's picture once, up front. Dozens of 640x400 frames
         # is a few tens of MB; seeking the mp4 per HTTP request is not
         # thread-safe and not worth making so.
-        cap = cv2.VideoCapture(video)
         self.images, self.dt_ms, self.frame_idx = [], [], []
-        for h, row, _ in picked_rows:
-            fi = row['i']
-            cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
-            ok, img = cap.read()
-            if ok and self.unmirror:
-                img = np.ascontiguousarray(img[:, ::-1])
-            self.images.append(img if ok else None)
-            self.dt_ms.append(abs(row['t_mono']
-                                  - 0.5 * (h['t0'] + h['t1'])) * 1000.0)
-            self.frame_idx.append(fi)
-        cap.release()
+        self.dead = []           # per hold: row indices condemned by fusion.h
+        if camera == 'thermal':
+            self._load_thermal(picked_rows)
+        else:
+            cap = cv2.VideoCapture(video)
+            for h, row, _ in picked_rows:
+                fi = row['i']
+                cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
+                ok, img = cap.read()
+                if ok and self.unmirror:
+                    img = np.ascontiguousarray(img[:, ::-1])
+                self.images.append(img if ok else None)
+                self.dead.append(np.empty(0, int))
+                self.dt_ms.append(abs(row['t_mono']
+                                      - 0.5 * (h['t0'] + h['t1'])) * 1000.0)
+                self.frame_idx.append(fi)
+            cap.release()
         shapes = [im.shape for im in self.images if im is not None]
         if not shapes:
-            raise SystemExit('session.mp4 yielded no decodable frames')
+            raise SystemExit('%s yielded no decodable frames'
+                             % ('thermal.bin' if camera == 'thermal'
+                                else 'session.mp4'))
         self.h, self.w = shapes[0][:2]
 
         self.intrinsics_path = intrinsics
+        if camera == 'thermal' and hfov_deg == MEASURED_HFOV_DEG:
+            hfov_deg = MEASURED_THERMAL_HFOV_DEG   # user did not override
         if intrinsics:
-            self.K, self.dist = rx.intrinsics_from_calib(intrinsics, 'rgb')
-            self.k_source = os.path.basename(intrinsics)
+            self.K, self.dist = rx.intrinsics_from_calib(intrinsics, camera)
+            self.k_source = '%s (%s)' % (os.path.basename(intrinsics), camera)
             self.k_nominal = False
         else:
             self.K, self.dist = nominal_K(self.w, self.h, hfov_deg)
-            self.k_source = ('NOMINAL: f=%.0f px from measured %.1f deg HFOV, '
-                             'zero distortion' % (self.K[0, 0], hfov_deg))
+            self.k_source = ('NOMINAL %s: f=%.0f px from %.1f deg HFOV, '
+                             'zero distortion'
+                             % (camera, self.K[0, 0], hfov_deg))
             self.k_nominal = True
 
-        self.corr_path = os.path.join(self.dir, 'corr.json')
+        # The two cameras are two separate solves over the same session and
+        # must never share an output file: picking on thermal would silently
+        # overwrite the RGB correspondence set (and vice versa), and the loser
+        # is indistinguishable from the winner once written. RGB keeps the
+        # historical names so older sessions still resume.
+        sfx = '' if camera == 'rgb' else '_' + camera
+        self.corr_path = os.path.join(self.dir, 'corr%s.json' % sfx)
         self.calib_path = os.path.join(
-            self.dir, 'radar_calib_nominalK.json' if self.k_nominal
-            else 'radar_calib.json')
+            self.dir, 'radar_calib%s%s.json'
+            % (sfx, '_nominalK' if self.k_nominal else ''))
 
         self.picks = {}          # hold index -> (u, v)
         self.result = None       # dict from _solve, or None
         self._load_existing()
+
+    def _load_thermal(self, picked_rows):
+        """Cut each hold's Lepton frame out of thermal.bin and colour it.
+
+        thermal.bin is a flat concatenation indexed by (thermal_off,
+        thermal_len) in frames.jsonl - no seeking, no decoder, and no
+        compositor between the sensor and this array. The raw frame is kept
+        alongside the coloured one because the dead-row test and any future
+        centroid assist must run on codes, never on the colour map.
+        """
+        blob = np.fromfile(self.thermal_path, np.uint8)
+        self.raw_thermal = []
+        for h, row, _ in picked_rows:
+            off, ln = row.get('thermal_off'), row.get('thermal_len')
+            img = raw = None
+            if off is not None and ln == THERMAL_FRAME_BYTES \
+                    and off + ln <= blob.size:
+                raw = blob[off:off + ln].reshape(THERMAL_H, THERMAL_W)
+                # Percentile stretch, not min/max: one stuck-hot pixel would
+                # otherwise flatten the whole marker into the low end.
+                lo, hi = np.percentile(raw, (0.5, 99.5))
+                norm = np.clip((raw.astype(np.float32) - lo)
+                               / max(hi - lo, 1.0), 0, 1)
+                img = cv2.applyColorMap((norm * 255).astype(np.uint8),
+                                        cv2.COLORMAP_INFERNO)
+            self.raw_thermal.append(raw)
+            self.images.append(img)
+            self.dead.append(dead_rows(raw) if raw is not None
+                             else np.empty(0, int))
+            self.dt_ms.append(abs(row['t_mono']
+                                  - 0.5 * (h['t0'] + h['t1'])) * 1000.0)
+            self.frame_idx.append(row['i'])
+        bad = sum(1 for im in self.images if im is None)
+        if bad:
+            print('warning: %d hold(s) had no usable thermal frame (missing '
+                  'or wrong-sized thermal_len; expected %d bytes)'
+                  % (bad, THERMAL_FRAME_BYTES), file=sys.stderr)
+
+    def _on_dead_row(self, k, v):
+        """Is this pick sitting on a row the live pipeline would repair?"""
+        if k >= len(self.dead) or not len(self.dead[k]):
+            return False
+        return int(round(v)) in set(self.dead[k].tolist())
 
     # -- persistence ------------------------------------------------------
 
@@ -263,6 +400,7 @@ class CalibSession:
                 'taint': self.taints[k],
                 'az_pixel_deg': self._az_pixel_deg(u),
                 'ghost_suspect': self._is_ghost(k, u),
+                'on_dead_row': self._on_dead_row(k, v),
             })
         return out
 
@@ -270,21 +408,33 @@ class CalibSession:
         """Write corr.json; returns the exact dict written, so solve() can hand
         the same object to provenance and the digest matches the file."""
         corrs = self._corrs()
+        if self.camera == 'thermal':
+            pixel_frame = ('thermal.bin, 160x120 8-bit, board byte order, '
+                           'uncomposited. AGC-normalised: shape is evidence, '
+                           'temperature is NOT readable from these codes.')
+            protocol = ('heated corner-reflector marker centroided in the '
+                        'THERMAL frame; radar median per hold. '
+                        'CALIBRATION-PLAN-V3-THERMAL.md sec 6a - the '
+                        'independent check on the composed T_th<-c . T_c<-r, '
+                        'not the shipping transform.')
+        else:
+            pixel_frame = ('unmirrored: video flipped horizontally on load'
+                           if self.unmirror else
+                           'raw video orientation; the stream is NOT mirrored '
+                           '(walk-in pixel track vs radar azimuth, 2026-08-09)')
+            protocol = ('stationary hold, frames averaged per correspondence. '
+                        'On a HUMAN subject this is bootstrap-grade: an '
+                        'extended target\'s radar centroid is offset from its '
+                        'visual outline by a constant that t absorbs invisibly '
+                        '(CALIBRATION-PLAN.md step 4). A corner reflector '
+                        'does not have that problem.')
         doc = {
             'session': self.dir,
-            'camera': 'rgb',
+            'camera': self.camera,
             'image_size': [self.w, self.h],
             'convention': 'radar x_fwd y_left z_up; image u right, v down',
-            'pixel_frame': ('unmirrored: video flipped horizontally on load '
-                            '(live.py stream is mirrored, measured 2026-08-09)'
-                            if self.unmirror else
-                            'raw video orientation (mirrored stream!)'),
-            'protocol': 'stationary hold on a HUMAN subject, frames averaged '
-                        'per correspondence. Bootstrap-grade: an extended '
-                        'target\'s radar centroid is offset from its visual '
-                        'outline by a constant that t absorbs invisibly '
-                        '(CALIBRATION-PLAN.md step 4); the corner-reflector '
-                        'round supersedes this.',
+            'pixel_frame': pixel_frame,
+            'protocol': protocol,
             'correspondences': corrs,
             'spread': rc.spread_report(corrs, (self.w, self.h)),
         }
@@ -298,7 +448,20 @@ class CalibSession:
         with self.lock:
             if not (0 <= k < len(self.holds)):
                 return {'error': 'no hold %d' % k}
-            self.picks[k] = (float(u), float(v))
+            # The browser reports coordinates in the SERVED image, which for
+            # thermal is upscaled; the pick is stored in sensor pixels.
+            u = float(u) / self.disp_scale
+            v = float(v) / self.disp_scale
+            if self._on_dead_row(k, v):
+                return dict(self.state(),
+                            error='row %d is a DEAD ROW (flat and lifted, '
+                                  'src/fusion.h): the live pipeline rebuilds '
+                                  'it by blending its neighbours, so a '
+                                  'centroid taken there is an interpolated '
+                                  'pixel, not a measurement. Re-place the '
+                                  'marker and re-record - do not pick around '
+                                  'it.' % int(round(v)))
+            self.picks[k] = (u, v)
             self.result = None          # stale the moment the set changes
             self._save_corrs()
             return self.state()
@@ -458,29 +621,47 @@ class CalibSession:
                 return None
             img = self.images[k].copy()
             h = self.holds[k]
+            s = self.disp_scale
+            # Condemned rows are painted BEFORE the upscale so the band lands
+            # exactly on the rows the test named, then survives INTER_NEAREST.
+            if len(self.dead[k]):
+                band = img.copy()
+                for r in self.dead[k]:
+                    band[r, :] = (60, 60, 255)
+                img = cv2.addWeighted(band, 0.55, img, 0.45, 0.0)
+            if s != 1:
+                img = cv2.resize(img, (self.w * s, self.h * s),
+                                 interpolation=cv2.INTER_NEAREST)
             hud = ('hold %d/%d  r=%.2fm az=%+.1f el=%+.1f  %d frames  '
                    'sd(az)=%.2f  dt=%.0fms'
                    % (k + 1, len(self.holds), h['range_m'], h['az_deg'],
                       h['el_deg'], h['n'], h['az_sd'], self.dt_ms[k]))
             cv2.putText(img, hud, (8, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                         (255, 255, 255), 1, cv2.LINE_AA)
+            y = 38
             if h['v_max_abs'] > 0.39:
-                cv2.putText(img, 'NOT STATIONARY - azimuth suspect', (8, 38),
+                cv2.putText(img, 'NOT STATIONARY - azimuth suspect', (8, y),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 160, 255), 2,
+                            cv2.LINE_AA)
+                y += 20
+            if len(self.dead[k]):
+                cv2.putText(img, '%d DEAD ROW(S) - picks there are refused'
+                            % len(self.dead[k]), (8, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (60, 60, 255), 2,
                             cv2.LINE_AA)
             if k in self.picks:
                 u, v = self.picks[k]
-                cv2.drawMarker(img, (int(u), int(v)), (180, 90, 255),
+                cv2.drawMarker(img, (int(u * s), int(v * s)), (180, 90, 255),
                                cv2.MARKER_CROSS, 18, 2)
             if self.result and k in self.result['proj']:
                 pu, pv, _ = self.result['proj'][k]
-                p = (int(round(pu)), int(round(pv)))
+                p = (int(round(pu * s)), int(round(pv * s)))
                 cv2.circle(img, p, 7, (90, 220, 90), 2)
                 if k in self.picks:
                     u, v = self.picks[k]
-                    cv2.line(img, (int(u), int(v)), p, (90, 220, 90), 1,
-                             cv2.LINE_AA)
-                    err = math.hypot(pu - u, pv - v)
+                    cv2.line(img, (int(u * s), int(v * s)), p, (90, 220, 90),
+                             1, cv2.LINE_AA)
+                    err = math.hypot(pu - u, pv - v)   # sensor px, not display
                     cv2.putText(img, '%.1f px' % err, (p[0] + 10, p[1] - 8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.42, (90, 220, 90),
                                 1, cv2.LINE_AA)
@@ -490,7 +671,7 @@ class CalibSession:
 
     def bird_jpeg(self, k):
         with self.lock:
-            img = rc._bird(self.holds, k, size=self.h)
+            img = rc._bird(self.holds, k, size=self.h * self.disp_scale)
             # _bird already highlights the active hold; add a ring on picks
             max_r = max([h['range_m'] for h in self.holds] + [3.0]) * 1.15
             cx, cy = img.shape[1] // 2, img.shape[0] - 20
@@ -695,6 +876,13 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('session', help='directory written by live.py --record')
+    ap.add_argument('--camera', choices=('rgb', 'thermal'), default='rgb',
+                    help='which picture the marker is picked on. "thermal" '
+                         'reads thermal.bin (160x120, uncomposited) and takes '
+                         'K_th from -i; it needs a target with a real thermal '
+                         'signature - a heated reflector marker, not bare '
+                         'aluminium (emissivity ~0.05). Picks landing on a '
+                         'dead row are refused.')
     ap.add_argument('-i', '--intrinsics', default=None,
                     help='calib.json from calib.py; omit to use the nominal '
                          'measured-FOV K (output is then marked provisional)')
@@ -738,7 +926,8 @@ def main():
                        allow_moving=a.allow_moving,
                        unmirror=a.unmirror,
                        allow_ghosts=a.allow_ghost_picks,
-                       ghost_tol_deg=a.ghost_tol)
+                       ghost_tol_deg=a.ghost_tol,
+                       camera=a.camera)
     print('%d holds (%d scenery, %d outside-camera, %d tainted excluded), '
           'intrinsics: %s'
           % (len(cal.holds), cal.n_scenery, cal.n_outside, cal.n_tainted,
