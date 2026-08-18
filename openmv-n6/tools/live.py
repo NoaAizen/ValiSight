@@ -19,6 +19,13 @@ firmware - so what you see here is what the board will do once flashed.
 
 Controls are live, no restart: http://localhost:8088/set?gain=250&eps=120&radius=5
 
+During a calibration session, name each station before holding it - from the
+page's pose bar, or /pose?id=N04 - and every frame written from then on carries
+that pose_id. /pose?clear=1 between stations, /pose to read back what has been
+stamped. Frames written with no station are labelled UNLABELLED on the page
+rather than passing quietly; recovering the split afterwards from timestamps is
+what the V3 plan section 5d exists to stop.
+
 The view selector is there to judge registration, which the fused image cannot
 show you on its own - see the VIEWS comment below for why, and use blink/edges
 during a calibration session rather than trusting how sharp the picture looks.
@@ -1807,6 +1814,16 @@ def ui_payload(pipe, state, now):
         "restarts": state.get("restarts", 0),
         "coverage": round(float(pipe.cover_grid().mean()), 4) if pipe.f.have_frame else None,
         "recording": os.path.basename(state["recording"]) if state.get("recording") else None,
+        # Which station the frames going to disk right now are labelled with.
+        # The operator is at the target, metres from the host, holding a phone;
+        # this is the only way to see that the stamp took before walking back.
+        # `null` while recording means frames are being written with no pose_id,
+        # which is the state a calibration session must never sit in unnoticed.
+        "pose": None if state.get("video") is None else {
+            "id": state["video"].pose_id,
+            "stamped": len(state["video"].meta_poses()),
+            "frames": state["video"].frames,
+        },
         # Cached inside Soc for 0.4s, so health() above and this share one sample
         # rather than each taking a delta over a near-zero interval.
         "soc": state["soc"].read() if state.get("soc") else None,
@@ -1874,6 +1891,22 @@ box-shadow:0 0 10px #ff7d7d70;animation:pulse 1.4s ease-in-out infinite}
 #qual span{color:var(--dim)}
 #qual span i{font-style:normal;color:var(--txt)}
 #qual span.bad i{color:var(--warn)}
+/* The pose bar is sized for the one hand that actually uses it: the operator is
+   standing at the reflector holding a phone, not sitting at the host. Hence the
+   44px touch targets and a current-station readout big enough to confirm at
+   arm's length without zooming. */
+#posebar{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+#posebar input{flex:1 1 140px;min-width:0;height:44px;padding:0 12px;
+  font-family:var(--mono);font-size:16px;color:var(--txt);
+  background:var(--panel2);border:1px solid var(--line);border-radius:6px}
+#posebar button{height:44px;padding:0 18px;font-size:15px;font-family:inherit;
+  color:var(--bg);background:var(--visible);border:0;border-radius:6px}
+#posebar button.clear{background:var(--panel2);color:var(--dim);
+  border:1px solid var(--line)}
+#posenow{font-family:var(--mono);font-size:20px;font-weight:600;
+  min-width:5ch;color:var(--ok)}
+#posenow.none{color:var(--warn)}
+#posen{font-size:12px;color:var(--dim);font-family:var(--mono)}
 #brand{margin-left:auto;color:var(--dimmer);font-size:11px;letter-spacing:.08em}
 
 /* --- main split */
@@ -2022,6 +2055,14 @@ padding:1px 5px;color:var(--dim);background:var(--panel2)}
   <div id=verdict><span class=dot></span><span id=vtext>connecting</span>
     <small id=vsub></small></div>
   <div id=qual></div>
+  <div id=posebar hidden>
+    <span id=posenow class=none>&mdash;</span>
+    <input id=poseid placeholder="station, e.g. N04" autocomplete=off
+           autocapitalize=characters spellcheck=false>
+    <button id=posego>stamp</button>
+    <button id=poseclr class=clear>clear</button>
+    <span id=posen></span>
+  </div>
   <div id=brand>THERMAL + VISIBLE FUSION &middot; LIVE</div>
 </div>
 
@@ -2182,6 +2223,26 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
 const set = (q) => fetch('/set?' + q);
 
+// The pose stamp. Deliberately NOT optimistic: the readout only changes after
+// the server answers, because the whole point of the control is to tell an
+// operator standing at the target whether the frames now going to disk carry
+// the id. A bar that showed 'N04' on click would show it on a 409 too.
+async function stamp(id) {
+  const r = await fetch('/pose?' + (id === null ? 'clear=1' : 'id=' + encodeURIComponent(id)));
+  const d = await r.json();
+  if (!r.ok) { $('posenow').textContent = d.error || 'failed'; return; }
+  $('poseid').value = '';
+  $('poseid').blur();
+  applyPose({id: d.pose, stamped: d.stamped, frames: d.first_frame});
+}
+function applyPose(p) {
+  $('posebar').hidden = !p;
+  if (!p) return;
+  $('posenow').textContent = p.id || '\\u2014';
+  $('posenow').className = p.id ? '' : 'none';
+  $('posen').textContent = p.stamped + ' stamped \\u00b7 frame ' + p.frames;
+}
+
 // ------------------------------------------------------------------ controls
 // Wired once, then initialised from /ui's cfg rather than from the values in the
 // HTML: the page is not the source of truth for what the pipeline is doing, and
@@ -2196,6 +2257,10 @@ for (const k of ['emis','refl'])
 for (const [id, param] of [['outline','outline'],['boxes','boxes'],
                            ['radar','radar'],['whisker','whisker']])
   $(id).onchange = (e) => set(param + '=' + (e.target.checked ? 1 : 0));
+
+$('posego').onclick = () => { const v = $('poseid').value.trim(); if (v) stamp(v); };
+$('poseclr').onclick = () => stamp(null);
+$('poseid').onkeydown = (e) => { if (e.key === 'Enter') $('posego').click(); };
 
 function seg(boxId, names, param, onpick) {
   const box = $(boxId);
@@ -2471,8 +2536,15 @@ async function poll() {
   q.push(['range', cfg.range[1] > cfg.range[0]
           ? cfg.range[0] + '-' + cfg.range[1] + ' \\u00b0C' : 'none', cfg.range[1] <= cfg.range[0]]);
   if (d.recording) q.push(['rec', d.recording, false]);
+  // Recording with no pose_id is flagged, not merely blank: unlabelled frames
+  // are the failure this control exists to prevent, and it is silent otherwise.
+  if (d.pose) q.push(['pose', d.pose.id || 'UNLABELLED', !d.pose.id]);
   $('qual').innerHTML = q.map(([k, v, bad]) =>
     '<span class="' + (bad ? 'bad' : '') + '">' + k + ' <i>' + esc(v) + '</i></span>').join('');
+
+  // Skipped while the operator is mid-entry: the poll runs every second and
+  // would otherwise wipe a half-typed station id under their thumb.
+  if (document.activeElement !== $('poseid')) applyPose(d.pose);
 
   drawHealth(d.checks);
 
@@ -2646,6 +2718,44 @@ def make_handler(state, pipe):
                               "agc_permille" if k == "agc" else k): v for k, v in q.items()})
                 self.send_response(204)
                 self.end_headers()
+            elif u.path == "/pose":
+                # Name the station the frames from here on belong to. The
+                # recorder has carried pose_id since it was written, but nothing
+                # could ever set it, so every session so far went to disk
+                # unlabelled and "which rows are pose N04" was reconstructed
+                # afterwards from timestamps and memory. V3 plan section 5d
+                # requires the id on the row itself.
+                q = {k: v[0] for k, v in parse_qs(u.query).items()}
+                video = state.get("video")
+                if video is None:
+                    # Not a 404: the request is well-formed and the operator
+                    # believes a session is being labelled. Failing loudly here
+                    # is the difference between noticing now and discovering at
+                    # solve time that 36 stations share one nameless heap.
+                    self.send_response(409)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": "not recording; start live.py with --record",
+                    }).encode())
+                elif "id" in q or "clear" in q:
+                    pid = None if "clear" in q else q["id"]
+                    video.set_pose(pid)
+                    body = json.dumps({"pose": video.pose_id,
+                                       "first_frame": video.frames,
+                                       "stamped": len(video.meta_poses())})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body.encode())
+                else:
+                    body = json.dumps({"pose": video.pose_id,
+                                       "frames": video.frames,
+                                       "poses": video.meta_poses()})
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(body.encode())
             elif u.path == "/ui":
                 # The page's one poll. Everything else here is for curl.
                 body = json.dumps(ui_payload(pipe, state, time.time()))
@@ -2931,6 +3041,12 @@ def main():
     if record_dir:
         video = recorder.SessionRecorder(record_dir, meta=session_meta(args))
         state["recording"] = record_dir
+        # Also in state, beside radar_proj: the recorder is owned by the
+        # Renderer thread, but /pose is served on the HTTP thread and has no
+        # other way to reach it. set_pose only appends to a list and rewrites
+        # meta.json, so the cross-thread call is a write the capture path never
+        # races on - it reads pose_id, and a str assignment is atomic.
+        state["video"] = video
         print("recording to %s/" % record_dir, file=sys.stderr)
 
     if args.radar:

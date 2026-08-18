@@ -16,18 +16,22 @@ import argparse
 import glob
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from http.server import ThreadingHTTPServer
+from urllib.error import HTTPError
 from urllib.request import urlopen
 
 import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-import live    # noqa: E402
-import detect  # noqa: E402
+import live      # noqa: E402
+import detect    # noqa: E402
+import recorder  # noqa: E402
 
 # Script-relative so the test passes from any CWD - the old "../captures"
 # default silently depended on being run from tools/.
@@ -575,8 +579,14 @@ def main():
     base_url = "http://127.0.0.1:%d" % srv.server_address[1]
 
     def get(path):
-        with urlopen(base_url + path, timeout=5) as r:
-            return r.status, r.read().decode()
+        # An error status is a result here, not an exception: /pose answers 409
+        # when nothing is recording, and that response is exactly what the
+        # operator's page has to render.
+        try:
+            with urlopen(base_url + path, timeout=5) as r:
+                return r.status, r.read().decode()
+        except HTTPError as e:
+            return e.code, e.read().decode()
 
     try:
         code, body = get("/")
@@ -678,6 +688,57 @@ def main():
               "gain %d, mix %d, palette %s" % (cfg["gain"], cfg["mix"], cfg["palette"]))
         check("a session with no radar reports none rather than dead knobs",
               cfg["radar"] is None)
+
+        # --- /pose: the station stamp (V3 plan section 5d)
+        # The recorder has carried pose_id since it was written but nothing
+        # could set it, so every session so far went to disk unlabelled.
+        check("a viewer that is not recording reports no pose at all",
+              json.loads(get("/ui")[1])["pose"] is None)
+        code, body = get("/pose?id=N04")
+        check("stamping without a recording fails loudly rather than silently",
+              code == 409 and "not recording" in json.loads(body)["error"],
+              "HTTP %d" % code)
+
+        tmp = tempfile.mkdtemp(prefix="posetest-")
+        try:
+            good["video"] = recorder.SessionRecorder(tmp, fps=30)
+            p = json.loads(get("/ui")[1])["pose"]
+            check("a recording with no stamp yet reads as unlabelled, not absent",
+                  p is not None and p["id"] is None and p["stamped"] == 0)
+
+            code, body = get("/pose?id=N04")
+            check("/pose stamps the station and echoes it back",
+                  code == 200 and json.loads(body)["pose"] == "N04")
+            check("the recorder is what actually changed",
+                  good["video"].pose_id == "N04")
+            check("/ui reports the stamp the operator's phone is waiting on",
+                  json.loads(get("/ui")[1])["pose"]["id"] == "N04")
+
+            # The id must reach the row, not just meta.json: 'which frames are
+            # pose N04' is the question the solver asks, and it asks it of
+            # frames.jsonl.
+            good["video"].write(np.zeros((8, 8, 3), np.uint8))
+            get("/pose?id=N05")
+            good["video"].write(np.zeros((8, 8, 3), np.uint8))
+            get("/pose?clear=1")
+            check("clearing leaves the frames unlabelled again",
+                  good["video"].pose_id is None)
+            good["video"].write(np.zeros((8, 8, 3), np.uint8))
+            good["video"].close()
+
+            rows = [json.loads(l) for l in
+                    open(os.path.join(tmp, "frames.jsonl"))]
+            check("every frame carries the station that was live when it was written",
+                  [r.get("pose_id") for r in rows] == ["N04", "N05", None],
+                  " ".join(str(r.get("pose_id")) for r in rows))
+            marks = json.load(open(os.path.join(tmp, "meta.json")))["poses"]
+            check("meta.json records where each station started",
+                  [(m["pose_id"], m["first_frame"]) for m in marks]
+                  == [("N04", 0), ("N05", 1), (None, 2)],
+                  str([(m["pose_id"], m["first_frame"]) for m in marks]))
+        finally:
+            good.pop("video", None)
+            shutil.rmtree(tmp, ignore_errors=True)
     finally:
         srv.shutdown()
 

@@ -133,6 +133,15 @@ class SessionRecorder:
         self._update_meta(poses=poses)
         return self.pose_id
 
+    def meta_poses(self):
+        """The pose marks written so far, oldest first.
+
+        A copy: callers are the HTTP thread reporting progress to the operator,
+        and handing out the live list would let a poll iterate it while the
+        capture thread appends to it.
+        """
+        return list(self._meta.get('poses', []))
+
     def close(self):
         self._update_meta(closed_wall=time.strftime('%Y-%m-%dT%H:%M:%S%z'),
                           frames=self.frames)
