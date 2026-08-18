@@ -1,0 +1,39 @@
+<!doctype html><html dir="rtl"><head><meta charset="utf-8"><title>סימון רפלקטור</title>
+<style>body{font-family:sans-serif;background:#111;color:#eee;margin:0;padding:10px}
+#wrap{position:relative;display:inline-block;direction:ltr}
+canvas{border:1px solid #444;cursor:crosshair;image-rendering:pixelated}
+button{font-size:18px;padding:8px 14px;margin:4px}
+.done{color:#4f4}.todo{color:#fa4}#list span{margin:0 6px;cursor:pointer}
+#zoom{border:1px solid #444;image-rendering:pixelated;background:#000}
+</style></head><body>
+<h2>סימון הרפלקטור — <span id="title"></span></h2>
+<div>לחיצה = לסמן את <b>הקודקוד</b> (הפינה הפנימית) של הרפלקטור. גלגלת/‎+‎/‎−‎ = זום. חצים = תחנה הבאה/קודמת. אפשר ללחוץ שוב לתקן.</div>
+<div id="list"></div>
+<div style="display:flex;gap:10px;align-items:flex-start;direction:ltr">
+<div id="wrap"><canvas id="c" width="640" height="400"></canvas></div>
+<canvas id="zoom" width="240" height="240"></canvas>
+</div>
+<div>
+<button onclick="prev()">◀ קודם</button><button onclick="next()">הבא ▶</button>
+<button onclick="frame(-1)">פריים אחר</button>
+<button onclick="skip()">אין רפלקטור בתמונה (דלג)</button>
+<span id="status"></span></div>
+<script>
+let S={},P={},keys=[],cur=0,fi=1,scale=1,img=new Image();
+const c=document.getElementById('c'),ctx=c.getContext('2d'),z=document.getElementById('zoom'),zc=z.getContext('2d');
+fetch('/stations').then(r=>r.json()).then(d=>{S=d.stations;P=d.picks;keys=Object.keys(S).sort();show();});
+function show(){const k=keys[cur];document.getElementById('title').textContent=k+'  ('+(cur+1)+'/'+keys.length+')';
+ img.onload=()=>{draw();};img.src='/img/'+S[k][Math.min(fi,S[k].length-1)];
+ document.getElementById('list').innerHTML=keys.map((x,i)=>'<span class="'+(P[x]?'done':'todo')+(i==cur?'" style="text-decoration:underline':'')+'" onclick="cur='+i+';fi=1;show()">'+x+(P[x]&&P[x].skip?'✗':(P[x]?'✓':''))+'</span>').join('');}
+function draw(){c.width=640*scale;c.height=400*scale;ctx.imageSmoothingEnabled=false;ctx.drawImage(img,0,0,c.width,c.height);
+ const p=P[keys[cur]];if(p&&!p.skip){ctx.strokeStyle='#f0f';ctx.lineWidth=1;ctx.beginPath();ctx.arc(p.u*scale,p.v*scale,8,0,7);ctx.moveTo(p.u*scale-12,p.v*scale);ctx.lineTo(p.u*scale+12,p.v*scale);ctx.moveTo(p.u*scale,p.v*scale-12);ctx.lineTo(p.u*scale,p.v*scale+12);ctx.stroke();}
+ document.getElementById('status').textContent=p?(p.skip?'דולג':('u='+p.u.toFixed(1)+' v='+p.v.toFixed(1))):'לא סומן';}
+c.addEventListener('mousemove',e=>{const r=c.getBoundingClientRect();const u=(e.clientX-r.left)/scale,v=(e.clientY-r.top)/scale;zc.imageSmoothingEnabled=false;zc.clearRect(0,0,240,240);zc.drawImage(img,u-15,v-15,30,30,0,0,240,240);zc.strokeStyle='#f0f';zc.beginPath();zc.moveTo(120,0);zc.lineTo(120,240);zc.moveTo(0,120);zc.lineTo(240,120);zc.stroke();});
+c.addEventListener('click',e=>{const r=c.getBoundingClientRect();const u=(e.clientX-r.left)/scale,v=(e.clientY-r.top)/scale;const k=keys[cur];P[k]={u:u,v:v,frame:S[k][Math.min(fi,S[k].length-1)]};save(k);draw();});
+c.addEventListener('wheel',e=>{e.preventDefault();scale=Math.max(1,Math.min(4,scale+(e.deltaY<0?0.5:-0.5)));draw();});
+function save(k){fetch('/',{method:'POST',body:JSON.stringify({[k]:P[k]})}).then(()=>show());}
+function next(){cur=Math.min(keys.length-1,cur+1);fi=1;show();}function prev(){cur=Math.max(0,cur-1);fi=1;show();}
+function frame(){fi=(fi+1)%S[keys[cur]].length;show();}
+function skip(){const k=keys[cur];P[k]={skip:true};save(k);}
+document.addEventListener('keydown',e=>{if(e.key=='ArrowRight')prev();if(e.key=='ArrowLeft')next();if(e.key=='+')scale=Math.min(4,scale+0.5),draw();if(e.key=='-')scale=Math.max(1,scale-0.5),draw();});
+</script></body></html>

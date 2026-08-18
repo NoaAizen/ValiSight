@@ -1,20 +1,33 @@
-% radar_people_measure_bias.cfg -- range bias / RX phase calibration for Mode P.
-% Identical to radar_people.cfg except for the two lines marked below.
+% radar_people.cfg -- IWR1843BOOST, mmWave SDK 3.x OOB demo, 10 fps.
+% Mode P of SCAN-MODES-PLAN.md: PEOPLE, 2-15 m. The operational mode.
 %
-% DERIVED, NOT YET MEASURED. radar/chirp.py computes these from the fields
-% below, and tools/tests/test_chirp.py asserts the same code reproduces the
-% three numbers that WERE measured on this board for radar_10hz.cfg
-% (0.0436 m grid, +-0.649 m/s, 11.16 m). That anchors the formulas; it does
-% not make the numbers here observations. SCAN-MODES-PLAN gate 2 does.
+% RUN ON THIS BOARD 2026-08-16. Every line accepted, no Error, sensorStart Done
+% -- the 768 KB radar cube loads, so the 48-loop fallback below is not needed.
+% radar/chirp.py derives the figures, tools/tests/test_chirp.py asserts the same
+% code reproduces the three that were measured off radar_10hz.cfg, and then the
+% board was asked directly, over 600 stage-1 frames and 400 recorded ones:
 %
-%   range resolution      0.0703 m   coarser than Mode C's 0.0436, on purpose
-%   max unambiguous range 17.99 m    fold margin past the 15 m envelope
-%   max unambiguous vel   +-4.99 m/s, resolution 0.156 m/s (64 Doppler bins)
-%   HPF blind zone        0.604 m    it MOVED: the corner is a frequency, the
-%                                    blind range is that frequency over the
-%                                    slope, and the slope changed
-%   active / period       12.29 / 100 ms
-%   radar cube            768 KB     tight against L3; see the frameCfg note
+%                        derived    MEASURED
+%   range resolution     0.0703 m   0.0702 m  grid fit over 1701 points, mean
+%                                             residual 0.0044 m; the old
+%                                             0.0436 m grid gives 0.0114
+%   Doppler step         0.1559     0.1557    spacing of the reported values
+%   max unambiguous vel  +-4.99 m/s    --     needs a fast target to confirm
+%   max unambiguous rng  17.99 m    8.79 m seen -- the room, not the limit
+%   HPF blind zone       0.604 m    0.62 m    nearest point reported
+%   active / period      12.29 / 100 ms
+%   link                    --      PASS: 600 frames, 0 bad gaps, 0 bytes lost,
+%                                   10.00 fps, frames 192-320 B
+%   interframe margin       --      84.50-84.56 ms, i.e. 15.5% of the frame
+%                                   period consumed. Mode C ran at 24.5%: the
+%                                   shorter chirp train more than pays for the
+%                                   4x deeper Doppler FFT, so the deeper
+%                                   velocity axis costs NOTHING in headroom
+%   die temperature         --      36-38 C
+%
+% STILL UNMEASURED, and each needs something in front of the radar: the exit
+% gate (a walker at 12 m, detected in >=90% of frames, v != 0, no aliasing
+% markers), and the range-bias/phase re-calibration flagged further down.
 %
 % WHY THIS CONFIG EXISTS AT ALL. Under radar_10hz.cfg v_max is 0.649 m/s, so a
 % person walking at 1.2-1.4 m/s folds to |v| <= 0.10 and reads as static: 76-99.8%
@@ -68,23 +81,21 @@ clutterRemoval -1 0
 calibDcRangeSig -1 0 -5 8 256
 extendedMaxVelocity -1 0
 lvdsStreamCfg -1 0 0 0
-% Measurement variant of radar_people.cfg: rangeBias 0.0 and TI's default phase
-% table, i.e. UNCALIBRATED on purpose. Mode P sweeps a different band than
-% radar_10hz.cfg (2.13 GHz sampled vs 3.44), so the phase table solved for that
-% profile is being applied at frequencies it was never fitted at, and a residual
-% range bias becomes a constant depth offset that solvePnP absorbs into t as a
-% fake lever arm which then breaks at every other distance.
+% ############ UNVERIFIED FOR THIS PROFILE ############
+% Carried over from radar_10hz.cfg, where it was measured on 2026-08-10 against
+% a 14 cm TCR at 1.5 m boresight. The rangeBias term should survive the profile
+% change -- it is a fixed RF/antenna delay expressed in metres, and c*tau/2 does
+% not care about the slope. THE PER-CHANNEL PHASE TABLE IS NOT SO LUCKY: it was
+% fitted over a 3.44 GHz sampled band and this profile sweeps 2.13 GHz, so the
+% phases are being applied at frequencies they were not measured at.
 %
-% Procedure, same as radar_10hz_measure_bias.cfg: corner reflector at 1.5 m
-% boresight, vertex at antenna height, run, take the component-wise MEDIAN over
-% a few hundred frames, paste the table back into radar_people.cfg.
-%
-% Do this BEFORE recording any session that becomes training data. A boresight
-% that moves between sessions puts a label on the wrong track.
-compRangeBiasAndRxChanPhase 0.0 1 0 -1 0 1 0 -1 0 1 0 -1 0 1 0 -1 0 1 0 -1 0 1 0 -1 0
-% 2026-08-18: window widened 0.2 -> 1.0 m; with 0.2 the raw peak (bias ~+0.06..0.13 m) sat on the window edge and the
-%   measurement locked onto noise (runs 1-2). 1.0 m still excludes everything else on a cleared boresight.
-measureRangeBiasAndRxChanPhase 1 1.5 1.0
+% Consequence if it is wrong: a boresight shift, which is exactly what
+% T_camera_radar.json's (R,t) absorbed last time -- see the warning on the same
+% line in radar_10hz.cfg. Re-run radar_people_measure_bias.cfg against the TCR
+% BEFORE trusting any projection from this profile, and before recording
+% anything that will be used as training data.
+compRangeBiasAndRxChanPhase 0.0827654 0.97766 0.21017 0.85803 0.24323 0.58871 0.66953 0.67664 0.58447 0.78122 0.28757 0.69891 0.35345 0.40619 0.61334 0.51917 0.63443 0.81543 0.47922 0.66461 0.50806 0.37115 0.78207 0.54428 0.79688
+measureRangeBiasAndRxChanPhase 0 1.5 0.2
 CQRxSatMonitor 0 3 5 121 0
 CQSigImgMonitor 0 127 4
 analogMonitor 0 0

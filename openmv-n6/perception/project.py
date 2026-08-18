@@ -17,7 +17,7 @@ import numpy as np
 
 ART = os.path.join(os.path.dirname(__file__), '..', 'calib-artifacts')
 
-VALID_RANGE_M = (1.5, 3.5)
+VALID_RANGE_M = (2.0, 8.6)   # 2026-08-18 calibration (was 1.5-3.5)
 
 
 class RadarProjector:

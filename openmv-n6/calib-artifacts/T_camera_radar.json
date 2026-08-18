@@ -1,69 +1,40 @@
 {
-  "yaw_deg": -1.0924371128541102,
-  "R": [
-    [
-      -0.01906546927667812,
-      -0.9998182374218126,
-      0.0
-    ],
-    [
-      0.0,
-      0.0,
-      -1.0
-    ],
-    [
-      0.9998182374218126,
-      -0.01906546927667812,
-      0.0
-    ]
+ "yaw_deg": -0.06299880274262508,
+ "pitch_deg": -4.314063298156262,
+ "R": [
+  [
+   0.0010995363111202011,
+   -0.9999993955097676,
+   0.0
   ],
-  "t_m": [
-    0.01697842887437343,
-    0.047,
-    0.0
+  [
+   -0.07522343903854882,
+   -8.27109526681843e-05,
+   -0.9971666998943116
   ],
-  "formulation": "V2-plan sec 8.2 reduced: yaw+tx fit on image-u of 5 clean TCR holds; pitch=roll=0, t_y=+0.047 (caliper), t_z=0 (coplanar boards) mechanical",
-  "fit_holds": [
-    "hold_39",
-    "hold_44",
-    "hold_52",
-    "hold_53",
-    "hold_57"
-  ],
-  "excluded": {
-    "hold_50": "el anomaly +9.5deg, du inconsistent with hold_52 at same range/side",
-    "hold_51": "moving-flagged, du inconsistent with hold_52 at same range/side",
-    "others": "pick-vs-radar azimuth mismatch (clutter holds / mid-placement)"
-  },
-  "K_source": "calib-artifacts/calib.json (f tape-fixed 525)",
-  "convention": "p_C = R @ p_R + t; radar x fwd y left z up; camera x right y down z fwd",
-  "du_median_px": 0.9634721802376021,
-  "du_max_px": 7.947706561195844,
-  "dv_note": "v not fit: radar el sigma and pick-v slop dominate; mechanical vertical geometry used",
-  "valid_range_m": [
-    1.5,
-    3.5
-  ],
-  "validation_2026_08_10": {
-    "method": "fresh TCR placements, radar median vs my vertex-pixel estimate",
-    "V-A": {
-      "range_m": 2.45,
-      "note": "center; du +15 px (radar az +3.6 vs pixel az +1.3)"
-    },
-    "V-B": {
-      "range_m": 3.19,
-      "note": "left ~-18deg; du +35 px - worst case, left side never in fit set"
-    },
-    "V-C": {
-      "range_m": 2.0,
-      "note": "center; auto-picked cluster was the TABLE EDGE (el -4.8, snr 18.5); the true TCR cluster (el 0, snr 25.3) gives du -17 px"
-    },
-    "verdict": "horizontal projection lands on the target within ~35 px worst case at 1.5-3.2 m; vertical is mechanical-geometry only (radar el unusable). Dominant error sources: target-furniture cluster contamination (the rolling table under the TCR) and residual az structure vs azimuth (plan sec 4b signature).",
-    "v2_actions": [
-      "isolate TCR on a tripod away from furniture",
-      "stations on BOTH azimuth sides in the fit set",
-      "investigate residual-vs-az slope (phase table / az scale)",
-      "el-aware cluster gating in extraction (do not take strongest in range gate)"
-    ]
-  }
+  [
+   0.9971660971167814,
+   0.001096420994773696,
+   -0.07522348451041046
+  ]
+ ],
+ "t_m": [
+  0.0,
+  0.0749,
+  0.0088
+ ],
+ "formulation": "REDUCED: yaw solved from horizontal (u) evidence only; t_x=0 (camera directly above radar, measured), t_y=+74.9 mm (caliper: camera above radar), t_z=+8.8 mm (caliper, depth; sign assumed camera behind radar - effect <0.3%), pitch solved from known-height stations (stage B), roll=0 (mechanical). Radar z NOT used: elevation on this rig reads ~3x true and low targets are dropped by aoaFovCfg el +-30.",
+ "valid_range_m": [
+  2.0,
+  8.6
+ ],
+ "du_median_px": 7.094467253053182,
+ "du_max_px": 23.465510645582583,
+ "holdout_du_median_px": 15.383135809742356,
+ "dv_note": "v calibrated via pitch from stations at antenna height (radar z := 0). For targets NOT at antenna height the radar z is still unusable on this rig - projected v is only correct near antenna height / far range.",
+ "K_source": "calib-artifacts/calib.json (Hagai, f=525 tape-anchored)",
+ "convention": "p_C = R @ p_R + t; radar x fwd y left z up; camera x right y down z fwd",
+ "source": "radar_rgb_2026-08-18.json (22 fit + 6 holdout stations, 2026-08-18)",
+ "radar_cfg_sha256": "b3e4a561b8de34ea0e3e9023a4acb370eb23098446dcfce6fa5449c2908625f7",
+ "previous": "T_camera_radar_2026-08-10.json (5 holds, yaw only) - superseded"
 }

@@ -1,0 +1,419 @@
+{
+ "name": "radar_rgb_2026-08-18",
+ "date": "2026-08-18",
+ "rig_id": "valisight-rig-1",
+ "mount_token": "locked-2026-08-18",
+ "formulation": "REDUCED: yaw solved from horizontal (u) evidence only; t_x=0 (camera directly above radar, measured), t_y=+74.9 mm (caliper: camera above radar), t_z=+8.8 mm (caliper, depth; sign assumed camera behind radar - effect <0.3%), pitch solved from known-height stations (stage B), roll=0 (mechanical). Radar z NOT used: elevation on this rig reads ~3x true and low targets are dropped by aoaFovCfg el +-30.",
+ "frames": "radar: x fwd, y left, z up (mmwave.py project frame). camera: x right, y down, z fwd (OpenCV). P_cam = R @ P_radar + t",
+ "yaw_deg": -0.06299880274262508,
+ "yaw_bootstrap_std_deg": 0.23505936815620404,
+ "t_cam_m": [
+  0.0,
+  0.0749,
+  0.0088
+ ],
+ "R_cam_from_radar": [
+  [
+   0.0010995363111202011,
+   -0.9999993955097676,
+   0.0
+  ],
+  [
+   -0.07522343903854882,
+   -8.27109526681843e-05,
+   -0.9971666998943116
+  ],
+  [
+   0.9971660971167814,
+   0.001096420994773696,
+   -0.07522348451041046
+  ]
+ ],
+ "T_cam_from_radar_4x4": [
+  [
+   0.0010995363111202011,
+   -0.9999993955097676,
+   0.0,
+   0.0
+  ],
+  [
+   -0.07522343903854882,
+   -8.27109526681843e-05,
+   -0.9971666998943116,
+   0.0749
+  ],
+  [
+   0.9971660971167814,
+   0.001096420994773696,
+   -0.07522348451041046,
+   0.0088
+  ],
+  [
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "T_radar_from_cam_4x4": [
+  [
+   0.0010995363111202011,
+   -0.0752234390385488,
+   0.9971660971167813,
+   -0.0031408260706403696
+  ],
+  [
+   -0.9999993955097676,
+   -8.27109526681843e-05,
+   0.001096420994773696,
+   -3.45345439916152e-06
+  ],
+  [
+   5.420670209462459e-21,
+   -0.9971666998943116,
+   -0.07522348451041046,
+   0.07534975248577555
+  ],
+  [
+   0.0,
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "K_rgb": [
+  [
+   525.0,
+   0.0,
+   306.40269598495223
+  ],
+  [
+   0.0,
+   525.0,
+   238.54588806925722
+  ],
+  [
+   0.0,
+   0.0,
+   1.0
+  ]
+ ],
+ "dist_rgb": [
+  -0.1171435057315308,
+  -0.04143977725451964,
+  0.024453833089887158,
+  0.00524832733429692,
+  0.0
+ ],
+ "image_size": [
+  640,
+  400
+ ],
+ "intrinsics_source": "calib-artifacts/calib.json (Hagai, f=525 tape-anchored)",
+ "radar_cfg": "radar/configs/radar_people.cfg",
+ "radar_cfg_sha256": "b3e4a561b8de34ea0e3e9023a4acb370eb23098446dcfce6fa5449c2908625f7",
+ "phase_table": "re-measured 2026-08-18 (compRangeBiasAndRxChanPhase 0.0610061 ...)",
+ "n_poses_fit": 22,
+ "n_poses_holdout": 6,
+ "working_range_m": [
+  1.98,
+  8.6
+ ],
+ "az_span_deg": [
+  -14.6,
+  20.2
+ ],
+ "fit": {
+  "n": 22,
+  "median_px": 7.094467253053182,
+  "p95_px": 18.285975697356225,
+  "max_px": 23.465510645582583,
+  "median_deg": 0.7742533933213674,
+  "p95_deg": 1.9956366318805792
+ },
+ "holdout": {
+  "n": 6,
+  "median_px": 15.383135809742356,
+  "p95_px": 25.046115365520222,
+  "max_px": 25.564227704526274,
+  "median_deg": 1.678835728713903,
+  "p95_deg": 2.7334032450325143
+ },
+ "acceptance": {
+  "V3_holdout_median_gate_deg": 0.72,
+  "met": false,
+  "note": "radar azimuth is quantised to ~1.8 deg FFT bins (values repeat: 3.6,5.4,7.2,12.6,16.4...) -> +-8 px floor per station; scatter is sensor resolution, not misalignment"
+ },
+ "per_station": [
+  {
+   "id": "F01",
+   "set": "fit",
+   "range_m": 2.262148438696619,
+   "az_deg": -13.011528699864332,
+   "snr": 17.9,
+   "du_px": -16.038155398891632,
+   "flag": ""
+  },
+  {
+   "id": "F02",
+   "set": "fit",
+   "range_m": 2.1917500033206854,
+   "az_deg": -3.6231287222495205,
+   "snr": 16.7,
+   "du_px": 10.761364271649029,
+   "flag": ""
+  },
+  {
+   "id": "F03",
+   "set": "fit",
+   "range_m": 2.262148629177403,
+   "az_deg": 16.353649180511816,
+   "snr": 17.5,
+   "du_px": 1.8092804232837807,
+   "flag": ""
+  },
+  {
+   "id": "F04",
+   "set": "fit",
+   "range_m": 2.3325471946720158,
+   "az_deg": 16.335496487226045,
+   "snr": 11.8,
+   "du_px": -6.761076807626296,
+   "flag": ""
+  },
+  {
+   "id": "F05",
+   "set": "fit",
+   "range_m": 1.9805540809075968,
+   "az_deg": 3.600158032557742,
+   "snr": 19.4,
+   "du_px": -17.0577764936657,
+   "flag": ""
+  },
+  {
+   "id": "F06",
+   "set": "fit",
+   "range_m": 2.6845404598649396,
+   "az_deg": 3.70741925486256,
+   "snr": 23.8,
+   "du_px": -1.0839869633688295,
+   "flag": ""
+  },
+  {
+   "id": "F07",
+   "set": "fit",
+   "range_m": 2.754939079436107,
+   "az_deg": -5.580750070140081,
+   "snr": 16.5,
+   "du_px": 11.92388364753748,
+   "flag": ""
+  },
+  {
+   "id": "F08",
+   "set": "fit",
+   "range_m": 2.825337645565777,
+   "az_deg": 16.818474773264764,
+   "snr": 12.3,
+   "du_px": 2.373346152518195,
+   "flag": ""
+  },
+  {
+   "id": "F10",
+   "set": "fit",
+   "range_m": 4.162911973954268,
+   "az_deg": -1.8051148759742588,
+   "snr": 19.9,
+   "du_px": 23.465510645582583,
+   "flag": ""
+  },
+  {
+   "id": "F11",
+   "set": "fit",
+   "range_m": 3.9517160418282637,
+   "az_deg": 12.701409616857331,
+   "snr": 11.6,
+   "du_px": 2.8715441990361796,
+   "flag": ""
+  },
+  {
+   "id": "F12",
+   "set": "fit",
+   "range_m": 3.9517159502338592,
+   "az_deg": -7.184730878040294,
+   "snr": 14.5,
+   "du_px": 5.1462619351245,
+   "flag": ""
+  },
+  {
+   "id": "F13",
+   "set": "fit",
+   "range_m": 3.036533595071366,
+   "az_deg": -14.55369428749783,
+   "snr": 11.3,
+   "du_px": 1.5957642850423497,
+   "flag": ""
+  },
+  {
+   "id": "F14",
+   "set": "fit",
+   "range_m": 3.036533602858875,
+   "az_deg": 16.356235924263753,
+   "snr": 11.5,
+   "du_px": -7.068281785046906,
+   "flag": ""
+  },
+  {
+   "id": "G01",
+   "set": "fit",
+   "range_m": 5.430087026695785,
+   "az_deg": 3.5852341963810757,
+   "snr": 15.6,
+   "du_px": 5.862277713580909,
+   "flag": ""
+  },
+  {
+   "id": "G02",
+   "set": "fit",
+   "range_m": 5.289289921797897,
+   "az_deg": -7.1870461909870516,
+   "snr": 14.1,
+   "du_px": 8.10191038780593,
+   "flag": ""
+  },
+  {
+   "id": "G03",
+   "set": "fit",
+   "range_m": 5.359688378613761,
+   "az_deg": 20.10978736949898,
+   "snr": 16.1,
+   "du_px": -2.9862271390074966,
+   "flag": ""
+  },
+  {
+   "id": "G04",
+   "set": "fit",
+   "range_m": 6.767661054962514,
+   "az_deg": 3.5925155317588056,
+   "snr": 11.3,
+   "du_px": -8.06444010493857,
+   "flag": ""
+  },
+  {
+   "id": "G05",
+   "set": "fit",
+   "range_m": 6.978856592757931,
+   "az_deg": -7.205363209772962,
+   "snr": 15.3,
+   "du_px": -12.082889513059854,
+   "flag": ""
+  },
+  {
+   "id": "G06",
+   "set": "fit",
+   "range_m": 7.330850239454097,
+   "az_deg": 20.215526948487312,
+   "snr": 13.5,
+   "du_px": 7.120652721059457,
+   "flag": "near glass door"
+  },
+  {
+   "id": "G07",
+   "set": "fit",
+   "range_m": 8.246031490889651,
+   "az_deg": 5.399557077866043,
+   "snr": 16.6,
+   "du_px": 9.59804473886453,
+   "flag": ""
+  },
+  {
+   "id": "G08",
+   "set": "fit",
+   "range_m": 8.316430134965474,
+   "az_deg": -1.8011275829957583,
+   "snr": 18.3,
+   "du_px": 0.4909583947831493,
+   "flag": ""
+  },
+  {
+   "id": "G09",
+   "set": "fit",
+   "range_m": 8.598024532324692,
+   "az_deg": 16.411532991181975,
+   "snr": 17.1,
+   "du_px": -18.35061776070836,
+   "flag": ""
+  },
+  {
+   "id": "V01",
+   "set": "holdout",
+   "range_m": 2.543743112998262,
+   "az_deg": -12.64665962783674,
+   "snr": 18.9,
+   "du_px": 25.564227704526274
+  },
+  {
+   "id": "V02",
+   "set": "holdout",
+   "range_m": 2.543743094946642,
+   "az_deg": 12.6436278639229,
+   "snr": 27.3,
+   "du_px": -14.767871227359763
+  },
+  {
+   "id": "V03",
+   "set": "holdout",
+   "range_m": 3.0365336407296346,
+   "az_deg": 5.379382121189163,
+   "snr": 15.3,
+   "du_px": 1.3565096949312192
+  },
+  {
+   "id": "V04",
+   "set": "holdout",
+   "range_m": 3.1069322144800977,
+   "az_deg": -7.18136545325184,
+   "snr": 11.8,
+   "du_px": 0.20249218804707425
+  },
+  {
+   "id": "V05",
+   "set": "holdout",
+   "range_m": 3.1773310590754145,
+   "az_deg": 12.667287530384733,
+   "snr": 15.1,
+   "du_px": -23.491778348502066
+  },
+  {
+   "id": "V06",
+   "set": "holdout",
+   "range_m": 3.036533644597646,
+   "az_deg": 3.6028533928849154,
+   "snr": 16.1,
+   "du_px": 15.99840039212495
+  }
+ ],
+ "excluded": {
+  "F09": "no radar detection (low target)",
+  "F15": "static lamp in same cell"
+ },
+ "invalidation": "any unbolting of camera/radar, lens change, radar cfg change (sha above), or new phase table",
+ "sessions": [
+  "calib_2026-08-18/session_fit",
+  "calib_2026-08-18/session_fit2"
+ ],
+ "v_axis_note": "v calibrated via pitch from stations at antenna height (radar z := 0). For targets NOT at antenna height the radar z is still unusable on this rig - projected v is only correct near antenna height / far range.",
+ "pitch_deg": -4.314063298156262,
+ "pitch_note": "solved from v of stations with vertex at antenna height (F10-F14, G01-G09; z_radar:=0), validated on V01-V05",
+ "fit_v": {
+  "n": 14,
+  "median_px": 2.617900373139534,
+  "p95_px": 7.57379439752166,
+  "max_px": 8.312555871100784
+ },
+ "holdout_v": {
+  "n": 5,
+  "median_px": 10.616419522177324,
+  "p95_px": 18.150865218239307,
+  "max_px": 18.169148776228695
+ }
+}

@@ -61,3 +61,22 @@ without the tape measurement.
   UART7 migration later requires the short re-validation of PDF sec. 11.
 - cfg must be re-sent (tools/send_radar_cfg.py) after every radar power
   cycle; live.py warns after 15 s of radar silence.
+
+=== 2026-08-18 calibration day - stage 0 (V3 plan) ===
+radar cfg      : radar/configs/radar_people.cfg
+cfg sha256     : b3e4a561b8de34ea0e3e9023a4acb370eb23098446dcfce6fa5449c2908625f7
+phase table    : RE-MEASURED on the 43.4 MHz/us profile (compRangeBiasAndRxChanPhase 0.0610061 ...),
+                 TCR on tripod 1.50 m boresight, 297/300 in-mode, comp spread <=0.033. Old 08-10 table kept
+                 commented in the cfg. Evidence: ~/ValiSight_noa/calib_2026-08-18/phase_table_run*.json
+                 measure window widened 0.2 -> 1.0 m (peak sat on the 0.2 m window edge).
+                 rangeBias is bin-quantised (0.07 m) by firmware -> verify vs tape at the stations.
+sign test      : project frame (x fwd, y left, z up), radar_people.cfg + new table
+                 TCR 1 m LEFT  -> y = +1.06 m (az -22.0 deg display, right-positive)   OK
+                 TCR 30 cm UP  -> z sign +, but el jumped -4.6 -> +23.8 deg (~0.9 m)   SIGN OK, MAGNITUDE UNUSABLE
+                 => elevation/z NOT trusted; formulation today = 4-DoF (yaw, pitch, tx, ty), tz fixed 47 mm caliper.
+warm-up        : radar die 46-50 C throughout (already at operating temperature).
+2026-08-18 result: 13 fit + 6 holdout stations, 2.0-4.2 m, az -15..+17 deg, three +44 cm holds.
+  reduced solve (u only, tz/ty mechanical): yaw +2.6 deg with tx +127 mm  OR yaw 0.1 with tx 0 - degenerate over this range.
+  fit median 5.9 px, HOLDOUT median 13.4 px (1.47 deg) -> V3 acceptance (0.72 deg) NOT met. Files: ~/ValiSight_noa/calib_2026-08-18/
+  Lessons: 14 cm TCR is threshold-limited (11-15 dB) beyond 3 m off-axis; aim (mouth at radar) worth 12 dB; radar az quantised ~1.8 deg;
+  radar restart (re-send cfg) recovers marginal detections; el filter drops ~25% of frames of low/edge targets.
