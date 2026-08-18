@@ -1,3 +1,7 @@
-bridge_rx
-bridge_rx_asan
-__pycache__/
+out/
+stats.txt
+view.log
+start.log
+holds_start_line.txt
+*.bin
+!recordings/**/*.bin
