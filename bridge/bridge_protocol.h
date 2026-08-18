@@ -17,8 +17,8 @@
  *   20    4    crc32     zlib CRC-32 over header bytes [4,20) + payload
  *
  * Payloads (all little-endian):
- *   THERMAL : u16 w, u16 h, u8 fmt(BRIDGE_PIX_*), u8 pad, then pixels
- *   RGB     : u16 w, u16 h, u8 fmt(BRIDGE_PIX_JPEG), u8 pad, then bytes
+ *   THERMAL : u16 w, u16 h, u8 fmt(BRIDGE_PIX_*), u8 flags (bit0 FFC in progress, bit1 FFC known), then pixels
+ *   RGB     : u16 w, u16 h, u8 fmt(BRIDGE_PIX_JPEG), u8 flags (0), then bytes
  *   IMU     : i32 ax,ay,az [milli-g]  i32 gx,gy,gz [milli-deg/s]
  *   HELLO   : u32 proto_ver, u32 sender_drops (records the N6 itself gave up
  *             on because USB was not draining), u32 imu_overflow (IMU samples

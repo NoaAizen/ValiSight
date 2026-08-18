@@ -138,6 +138,9 @@ def test_ffc_flat_or_frozen():
     assert ffc_in_progress(flat) is True
     assert ffc_in_progress(scene) is False
     assert ffc_in_progress(scene, scene) is True          # frozen frame
+    # sensor flag wins over the image heuristic, both ways
+    assert ffc_in_progress(scene, None, flags=3) is True
+    assert ffc_in_progress(flat, None, flags=2) is False
 
 
 def test_camera_geometry_from_measured_K():
@@ -152,10 +155,16 @@ def test_thermal_tail_reads_frames_csv():
     open(os.path.join(d, "%010d_thermal.bin" % 7), "wb").write(
         _thermal_payload(rows=lambda y, x: (x + y) % 256))
     with open(os.path.join(d, "frames.csv"), "w") as f:
-        f.write("seq,type,ts_ticks,ts_src,host_ms,len\n7,thermal,20000,0,1025,19206\n8,rgb,21000,0,1026,900\n")
+        f.write("seq,type,ts_ticks,ts_src,host_ms,len,flags\n7,thermal,20000,0,1025,19206,2\n8,rgb,21000,0,1026,900,0\n")
     t = ThermalTail(d, m)
     fr = t.thermal_frame()
     assert fr["seq"] == 7 and fr["timestamp_ms"] == 1025 and fr["ffc_in_progress"] is False
+    assert fr["ffc_source"] == "sensor"
+    with open(os.path.join(d, "frames.csv"), "a") as f:
+        f.write("9,thermal,30000,0,1035,19206,3\n")
+    open(os.path.join(d, "%010d_thermal.bin" % 9), "wb").write(_thermal_payload(rows=lambda y, x: (x + y) % 256))
+    fr = t.thermal_frame()
+    assert fr["seq"] == 9 and fr["ffc_in_progress"] is True and fr["ffc_source"] == "sensor"
     assert len(fr["temps_c"]) == W * H
 
 

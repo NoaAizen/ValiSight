@@ -83,7 +83,7 @@ static void rx_init(bridge_rx_t *r, const char *dump_dir)
         snprintf(p, sizeof p, "%s/frames.csv", dump_dir);
         r->frames_csv = fopen(p, "a");
         if (r->frames_csv && ftell(r->frames_csv) == 0)
-            fprintf(r->frames_csv, "seq,type,ts_ticks,ts_src,host_ms,len\n");
+            fprintf(r->frames_csv, "seq,type,ts_ticks,ts_src,host_ms,len,flags\n");
     }
 }
 
@@ -128,9 +128,10 @@ static void rx_deliver(bridge_rx_t *r, const bridge_hdr_t *h, const uint8_t *pay
         FILE *f = fopen(p, "wb");
         if (f) { fwrite(payload, 1, h->len, f); fclose(f); }
         if (r->frames_csv) {
-            fprintf(r->frames_csv, "%u,%s,%lld,%u,%lld,%u\n", h->seq,
+            fprintf(r->frames_csv, "%u,%s,%lld,%u,%lld,%u,%u\n", h->seq,
                     h->type == BRIDGE_T_THERMAL ? "thermal" : "rgb",
-                    (long long)r->ts_unwrapped, h->ts_src, (long long)r->host_ms, h->len);
+                    (long long)r->ts_unwrapped, h->ts_src, (long long)r->host_ms, h->len,
+                    h->len >= 6 ? (unsigned)payload[5] : 0u);   /* image flags byte: bit0 FFC */
             fflush(r->frames_csv);
         }
     }

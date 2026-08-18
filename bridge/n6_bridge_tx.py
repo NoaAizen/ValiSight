@@ -68,8 +68,8 @@ class Bridge:
             return self.hello(now)
         return None
 
-    def thermal(self, pixels, ts, w=160, h=120):
-        return self._send(bp.T_THERMAL, ts, pixels, bp.image_prefix(w, h, bp.PIX_GRAY8))
+    def thermal(self, pixels, ts, w=160, h=120, flags=0):
+        return self._send(bp.T_THERMAL, ts, pixels, bp.image_prefix(w, h, bp.PIX_GRAY8, flags))
 
     def rgb_jpeg(self, jpeg, ts, w=320, h=240):
         return self._send(bp.T_RGB, ts, jpeg, bp.image_prefix(w, h, bp.PIX_JPEG))
@@ -197,6 +197,17 @@ def main():
         cam.ioctl(csi.IOCTL_LEPTON_SET_RANGE, MIN_C, MAX_C)
         return cam
 
+    LEP_SYS_FFC_STATUS = 0x0244        # Lepton SDK: LEP_CID_SYS_FFC_STATUS -> LEP_SYS_STATUS_E (1 = BUSY = FFC running)
+
+    def ffc_flags(cam):
+        """bit0 = FFC in progress, bit1 = status known. One I2C read, ~3.9 ms
+        (measured 2026-08-18; after a forced FFC the flag stays up ~1.35 s)."""
+        try:
+            st = cam.ioctl(csi.IOCTL_LEPTON_GET_ATTRIBUTE, LEP_SYS_FFC_STATUS, 2)
+            return bp.IMG_FLAG_FFC_KNOWN | (bp.IMG_FLAG_FFC if st[0] == 1 else 0)
+        except Exception:
+            return 0
+
     def grab(cam):
         for _ in range(10):
             try:
@@ -248,7 +259,7 @@ def main():
                 lep_miss = 0
         else:
             lep_miss = 0
-            br.thermal(t.bytearray(), t_ts, t.width(), t.height())
+            br.thermal(t.bytearray(), t_ts, t.width(), t.height(), ffc_flags(lep))
 
         if ring is not None:
             br.imu_ring(ring)                         # ~22 samples per thermal frame at 200 Hz

@@ -6,10 +6,16 @@ N6, host_ms). הפריים מגיע מה-N6 כ-160×120 GRAY8 אחרי מיפו�
 כלומר 0..255 = 15..45 °C, צעד 0.118 °C. thermal_frame() מחזיר גם את
 הבתים הגולמיים וגם מערך °C.
 
-FFC (כיול-מסך של הלפטון, "flat-field correction"): התריס נסגר ל-~0.5–1 ש',
-התמונה הופכת אחידה. אין עדיין דגל מהחיישן דרך הגשר (יידרש record חדש
-בפרוטוקול); כאן זיהוי מהתמונה — סטיית תקן נמוכה מאוד או פריים קפוא
-זהה לקודמו. אמין לסצנה רגילה; קיר חלק לגמרי בשדה הראייה עלול לתת דגל-שווא.
+FFC (כיול-מסך של הלפטון, "flat-field correction"): התריס נסגר ל-~1–1.5 ש',
+התמונה הופכת אחידה. **הדגל מגיע מהחיישן עצמו**: השולח על ה-N6 קורא
+LEP_CID_SYS_FFC_STATUS (I2C, 3.9 ms) לכל פריים ושם אותו בבית הדגלים של כותרת
+התמונה (bit0 = FFC רץ, bit1 = נקרא בהצלחה). bridge_rx כותב אותו בעמודת flags
+של frames.csv. אם הדגל לא ידוע (שולח ישן / קריאה נכשלה) — נופלים לזיהוי
+מהתמונה (סטיית תקן נמוכה מאוד או פריים קפוא). **הזיהוי מהתמונה חלש**: ב-FFC
+טבעי שנמדד 18.8 (19 פריימים, 2.3 ש') הלפטון החזיק את הפריים האחרון עם רעש
+קטן — סטיית התקן לא זזה והבתים לא היו זהים — הניחוש פספס לגמרי. אחרי ה-FFC
+הממוצע קפץ ב-~20 רמות (≈2.4 °C): כיול-מחדש אמיתי, לא תנועה. הדגל מהחיישן
+הוא הדרך היחידה האמינה.
 
 בנוסף: הלפטון הזה נושא 14 שורות מתות (בלי מידע סצנה) — ראה
 valisight-lepton-dead-rows. הפריים כאן גולמי; התיקון הוא בצד של חגי (lepton_fix).
@@ -75,8 +81,13 @@ def frame_stats(gray_bytes):
     return mean, math.sqrt(var)
 
 
-def ffc_in_progress(gray_bytes, prev_gray_bytes=None):
-    """True אם הפריים "שטוח" (תריס סגור) או קפוא זהה לקודם."""
+IMG_FLAG_FFC, IMG_FLAG_FFC_KNOWN = 1, 2       # == bridge_protocol.IMG_FLAG_*
+
+
+def ffc_in_progress(gray_bytes, prev_gray_bytes=None, flags=0):
+    """הדגל מהחיישן אם ידוע; אחרת: פריים "שטוח" (תריס סגור) או קפוא זהה לקודם."""
+    if flags & IMG_FLAG_FFC_KNOWN:
+        return bool(flags & IMG_FLAG_FFC)
     if prev_gray_bytes is not None and gray_bytes == prev_gray_bytes:
         return True
     _, sd = frame_stats(gray_bytes)
@@ -114,7 +125,8 @@ class ThermalTail:
                 continue
             try:
                 rec = {"seq": int(f[0]), "ts_ticks": int(f[2]), "ts_src": int(f[3]),
-                       "host_ms": int(f[4]), "len": int(f[5])}
+                       "host_ms": int(f[4]), "len": int(f[5]),
+                       "flags": int(f[6]) if len(f) > 6 and f[6].strip().isdigit() else 0}
             except ValueError:
                 continue
             self.clock_map.observe(rec["ts_ticks"], rec["ts_src"], rec["host_ms"])
@@ -152,6 +164,7 @@ class ThermalTail:
                 "temps_c": gray_to_celsius(gray) if celsius else None,
                 "range_c": (MIN_C, MAX_C),
                 "timestamp_ms": ts, "seq": self.last["seq"],
-                "ffc_in_progress": ffc_in_progress(gray, self._prev_gray),
+                "ffc_in_progress": ffc_in_progress(gray, self._prev_gray, self.last["flags"]),
+                "ffc_source": "sensor" if self.last["flags"] & IMG_FLAG_FFC_KNOWN else "image",
                 "mean_c": round(MIN_C + mean * (MAX_C - MIN_C) / 255.0, 2),
                 "std_gray": round(sd, 2)}

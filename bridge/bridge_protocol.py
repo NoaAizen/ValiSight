@@ -25,7 +25,8 @@ PIX_GRAY8, PIX_JPEG = 0, 1
 # header after the magic: type u8, ts_src u8, reserved u16, seq u32, ts u32, len u32
 _HDR_BODY = "<BBHIII"          # 16 bytes: offsets 4..20
 _CRC = "<I"                    # offset 20..24
-_IMG = "<HHBB"                 # w, h, fmt, pad
+_IMG = "<HHBB"                 # w, h, fmt, flags (bit0 = FFC in progress, bit1 = FFC status known; 0 = legacy pad)
+IMG_FLAG_FFC, IMG_FLAG_FFC_KNOWN = 1, 2
 _IMU = "<iiiiii"               # ax ay az [mg], gx gy gz [mdeg/s]
 _HELLO = "<III"                # proto_ver, sender_drops, imu_overflow
 
@@ -40,13 +41,15 @@ def pack(rtype, ts_src, seq, ts, payload):
     return MAGIC + body + struct.pack(_CRC, _crc(body, payload)) + payload
 
 
-def image_payload(w, h, fmt, data):
-    return struct.pack(_IMG, w, h, fmt, 0) + data
+def image_payload(w, h, fmt, data, flags=0):
+    return struct.pack(_IMG, w, h, fmt, flags) + data
 
 
-def image_prefix(w, h, fmt):
-    """The 6-byte image sub-header alone (for zero-copy sends: header+prefix, then pixels)."""
-    return struct.pack(_IMG, w, h, fmt, 0)
+def image_prefix(w, h, fmt, flags=0):
+    """The 6-byte image sub-header alone (for zero-copy sends: header+prefix, then pixels).
+    flags: IMG_FLAG_FFC (Lepton shutter/FFC in progress: frame is NOT scene data),
+    IMG_FLAG_FFC_KNOWN (the sender actually read the sensor; 0 = unknown/legacy)."""
+    return struct.pack(_IMG, w, h, fmt, flags)
 
 
 def pack_header(rtype, ts_src, seq, ts, prefix, payload):
@@ -136,6 +139,11 @@ class Decoder:
 def unpack_image(payload):
     w, h, fmt, _ = struct.unpack(_IMG, payload[:6])
     return w, h, fmt, payload[6:]
+
+
+def image_flags(payload):
+    """The flags byte of an image payload (IMG_FLAG_*)."""
+    return payload[5] if len(payload) >= 6 else 0
 
 
 def unpack_imu(payload):

@@ -137,6 +137,18 @@ def test_imu_ring_keeps_ticks_that_arrive_while_packing():
     out = ring.drain(); assert [o[0] for o in out] == [60, 61] and ring.ix == 0
 
 
+
+def test_thermal_carries_ffc_flags():
+    """5.2 for Yael: the FFC state read from the Lepton rides in the image flags byte."""
+    link = FakeLink(); br = Bridge(link.write, lambda: 0)
+    br.thermal(b"\x00" * 6, 5, w=3, h=2, flags=bp.IMG_FLAG_FFC | bp.IMG_FLAG_FFC_KNOWN)
+    br.thermal(b"\x00" * 6, 6, w=3, h=2, flags=bp.IMG_FLAG_FFC_KNOWN)
+    br.thermal(b"\x00" * 6, 7, w=3, h=2)                      # legacy: unknown
+    recs, _ = decode(link)
+    assert [bp.image_flags(r[4]) for r in recs] == [3, 2, 0]
+    assert bp.unpack_image(recs[0][4])[:3] == (3, 2, bp.PIX_GRAY8)
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):
