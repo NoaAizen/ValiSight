@@ -5,3 +5,5 @@ start.log
 holds_start_line.txt
 *.bin
 !recordings/**/*.bin
+bridge_rx
+bridge_rx_asan
