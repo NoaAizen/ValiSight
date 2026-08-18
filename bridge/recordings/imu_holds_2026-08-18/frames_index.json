@@ -1,0 +1,58 @@
+{
+ "hold_01": {
+  "imu_seq": [
+   205912,
+   206769
+  ],
+  "thermal_frames": 35
+ },
+ "hold_02": {
+  "imu_seq": [
+   207150,
+   213772
+  ],
+  "thermal_frames": 266
+ },
+ "hold_03": {
+  "imu_seq": [
+   213811,
+   214277
+  ],
+  "thermal_frames": 19
+ },
+ "hold_04": {
+  "imu_seq": [
+   215478,
+   216592
+  ],
+  "thermal_frames": 45
+ },
+ "hold_05": {
+  "imu_seq": [
+   216935,
+   218132
+  ],
+  "thermal_frames": 50
+ },
+ "hold_06": {
+  "imu_seq": [
+   219326,
+   220229
+  ],
+  "thermal_frames": 36
+ },
+ "hold_07": {
+  "imu_seq": [
+   220744,
+   221194
+  ],
+  "thermal_frames": 18
+ },
+ "hold_08": {
+  "imu_seq": [
+   226210,
+   229773
+  ],
+  "thermal_frames": 143
+ }
+}
