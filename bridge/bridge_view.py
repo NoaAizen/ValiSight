@@ -66,7 +66,7 @@ class State:
         r = None
         for line in reversed(tail):            # the last line may still be half-written by bridge_rx
             f = line.split(",")
-            if len(f) == 9 and f[0].isdigit() and f[8].lstrip("-").isdigit(): r = f; break
+            if len(f) >= 9 and f[0].isdigit() and f[8].lstrip("-").isdigit(): r = f; break
         if r is None: return None
         ax, ay, az = (int(r[3]), int(r[4]), int(r[5])); gx, gy, gz = (int(r[6]) / 1000, int(r[7]) / 1000, int(r[8]) / 1000)
         mag = (ax * ax + ay * ay + az * az) ** 0.5

@@ -21,8 +21,9 @@ python3 n6_bridge_start.py --record s.bin --seconds 10   # בדיקה חיה + �
 ./bridge_rx s.bin -o out/                   # replay ההקלטה במקלט ה-C
 python3 n6_bridge_start.py && ./bridge_rx /dev/serial/by-id/usb-MicroPython_Pyboard* -o out/   # חי
 ```
-`out/` יכיל `<seq>_thermal.bin` / `<seq>_rgb.bin` (הנתונים כפי שנשלחו) ו-`imu.csv`
-עם חותמות זמן **פרוסות** (בלי גלישה).
+`out/` יכיל `<seq>_thermal.bin` / `<seq>_rgb.bin` (הנתונים כפי שנשלחו), `imu.csv`
+עם חותמות זמן **פרוסות** (בלי גלישה) + עמודת `host_ms` (שעון המחשב בקליטה = השעון המשותף),
+ו-`frames.csv` (seq, type, ts_ticks, ts_src, host_ms, len) לכל פריים. `imu.csv` נכתב שורה-שורה (קוראים חיים רואים כל דגימה תוך ms).
 
 ## תצוגה חיה בדפדפן
 ```

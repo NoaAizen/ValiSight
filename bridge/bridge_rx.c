@@ -63,6 +63,8 @@ typedef struct {
     /* sink */
     const char *dump_dir;
     FILE      *imu_csv;
+    FILE      *frames_csv;
+    int64_t   host_ms;        /* host CLOCK_MONOTONIC (ms) when the current chunk was read: the "shared clock" */
 } bridge_rx_t;
 
 static void rx_init(bridge_rx_t *r, const char *dump_dir)
@@ -75,8 +77,13 @@ static void rx_init(bridge_rx_t *r, const char *dump_dir)
         mkdir(dump_dir, 0755);
         snprintf(p, sizeof p, "%s/imu.csv", dump_dir);
         r->imu_csv = fopen(p, "a");
+        if (r->imu_csv) setvbuf(r->imu_csv, NULL, _IOLBF, 1 << 16);   /* line-buffered: live readers see each sample within ~5 ms, not 0.35 s */
         if (r->imu_csv && ftell(r->imu_csv) == 0)
-            fprintf(r->imu_csv, "seq,ts_ticks,ts_src,ax_mg,ay_mg,az_mg,gx_mdps,gy_mdps,gz_mdps\n");
+            fprintf(r->imu_csv, "seq,ts_ticks,ts_src,ax_mg,ay_mg,az_mg,gx_mdps,gy_mdps,gz_mdps,host_ms\n");
+        snprintf(p, sizeof p, "%s/frames.csv", dump_dir);
+        r->frames_csv = fopen(p, "a");
+        if (r->frames_csv && ftell(r->frames_csv) == 0)
+            fprintf(r->frames_csv, "seq,type,ts_ticks,ts_src,host_ms,len\n");
     }
 }
 
@@ -109,16 +116,23 @@ static void rx_deliver(bridge_rx_t *r, const bridge_hdr_t *h, const uint8_t *pay
         r->sender_drops = rd32(payload + 4);
         if (h->len >= 12) r->imu_overflow = rd32(payload + 8);
     } else if (h->type == BRIDGE_T_IMU && h->len >= 24 && r->imu_csv) {
-        fprintf(r->imu_csv, "%u,%lld,%u,%d,%d,%d,%d,%d,%d\n", h->seq,
+        fprintf(r->imu_csv, "%u,%lld,%u,%d,%d,%d,%d,%d,%d,%lld\n", h->seq,
                 (long long)r->ts_unwrapped, h->ts_src,
                 rd32s(payload), rd32s(payload + 4), rd32s(payload + 8),
-                rd32s(payload + 12), rd32s(payload + 16), rd32s(payload + 20));
+                rd32s(payload + 12), rd32s(payload + 16), rd32s(payload + 20),
+                (long long)r->host_ms);
     } else if ((h->type == BRIDGE_T_THERMAL || h->type == BRIDGE_T_RGB) && r->dump_dir) {
         char p[512];
         snprintf(p, sizeof p, "%s/%010u_%s.bin", r->dump_dir, h->seq,
                  h->type == BRIDGE_T_THERMAL ? "thermal" : "rgb");
         FILE *f = fopen(p, "wb");
         if (f) { fwrite(payload, 1, h->len, f); fclose(f); }
+        if (r->frames_csv) {
+            fprintf(r->frames_csv, "%u,%s,%lld,%u,%lld,%u\n", h->seq,
+                    h->type == BRIDGE_T_THERMAL ? "thermal" : "rgb",
+                    (long long)r->ts_unwrapped, h->ts_src, (long long)r->host_ms, h->len);
+            fflush(r->frames_csv);
+        }
     }
 }
 
@@ -233,6 +247,7 @@ int main(int argc, char **argv)
         if (n > 0) {
             if (rx.last_read_ms && now - rx.last_read_ms > rx.max_read_gap_ms) rx.max_read_gap_ms = now - rx.last_read_ms;
             rx.last_read_ms = now;
+            rx.host_ms = now;
             if (raw) fwrite(chunk, 1, (size_t)n, raw);
             bridge_feed(&rx, chunk, (size_t)n);
         }
@@ -247,6 +262,7 @@ int main(int argc, char **argv)
     fflush(stdout);
     if (raw) fclose(raw);
     if (rx.imu_csv) fclose(rx.imu_csv);
+    if (rx.frames_csv) fclose(rx.frames_csv);
     free(rx.buf); free(chunk);
     if (fd > 0) close(fd);
     return 0;

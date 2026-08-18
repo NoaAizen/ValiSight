@@ -94,8 +94,20 @@ class FrameSync:
                 frames.append(self._buf[:total])
                 self._buf = self._buf[total:]
             elif not after:
-                frames.append(self._buf[:total])  # closes buffer exactly
-                self._buf = b''
+                # Buffer closes exactly on totalPacketLen. That alone is an
+                # ARRIVAL-TIMING accident, not proof of framing (byte-wise
+                # feeding closes the buffer after every byte), so demand the
+                # TLV walk itself to close the frame before trusting it.
+                # Found by replay chunk-invariance: a stale frame at the head
+                # of aliasing_walk_20260810 was emitted here and cost the two
+                # real frames that followed. Residual corner: a TLV-valid
+                # frame whose successor bytes are corrupt is still rejected
+                # on the confirmed-successor path above but accepted here.
+                if self._frame_ok(self._buf[:total]):
+                    frames.append(self._buf[:total])
+                    self._buf = b''
+                else:
+                    self._skip_one()
             else:
                 # 1..7 trailing bytes: maybe the next magic starting
                 if MAGIC.startswith(after):
@@ -108,6 +120,14 @@ class FrameSync:
         self.dropped_bytes += 1
         self.resync_count += 1
         self._buf = self._buf[1:]
+
+    @staticmethod
+    def _frame_ok(frame):
+        try:
+            walk_tlvs(frame)
+        except ValueError:
+            return False
+        return True
 
 
 def parse_header(frame):
