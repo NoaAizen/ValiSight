@@ -136,21 +136,33 @@ class ImuRing:
         self.v[j + 3] = int(g[0]); self.v[j + 4] = int(g[1]); self.v[j + 5] = int(g[2])
         self.ix = i + 1
 
+    def _compact(self, n):
+        """Drop samples [0, n) and slide the ones that arrived meanwhile to the
+        front. This is the ONLY critical section (a few samples at most), so the
+        timer keeps sampling during the long pack/drain loops. Measured live
+        2026-08-18: holding `busy` across the whole pack loop cost ~30 ms per
+        camera frame = 6 samples lost per frame (148 Hz instead of 200)."""
+        self.busy = True
+        k = self.ix - n
+        if k > 0:
+            self.ts[0:k] = self.ts[n:n + k]
+            self.v[0:6 * k] = self.v[6 * n:6 * (n + k)]
+        self.ix = k
+        self.busy = False
+
     def pack_records(self, ts_src, seq0):
         """Pack every buffered sample as a full record into self.out (in place).
-        Returns the number of records; resets the ring."""
-        self.busy = True
+        Returns the number of records. Ticks that arrive while packing are kept
+        (they land at index >= n and are slid down by _compact)."""
         n = self.ix
         for i in range(n):
             j = 6 * i
             bp.pack_imu_into(self.outmv, i * self.REC, ts_src, (seq0 + i) & 0xFFFFFFFF, self.ts[i] & 0xFFFFFFFF,
                              self.v[j], self.v[j + 1], self.v[j + 2], self.v[j + 3], self.v[j + 4], self.v[j + 5])
-        self.ix = 0
-        self.busy = False
+        self._compact(n)
         return n
 
     def drain(self):
-        self.busy = True
         n = self.ix
         out = []
         for i in range(n):
@@ -158,8 +170,7 @@ class ImuRing:
             out.append((self.ts[i] & 0xFFFFFFFF,
                         (self.v[j], self.v[j + 1], self.v[j + 2]),
                         (self.v[j + 3], self.v[j + 4], self.v[j + 5])))
-        self.ix = 0
-        self.busy = False
+        self._compact(n)
         return out
 
 

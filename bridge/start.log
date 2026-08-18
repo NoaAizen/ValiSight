@@ -1,0 +1,10 @@
+Traceback (most recent call last):
+  File "/home/valisigth/ValiSight_git/bridge/n6_bridge_start.py", line 138, in <module>
+    main()
+  File "/home/valisigth/ValiSight_git/bridge/n6_bridge_start.py", line 95, in main
+    print(put_file(repl, "bridge_protocol.py", proto).decode())
+  File "/home/valisigth/ValiSight_git/bridge/n6_bridge_start.py", line 78, in put_file
+    out, err = repl.exec_and_wait(code.encode())
+  File "/home/valisigth/ValiSight_git/bridge/n6_bridge_start.py", line 59, in exec_and_wait
+    assert buf.startswith(b"OK"), "board did not ACK: %r" % buf[:80]
+AssertionError: board did not ACK: b'Ku'

@@ -108,6 +108,35 @@ def test_clock_wrap():
     assert br2._diff(3, (1 << 31) - 2) == 5
 
 
+def test_imu_ring_keeps_ticks_that_arrive_while_packing():
+    """Live 2026-08-18: holding `busy` across the whole pack loop lost ~6 samples
+    per camera frame (148 Hz instead of 200). A tick that fires mid-pack must
+    survive into the next drain, in order, with its own timestamp."""
+    import bridge_protocol as bp_
+    clk = Clock(0)
+    ring = ImuRing(8, lambda: ((1, 2, 3), (4, 5, 6)), clk)
+    for k in range(3):
+        clk.t = k; ring.tick()
+    orig = bp_.pack_imu_into
+    fired = []
+    def pack_and_tick(*a, **kw):          # simulate the timer firing during the pack loop
+        r = orig(*a, **kw)
+        if not fired:
+            fired.append(1); clk.t = 50; ring.tick()
+        return r
+    bp_.pack_imu_into = pack_and_tick
+    try:
+        n = ring.pack_records(0, 0)
+    finally:
+        bp_.pack_imu_into = orig
+    assert n == 3 and ring.ix == 1, "the mid-pack sample is kept, not dropped"
+    assert ring.ts[0] == 50, "and slid to the front with its own timestamp"
+    assert ring.pack_records(0, 3) == 1 and ring.ix == 0
+    # same for drain()
+    clk.t = 60; ring.tick(); clk.t = 61; ring.tick()
+    out = ring.drain(); assert [o[0] for o in out] == [60, 61] and ring.ix == 0
+
+
 if __name__ == "__main__":
     fails = 0
     for name, fn in list(globals().items()):

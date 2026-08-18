@@ -46,6 +46,14 @@ class RawRepl:
             raise RuntimeError("the N6 is not reading USB (wedged) — replug its cable and rerun")
         time.sleep(0.4)
         self.ser.reset_input_buffer()
+        # Soft reset (Ctrl-B = friendly REPL, Ctrl-D = reset). A previous sender's
+        # 200 Hz machine.Timer keeps running after Ctrl-C and starves the USB
+        # REPL — bytes get lost in both directions and the raw-REPL "OK" ACK
+        # arrives as "K" (seen 2026-08-18). The reset kills the timer and also
+        # clears sys.modules, so a re-pushed bridge_protocol.py is really used.
+        self.ser.write(b"\x02\x04"); time.sleep(3.0)
+        self.ser.write(b"\x03\x03"); time.sleep(0.5)     # stop main.py if the board has one
+        self.ser.reset_input_buffer()
         self.ser.write(b"\x01"); time.sleep(0.3)      # raw REPL
         self.ser.reset_input_buffer()
 
