@@ -202,24 +202,49 @@ class Bootstrap:
 
     def __init__(self, width, height, hfov_deg=70.0, calib_path=None):
         self.w, self.h = width, height
-        self.yaw = self.pitch = self.roll = 0.0
+        self.yaw = self.pitch = self.roll = 0.0      # nudges ON TOP of R_base
         self.t = np.zeros(3)                         # metres, camera frame
+        self.R_base = self.R_CANONICAL
+        self.solved = False
         self.source = 'assumed %.1f deg HFOV' % hfov_deg
         f = (width / 2.0) / np.tan(np.radians(hfov_deg) / 2.0)
         self.K = np.array([[f, 0, width / 2.0],
                            [0, f, height / 2.0],
                            [0, 0, 1.0]])
         self.dist = np.zeros(5)
+        self._r_fold = None                          # normalised fold radius, lazy
         if calib_path and os.path.exists(calib_path):
             self._load(calib_path)
 
     def _load(self, path):
+        """Accepts both calib schemas: radar_extrinsics.py output (K/R/t/dist)
+        and the 2026-08-18 reduced-formulation file (K_rgb/R_cam_from_radar/
+        t_cam_m/dist_rgb). When R and t are present the file is a solved
+        extrinsic: it replaces the canonical guess entirely, and the yaw/pitch/
+        roll nudges become corrections relative to the solution (0 = solved)."""
         with open(path) as fh:
             c = json.load(fh)
-        if 'K' in c:
-            self.K = np.array(c['K'], float)
-            self.dist = np.array(c.get('dist', np.zeros(5)), float).ravel()
-            self.source = os.path.basename(path)
+        K = c.get('K', c.get('K_rgb'))
+        if K is None:
+            return
+        self.K = np.array(K, float)
+        self.dist = np.array(c.get('dist', c.get('dist_rgb', np.zeros(5))),
+                             float).ravel()
+        self._r_fold = None
+        # A calib solved on a different image size must be scaled, not trusted
+        # as-is: K is in pixels of the image it was solved on.
+        size = c.get('image_size')
+        if size and (int(size[0]), int(size[1])) != (self.w, self.h):
+            sx, sy = self.w / float(size[0]), self.h / float(size[1])
+            self.K = np.diag([sx, sy, 1.0]) @ self.K
+        R = c.get('R', c.get('R_cam_from_radar'))
+        t = c.get('t', c.get('t_cam_m'))
+        self.source = os.path.basename(path)
+        if R is not None and t is not None:
+            self.R_base = np.array(R, float).reshape(3, 3)
+            self.t = np.array(t, float).reshape(3)
+            self.solved = True
+            self.source += ' (solved R,t)'
 
     @property
     def f(self):
@@ -232,23 +257,47 @@ class Bootstrap:
         Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
         Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])
         Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])
-        return Rz @ Rx @ Ry @ self.R_CANONICAL
+        return Rz @ Rx @ Ry @ self.R_base
+
+    def _fold_radius(self, r_max=3.0):
+        """Largest normalised radius where the Brown-Conrady polynomial is still
+        monotone. Past it cv2.projectPoints folds a far-off-axis target back to
+        a plausible in-frame pixel (same guard as radar_extrinsics.py)."""
+        if self._r_fold is None:
+            d = np.zeros(5)
+            d[:min(5, len(self.dist))] = self.dist[:5]
+            k1, k2, _, _, k3 = d
+            r = np.linspace(1e-6, r_max, 4000)
+            f = r * (1.0 + k1 * r**2 + k2 * r**4 + k3 * r**6)
+            bad = np.nonzero(np.diff(f) <= 0)[0]
+            self._r_fold = float(r[bad[0]]) if len(bad) else float(r_max)
+        return self._r_fold
 
     def project(self, points):
         """[{x,y,z,...}] -> [(u, v, in_frame)]. Never clamps: a detection off to
         the left reads u = -140, because a clamped point is a lie that sits on
-        the frame edge looking like a real one."""
+        the frame edge looking like a real one. Distortion is applied when the
+        calib carries it - the display is the raw (distorted) camera image, so
+        the pinhole pixel alone is up to ~1 deg off at the flanks."""
         if not points:
             return []
         P = np.array([[p['x'], p['y'], p['z']] for p in points], float)
         C = P @ self.R().T + self.t
         out = []
+        use_dist = np.any(self.dist)
         for (xc, yc, zc) in C:
             if zc <= 1e-6:                          # behind the camera
                 out.append((None, None, False))
                 continue
-            u = self.K[0, 0] * xc / zc + self.K[0, 2]
-            v = self.K[1, 1] * yc / zc + self.K[1, 2]
+            xn, yn = xc / zc, yc / zc
+            if use_dist and np.hypot(xn, yn) <= self._fold_radius():
+                uv, _ = cv2.projectPoints(np.array([[xc, yc, zc]]),
+                                          np.zeros(3), np.zeros(3),
+                                          self.K, self.dist)
+                u, v = float(uv[0, 0, 0]), float(uv[0, 0, 1])
+            else:                                   # pinhole (or past the fold)
+                u = self.K[0, 0] * xn + self.K[0, 2]
+                v = self.K[1, 1] * yn + self.K[1, 2]
             out.append((u, v, 0 <= u < self.w and 0 <= v < self.h))
         return out
 

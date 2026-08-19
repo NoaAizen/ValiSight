@@ -22,7 +22,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
-HTTP=8088
+HTTP="${HTTP:-8088}"
 
 # --- port resolution -------------------------------------------------------
 # The N6 enumerates as a MicroPython CDC device. The IWR1843 sits behind an
@@ -125,10 +125,19 @@ fi
 # --- launch ----------------------------------------------------------------
 # --radar-hfov 62.7 overrides live.py's 70 deg default with the measured value
 # (f = 525 px at 640 wide, caliper checkerboard against a tape measure).
-# --radar-calib cannot carry it: Bootstrap._load() reads only a top-level "K",
-# which neither calib.json ("K_rgb") nor T_camera_radar.json (yaw/R/t) has.
+# It only matters as a fallback: when the solved calib below exists, its K
+# (and R,t and distortion) replace the guess entirely.
 ARGS=(-p "$BOARD" --radar "$RADAR_DATA" --radar-hfov 62.7
       --detect person --view visible --http "$HTTP")
+
+# The solved radar<->RGB extrinsic of 2026-08-18 (full R with pitch, t from
+# caliper, K + distortion). Bootstrap._load() understands this schema and
+# projects with it; the /set push further down is only the legacy fallback.
+CAL_SOLVED="$ROOT/calib-artifacts/radar_rgb_2026-08-18.json"
+if [ -f "$CAL_SOLVED" ]; then
+    ARGS+=(--radar-calib "$CAL_SOLVED")
+    echo "extrinsic   $CAL_SOLVED (solved R,t via --radar-calib)"
+fi
 
 # The thermal layer is stretched, not registered, until B2 is shot and solved;
 # every temperature it quotes carries (unreg). Pick the LUT up automatically
@@ -166,11 +175,12 @@ for _ in $(seq 45); do
 done
 echo
 
-# The solved radar extrinsic never reaches live.py through a flag: --radar-calib
-# only understands intrinsics. Read it out of the artifact and push it through
-# /set so the number applied is the one that was solved, not a copy that drifts.
+# Legacy fallback only: when no solved calib file was passed via --radar-calib,
+# push the old yaw+t solution (2026-08-10) through /set. With a solved calib
+# loaded the /set angles are corrections on top of it - pushing absolute values
+# here would corrupt the solution, so skip.
 CAL="$ROOT/calib-artifacts/T_camera_radar.json"
-if [ -f "$CAL" ]; then
+if [ ! -f "$CAL_SOLVED" ] && [ -f "$CAL" ]; then
     QS="$(python3 - "$CAL" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))
