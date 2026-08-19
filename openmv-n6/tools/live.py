@@ -1149,6 +1149,10 @@ class Renderer(threading.Thread):
                     self.state["radar_offscreen"] = off
                     self.state["radar_aliased"] = al
                     self.state["radar_frame"] = fr["frame_number"]
+                    if getattr(self, "radar_ai", False):
+                        # radar AI layer (Noa 2026-08-18): green PERSON rings
+                        self.state["radar_persons"] = radar_overlay.annotate_ai(
+                            rgb, fr["points"], self.radar_proj)
                 self.state["radar_frames"] = self.radar.frames
                 self.state["radar_dropped"] = self.radar.dropped_bytes
                 if self.radar.error:
@@ -2976,6 +2980,9 @@ def main():
                     help="assumed horizontal FOV used to guess the focal length when no "
                          "solved intrinsics exist (default 70). DESIGN.md:239 records this "
                          "as UNVERIFIED and the measured triple implies 63.8")
+    ap.add_argument("--radar-ai", action="store_true",
+                    help="draw the radar person/clutter classifier (perception/out/radar_ai/"
+                         "cluster_model_v0.pkl) on the picture: green ring = PERSON")
     ap.add_argument("--radar-calib", metavar="JSON",
                     help="solved intrinsics/extrinsics to project with, instead of the guess")
     ap.add_argument("--view", default="fused",
@@ -3063,6 +3070,7 @@ def main():
 
     render = Renderer(pipe, state, work, detector, radar=radar,
                       radar_proj=radar_proj, video=video)
+    render.radar_ai = bool(args.radar_ai)
     render.start()
     stream = Streamer(args.port, pipe, args.quality, state, work)
     if args.range:

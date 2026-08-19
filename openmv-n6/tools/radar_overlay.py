@@ -370,3 +370,57 @@ def annotate(rgb, points, proj, show_whisker=True, label_nearest=True):
                 (proj.w - 150, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.42,
                 COL_STATIC if drawn else (150, 150, 160), 1, cv2.LINE_AA)
     return drawn, off, aliased
+
+
+# --- radar AI layer (Noa, 2026-08-18) ------------------------------------------
+# Optional: cluster the frame, run perception/out/radar_ai/cluster_model_v0.pkl,
+# ring the clusters the model calls PERSON in green with range/speed/p. Silent
+# no-op when the model file is missing. Enabled by live.py --radar-ai.
+_AI = {'model': None, 'prev': [], 'tried': False}
+
+def _ai_model():
+    if _AI['tried']:
+        return _AI['model']
+    _AI['tried'] = True
+    try:
+        import pickle
+        mp = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'perception', 'out', 'radar_ai', 'cluster_model_v0.pkl')
+        _AI['model'] = pickle.load(open(mp, 'rb'))['model']
+    except Exception as e:                       # noqa: BLE001
+        print('radar AI layer: model not loaded (%s) - layer off' % e, file=sys.stderr)
+    return _AI['model']
+
+def annotate_ai(rgb, points, proj):
+    """Draw the classifier's PERSON clusters. Returns number of persons."""
+    model = _ai_model()
+    if model is None or not points:
+        return 0
+    import radar_classify_n6 as rc
+    import math as _m
+    pts = [(p['x'], p['y'], p['z'], p['v'], p['snr'] or 0.0) for p in points]
+    groups = rc.cluster([(x, y, z, v) for x, y, z, v, s in pts], eps=0.6, min_pts=1)
+    cur, persons = [], 0
+    for g in groups:
+        P = list(g)
+        snr = [s for x, y, z, v, s in pts if any(abs(x - q[0]) < 1e-6 and abs(y - q[1]) < 1e-6 for q in P)]
+        cx, cy = float(np.mean([q[0] for q in P])), float(np.mean([q[1] for q in P]))
+        vs = np.array([q[3] for q in P]); rng = _m.hypot(cx, cy)
+        ext = max((_m.hypot(a[0] - b[0], a[1] - b[1]) for a in P for b in P), default=0.0)
+        disp = min((_m.hypot(cx - px, cy - py) for px, py in _AI['prev']), default=float('nan'))
+        f = [len(P), abs(float(vs.mean())), float(vs.max() - vs.min()),
+             float(max(snr) + 40 * _m.log10(max(rng, .1))) if snr else 0.0, ext, rng, disp,
+             (disp - abs(float(vs.mean())) * 0.1) if disp == disp else float('nan')]
+        cur.append((cx, cy))
+        pr = float(model.predict_proba(np.nan_to_num(np.array([f], float), nan=-1))[0, 1])
+        if pr < 0.5:
+            continue
+        (u, v, inside), = proj.project([{'x': cx, 'y': cy, 'z': 0.0}])
+        if u is None or not inside:
+            continue
+        persons += 1
+        x, y = int(round(u)), int(round(v))
+        cv2.circle(rgb, (x, y), 16, (60, 220, 60), 2)
+        cv2.putText(rgb, 'PERSON %.1fm %+.1fm/s p=%.2f' % (rng, float(vs.mean()), pr), (x + 20, y + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (60, 220, 60), 1)
+    _AI['prev'] = cur
+    return persons

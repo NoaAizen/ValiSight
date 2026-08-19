@@ -14,9 +14,11 @@ measured_by: moshe
 date: 2026-08-10
 
 baseline_camera_from_radar_mm:
-  x_forward: 0               # ASSUMED flush (same bracket plane); confirm if > ~5 mm
-  y_left: 0                  # ASSUMED co-axial (camera directly above antennas)
-  z_up: 47                   # MEASURED, caliper: camera 47 mm above antenna center
+  # 2026-08-18 (Noa, caliper on the current bracket) - supersedes the 08-10 values below:
+  x_forward: 8.8             # MEASURED 2026-08-18: 8.8 mm depth offset (sign not recorded; <0.3% effect)
+  y_left: 0                  # MEASURED 2026-08-18: camera directly above the antennas (confirmed by the 2-8.6 m solve: t_x = +24 +- ~30 mm)
+  z_up: 74.9                 # MEASURED 2026-08-18, caliper: camera 74.9 mm above antenna center
+  # 2026-08-10 values (previous bracket state): x_forward 0 (assumed), y_left 0 (assumed), z_up 47 (caliper)
 
 mount_angles_estimate_deg:   # mechanical estimate only, initialization
   yaw: 0                     # measured co-aligned within a few deg (2026-08-09)

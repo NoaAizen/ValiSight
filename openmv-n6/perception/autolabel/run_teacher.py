@@ -32,7 +32,11 @@ sys.path.insert(0, os.path.join(ROOT, 'tools'))
 from perception.dataset import LiveSession          # noqa: E402
 from perception.autolabel.thermal_check import ThermalBoxCheck  # noqa: E402
 from detect import COCO                             # noqa: E402
-from trt_detect import TrtDetector                  # noqa: E402
+try:
+    from trt_detect import TrtDetector              # noqa: E402
+except Exception:                                   # engine absent on this host
+    TrtDetector = None
+import detect as _cpu_detect                          # noqa: E402  yolov4-tiny CPU fallback (2026-08-18)
 
 
 def main():
@@ -51,7 +55,13 @@ def main():
                  f'eats visible-view sessions (fused pixels contain the '
                  f'thermal overlay)')
 
-    det = TrtDetector(conf=a.conf, names=COCO)
+    try:
+        det = TrtDetector(conf=a.conf, names=COCO) if TrtDetector else None
+    except FileNotFoundError:
+        det = None
+    if det is None:
+        print('teacher: TensorRT yolov10n engine not available -> CPU yolov4-tiny fallback (slower, mAP lower)', file=sys.stderr)
+        det = _cpu_detect.Detector(conf=a.conf)
     check = ThermalBoxCheck()
     os.makedirs(a.out, exist_ok=True)
     name = os.path.basename(os.path.normpath(a.session))
