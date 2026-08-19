@@ -148,7 +148,19 @@ class FrameSync:
             ...
     """
 
-    def __init__(self, max_frame=16 * 1024, max_buffer=64 * 1024):
+    # max_frame covers every TLV the demo can emit under the people configs:
+    # header 40 + points (n*16) + side (n*4) + range/noise profile 512 each
+    # + azimuth heatmap 256*8*4 = 8 kB + RANGE-DOPPLER 256 range bins * 64
+    # Doppler bins * 2 = 32 kB (radar_people has 64 Doppler bins, not the 16
+    # of radar_10hz - sizing for 16 silently rejects every RD frame as a
+    # corrupt header). 48 kB fits that with headroom. The cost of the bigger
+    # bound is bounded by the TLV-walk validation below: a corrupt length is
+    # rejected the moment the bytes arrive, not after a 48 kB wait.
+    #
+    # max_buffer must hold at least two max frames or a ~200 ms host stall
+    # during a heatmap session drops bytes mid-frame; 256 kB is nothing on the
+    # host, and the N6 path never enables heatmaps.
+    def __init__(self, max_frame=48 * 1024, max_buffer=256 * 1024):
         self._buf = b''
         self._max_frame = max_frame
         self._max_buffer = max_buffer
@@ -540,6 +552,71 @@ def parse_temperature(payload):
         'pm_c': s[7],
         'dig_c': list(s[8:10]),
     }
+
+
+# One Q9 log2 count in dB: value * 2^-9 is log2(mag), and 20*log10(mag) =
+# log2(mag) * 20*log10(2). The heatmap/profile TLVs all use this fixed-point.
+Q9_LOG2_TO_DB = 20 * 0.30102999566398120 / 512.0     # ~0.011759
+
+
+def parse_range_profile(payload):
+    """TLV 2 (or 3, noise profile - same wire format) -> list of ints.
+
+    One uint16 per range bin, log2 magnitude in Q9. Multiply by Q9_LOG2_TO_DB
+    for relative dB. Values are RELATIVE - rxGain and windowing are baked in -
+    so compare bins to bins, never to an absolute level (the calibrated-RCS
+    trap the POC plan explicitly defers).
+    """
+    n = len(payload) // 2
+    return list(struct.unpack_from('<%dH' % n, payload, 0))
+
+
+def parse_azimuth_heatmap(payload, n_range_bins):
+    """TLV 4 -> (n_vant, rows) where rows[range_bin] = [(imag, real), ...].
+
+    The demo emits, per range bin, one cmplx16ImRe_t per azimuth virtual
+    antenna - IMAG FIRST, then real, both int16. That order is the wire
+    struct's, not a convention chosen here; swapping it conjugates the
+    spectrum and MIRRORS azimuth left-right, which downstream would read as a
+    sign error in the extrinsics (the exact failure mode of 2026-08-09's
+    "flipped azimuth"). n_vant is derived from the payload because it depends
+    on the antenna config (8 for the 1843's 3TX TDM azimuth row), and a
+    mismatch raises rather than reshaping into plausible garbage.
+
+    An angle FFT across the antenna axis of each row turns this into the
+    range-azimuth image; that is numpy work and lives with the consumer, not
+    here (this file must stay importable on the N6).
+    """
+    if n_range_bins <= 0 or len(payload) % (4 * n_range_bins):
+        raise ValueError('azimuth heatmap %d B does not divide into %d range '
+                         'bins of cmplx16' % (len(payload), n_range_bins))
+    n_vant = len(payload) // (4 * n_range_bins)
+    vals = struct.unpack_from('<%dh' % (len(payload) // 2), payload, 0)
+    rows = []
+    for r in range(n_range_bins):
+        base = r * n_vant * 2
+        rows.append([(vals[base + 2 * a], vals[base + 2 * a + 1])
+                     for a in range(n_vant)])
+    return n_vant, rows
+
+
+def parse_range_doppler_heatmap(payload, n_range_bins):
+    """TLV 5 -> (n_doppler, rows) where rows[range_bin] = [uint16, ...].
+
+    One uint16 log2-Q9 magnitude per (range, Doppler) cell, range-major. The
+    Doppler axis arrives in FFT bin order - DC first, then positive
+    velocities, then negative - so a consumer that wants zero velocity in the
+    middle must fftshift that axis; plotting it raw puts a walking person's
+    energy at the image edges and reads as noise.
+    """
+    if n_range_bins <= 0 or len(payload) % (2 * n_range_bins):
+        raise ValueError('range-Doppler heatmap %d B does not divide into %d '
+                         'range bins of uint16' % (len(payload), n_range_bins))
+    n_doppler = len(payload) // (2 * n_range_bins)
+    vals = struct.unpack_from('<%dH' % (len(payload) // 2), payload, 0)
+    rows = [list(vals[r * n_doppler:(r + 1) * n_doppler])
+            for r in range(n_range_bins)]
+    return n_doppler, rows
 
 
 def parse_frame(frame, convention='project'):

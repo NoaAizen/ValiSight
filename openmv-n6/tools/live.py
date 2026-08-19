@@ -2870,6 +2870,28 @@ def session_meta(args):
                               'be the config now on the sensor')
     except Exception as e:                     # provenance never breaks a run
         stamp_note = 'stamp unreadable: %s' % e
+
+    # The thermal window is what turns the recorded uint8 back into degrees:
+    # c_per_lsb = (tmax - tmin) / 255. Every session before 2026-08-19 omitted
+    # it, which is why perception/out/gexport v1 carries c_per_lsb: null and
+    # its thermal plane is intensity, not temperature. The default matches the
+    # bring-up default in Streamer._setup (fixed_range or (-10, 140)); if that
+    # pair ever moves, this one must move with it or the meta lies.
+    if args.range:
+        tmin_c, tmax_c = (int(v) for v in args.range.split(':'))
+    else:
+        tmin_c, tmax_c = -10, 140
+
+    def _sha(path):
+        # Calibration files are small (a LUT is ~1 MB); hashing at session
+        # start is the only moment the file on disk is KNOWN to be the file
+        # the session ran with.
+        if not path or not os.path.exists(path):
+            return None
+        import hashlib
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
     return {
         'tool': 'live.py',
         'argv': sys.argv[1:],
@@ -2877,10 +2899,19 @@ def session_meta(args):
         'radar_port': args.radar,
         'view': args.view,
         'warp_lut': args.warp,
+        'warp_lut_sha256': _sha(args.warp),
         'radar_calib': args.radar_calib,
+        'radar_calib_sha256': _sha(args.radar_calib),
         'detector': args.detect,
         'radar_cfg_stamp': stamp,
         'radar_cfg_stamp_note': stamp_note,
+        'tmin': tmin_c,
+        'tmax': tmax_c,
+        'c_per_lsb': (tmax_c - tmin_c) / 255.0,
+        # The bring-up has run the Lepton in HIGH gain since 2026-08-09
+        # (capture._BRINGUP, SET_MODE(True, False)); recorded so a future
+        # low-gain session cannot be silently mixed in as the same scale.
+        'lepton_gain': 'high',
     }
 
 

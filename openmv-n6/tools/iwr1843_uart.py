@@ -45,9 +45,12 @@ CYCLES_PERIOD = 1 << 32
 # 921600 baud is ~0.7 s -- roughly 7 frames swallowed as one packet, discarded
 # whole when the TLV parse fails. Budget, worst case, with every TLV on:
 #   header 40 + TLV1 (n*16) + TLV7 (n*4) + TLV6 24 + TLV2/TLV3 512 each
-#   + TLV4 (256 bins * 8 virt * 4) 8192 + TLV5 (256 * 16 * 2) 8192 ~= 17.6 kB
-# 24 kB leaves headroom and still resyncs within ~0.26 s.
-MAX_FRAME_BYTES = 24576
+#   + TLV4 (256 bins * 8 virt * 4) 8192
+#   + TLV5 (256 bins * 64 Doppler * 2) 32768   <- radar_people has 64 Doppler
+#     bins, not radar_10hz's 16; the old 24 kB bound sized for 16 would reject
+#     every heatmap frame of the people config as a corrupt header
+# ~= 42 kB; 48 kB leaves headroom and still resyncs within ~0.53 s.
+MAX_FRAME_BYTES = 49152
 
 
 class RadarReader:
