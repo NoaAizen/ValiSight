@@ -204,6 +204,62 @@ class DemSampler:
         bottom = block[1, 0] * (1 - dx) + block[1, 1] * dx
         return float(top * (1 - dy) + bottom * dy)
 
+    def sample_many(self, latitudes, longitudes):
+        """Sample many points at once, reading the covering window only once.
+
+        Marching rays out to kilometres asks for tens of thousands of heights,
+        and going through the file for each costs seconds. Pulling the covering
+        block into memory and interpolating there is the same arithmetic two
+        orders of magnitude faster.
+
+        Returns a float array with NaN wherever the DEM has no data.
+        """
+        import numpy as np
+        import rasterio.windows
+
+        latitudes = np.asarray(latitudes, dtype=float)
+        longitudes = np.asarray(longitudes, dtype=float)
+
+        cols, rows = ~self._dataset.transform * (longitudes, latitudes)
+        cols, rows = np.asarray(cols) - 0.5, np.asarray(rows) - 0.5
+
+        col_min = int(math.floor(np.nanmin(cols))) - 1
+        row_min = int(math.floor(np.nanmin(rows))) - 1
+        col_max = int(math.ceil(np.nanmax(cols))) + 2
+        row_max = int(math.ceil(np.nanmax(rows))) + 2
+
+        col_min, row_min = max(col_min, 0), max(row_min, 0)
+        col_max = min(col_max, self._dataset.width)
+        row_max = min(row_max, self._dataset.height)
+        if col_max <= col_min or row_max <= row_min:
+            return np.full(latitudes.shape, np.nan)
+
+        window = rasterio.windows.Window(
+            col_min, row_min, col_max - col_min, row_max - row_min
+        )
+        block = self._dataset.read(1, window=window).astype(float)
+        block[block == self.nodata] = np.nan
+
+        local_col = cols - col_min
+        local_row = rows - row_min
+        c0 = np.clip(np.floor(local_col).astype(int), 0, block.shape[1] - 2)
+        r0 = np.clip(np.floor(local_row).astype(int), 0, block.shape[0] - 2)
+        dx = np.clip(local_col - c0, 0.0, 1.0)
+        dy = np.clip(local_row - r0, 0.0, 1.0)
+
+        top = block[r0, c0] * (1 - dx) + block[r0, c0 + 1] * dx
+        bottom = block[r0 + 1, c0] * (1 - dx) + block[r0 + 1, c0 + 1] * dx
+        heights = top * (1 - dy) + bottom * dy
+
+        # Outside the raster the interpolation is meaningless, whatever the
+        # clipped indices happened to land on
+        outside = (
+            (local_col < 0) | (local_col > block.shape[1] - 1)
+            | (local_row < 0) | (local_row > block.shape[0] - 1)
+        )
+        heights[outside] = np.nan
+        return heights
+
     def _ring_samples(self, latitude: float, longitude: float, radius_m: float, count: int) -> List[float]:
         """Heights sampled evenly around a circle, skipping points off the tile."""
         samples = []

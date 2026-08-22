@@ -68,16 +68,19 @@ def build_scene(tilts=None, seed=11, noise_mg=3.6, lateral_mg=None, lateral_inde
     for index, (axis, degrees) in enumerate(tilts or GOOD_TILTS):
         direction = np.asarray(axis, dtype=float)
         rig = rotation(direction / np.linalg.norm(direction) * math.radians(degrees))
-        gravity_imu = rig.T @ np.array([0.0, 0.0, -1.0])
+        # The accelerometer measures the reaction to gravity, so at rest it
+        # points UP. World up is +z; a level rig reads +1 g on whichever axis
+        # faces the sky.
+        up_imu = rig.T @ np.array([0.0, 0.0, 1.0])
 
-        accel = gravity_imu * 1000.0 + generator.normal(0, noise_mg, 3)
+        accel = up_imu * 1000.0 + generator.normal(0, noise_mg, 3)
         if lateral_mg is not None and index == lateral_index:
             accel = accel + np.array([lateral_mg, 0.0, 0.0])
 
         orientations.append(RigOrientation(
             label=f"P{index + 1}",
             imu_accel_mg=tuple(accel),
-            camera_gravity=tuple(true_rotation @ gravity_imu),
+            camera_up=tuple(true_rotation @ up_imu),
         ))
     return orientations
 
@@ -90,6 +93,45 @@ def rotation_error_deg(solved) -> float:
 # --------------------------------------------------------------------------
 # The solve
 # --------------------------------------------------------------------------
+
+
+def test_a_level_rig_reads_positive_g_on_its_upward_axis():
+    """The physical convention, pinned against the hardware.
+
+    This board lying flat reads (+1002, 4, 15) mg, so +X faces the sky. An
+    accelerometer measures the reaction to gravity, not gravity, and the
+    difference is a sign that nothing downstream would catch.
+    """
+    flat = RigOrientation("flat", (1002.0, 4.0, 15.0), (0.0, 0.0, 1.0))
+    up = flat.imu_up
+    assert up[0] > 0.99, "the axis facing the sky reads positive"
+    assert flat.is_static
+
+
+def test_flipping_one_vector_and_not_the_other_is_caught_by_the_residual():
+    """Getting the up/down sense wrong on one side cannot hide.
+
+    Negating every camera direction would need R = -R_true to fit, and in three
+    dimensions the negative of a rotation has determinant -1: it is a
+    reflection, not a rotation. The SVD refuses reflections, so it returns the
+    nearest proper rotation instead and the misfit shows up as a large
+    residual. The convention is still worth stating loudly -- but if it does get
+    reversed, the number says so rather than a plausible answer coming back.
+    """
+    good = build_scene()
+    flipped = [
+        RigOrientation(o.label, o.imu_accel_mg, tuple(-c for c in o.camera_up))
+        for o in good
+    ]
+
+    honest = solve_imu_camera(good)
+    wrong = solve_imu_camera(flipped)
+
+    assert honest.residual_rms_deg < 1.0
+    assert rotation_error_deg(honest.rotation) < 1.0
+
+    assert wrong.residual_rms_deg > 10.0, "a flip must not fit cleanly"
+    assert rotation_error_deg(wrong.rotation) > 45.0
 
 
 def test_solver_recovers_a_known_rotation():

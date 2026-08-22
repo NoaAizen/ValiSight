@@ -11,10 +11,16 @@ not six.
 
 **How it is observed.** The rig is held still in several orientations. In each:
 
-* the accelerometer measures gravity, an absolute external direction, in IMU
-  coordinates
+* the accelerometer measures the *reaction* to gravity, so at rest the axis
+  pointing skyward reads +1 g. The measured direction is therefore **up**, not
+  down. Confirmed against this board: lying flat it reads (+1002, 4, 15) mg,
+  which is +X up.
 * the camera observes surveyed targets, which fixes its orientation in the
-  world, and therefore where gravity points in camera coordinates
+  world, and therefore where up lies in camera coordinates
+
+Both vectors must use the same sense. Flipping one and not the other yields a
+rotation wrong by 180 degrees about a horizontal axis, and Wahba's problem
+reports it with a clean residual because it fits the flipped data perfectly.
 
 Two readings of one direction in two frames, repeated. The rotation that
 reconciles them is Wahba's problem, solved in closed form by SVD.
@@ -87,17 +93,23 @@ def _require_numpy():
 class RigOrientation:
     """One static pose: what the IMU read, and where the camera was pointing.
 
-    ``camera_gravity`` is where gravity points expressed in camera coordinates.
-    It comes from the camera's orientation against the surveyed targets, not
-    from the IMU, which is the whole point — the two must be independent for
-    their comparison to mean anything.
+    ``camera_up`` is which way is up, expressed in camera coordinates. It comes
+    from the camera's orientation against the surveyed targets, not from the
+    IMU, which is the whole point — the two must be independent for their
+    comparison to mean anything.
+
+    Both directions point **up**, matching what the accelerometer physically
+    reports at rest. The naming is laboured on purpose: this is a sign that can
+    be got wrong silently.
     """
 
     label: str
-    #: Raw accelerometer reading in IMU coordinates, milli-g.
+    #: Raw accelerometer reading in IMU coordinates, milli-g. At rest the axis
+    #: pointing skyward reads about +1000.
     imu_accel_mg: Tuple[float, float, float]
-    #: Unit vector along gravity in camera coordinates.
-    camera_gravity: Tuple[float, float, float]
+    #: Unit vector pointing up, in camera coordinates. Same sense as the
+    #: accelerometer reading, not its negation.
+    camera_up: Tuple[float, float, float]
 
     @property
     def magnitude_mg(self) -> float:
@@ -109,8 +121,12 @@ class RigOrientation:
         return abs(self.magnitude_mg - STANDARD_GRAVITY_MG) <= GRAVITY_TOLERANCE_MG
 
     @property
-    def imu_gravity(self) -> Tuple[float, float, float]:
-        """Accelerometer reading normalised to a unit direction."""
+    def imu_up(self) -> Tuple[float, float, float]:
+        """Accelerometer reading normalised: a unit vector pointing up.
+
+        Up rather than down, because that is what the sensor measures. Naming
+        it after gravity invites a negation that nothing downstream would catch.
+        """
         magnitude = self.magnitude_mg
         if magnitude < 1e-6:
             raise ImuCalibrationFailed(f"Orientation {self.label!r} has no measurable acceleration")
@@ -172,7 +188,7 @@ def tilt_separation_deg(orientations: Sequence[RigOrientation]) -> float:
     same axis leave rotation about gravity as unconstrained as one tilt did.
     """
     np = _require_numpy()
-    vectors = [np.array(o.imu_gravity) for o in orientations]
+    vectors = [np.array(o.imu_up) for o in orientations]
     widest = 0.0
     for i, first in enumerate(vectors):
         for second in vectors[i + 1:]:
@@ -191,7 +207,7 @@ def _observability(np, orientations: Sequence[RigOrientation]) -> float:
     the worst-determined axis. Normalising by N makes the number comparable
     between runs with different numbers of orientations.
     """
-    directions = [np.array(o.imu_gravity) for o in orientations]
+    directions = [np.array(o.imu_up) for o in orientations]
     scatter = sum(np.outer(g, g) for g in directions)
     information = len(directions) * np.eye(3) - scatter
     return float(np.linalg.eigvalsh(information)[0] / len(directions))
@@ -229,9 +245,9 @@ def solve_imu_camera(orientations: Sequence[RigOrientation]) -> ImuCameraSolutio
     # rotation the directions actually constrain.
     profile = np.zeros((3, 3))
     for orientation in usable:
-        camera = np.array(orientation.camera_gravity, dtype=float)
+        camera = np.array(orientation.camera_up, dtype=float)
         camera = camera / np.linalg.norm(camera)
-        profile += np.outer(camera, np.array(orientation.imu_gravity))
+        profile += np.outer(camera, np.array(orientation.imu_up))
 
     u, _, vt = np.linalg.svd(profile)
     # The middle term forbids a reflection, which would fit the data equally
@@ -243,8 +259,8 @@ def solve_imu_camera(orientations: Sequence[RigOrientation]) -> ImuCameraSolutio
 
     residuals = []
     for orientation in usable:
-        predicted = rotation @ np.array(orientation.imu_gravity)
-        measured = np.array(orientation.camera_gravity, dtype=float)
+        predicted = rotation @ np.array(orientation.imu_up)
+        measured = np.array(orientation.camera_up, dtype=float)
         measured = measured / np.linalg.norm(measured)
         cosine = max(-1.0, min(1.0, float(predicted @ measured)))
         residuals.append(math.degrees(math.acos(cosine)))
@@ -391,8 +407,8 @@ class ImuCameraConstraint(CalibrationConstraint):
                 source=f"{self.name}:{orientation.label}",
                 sigma=angular_sigma,
                 payload={
-                    "imu_gravity": orientation.imu_gravity,
-                    "camera_gravity": orientation.camera_gravity,
+                    "imu_up": orientation.imu_up,
+                    "camera_up": orientation.camera_up,
                 },
             )
             for orientation in self.orientations
