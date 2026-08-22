@@ -376,7 +376,10 @@ class _StubStage(InitStage):
 def test_default_pipeline_runs_the_geoid_guard_first():
     """The cheapest check, and the one that invalidates everything downstream."""
     names = [stage.name for stage in InitializationPipeline.default().stages]
-    assert names == ["geoid", "priors", "calibration"]
+    assert names == ["geoid", "priors", "calibration", "pose_init"]
+    # The order of the first three is the interface contract; pose_init is
+    # appended, unimplemented, and reports itself skipped.
+    assert names[0] == "geoid"
 
 
 def test_fail_fast_stops_at_the_first_failure():
@@ -719,17 +722,79 @@ def test_initializer_run_matches_the_pipeline_it_exposes(tiled_priors):
     report = init.run()
 
     assert report.ok, report.summary()
-    assert [s.name for s in init.pipeline().stages] == ["geoid", "priors", "calibration"]
+    assert [s.name for s in init.pipeline().stages] == [
+        "geoid",
+        "priors",
+        "calibration",
+        "pose_init",
+    ]
     assert report.stage("geoid").data["undulation_m"] == pytest.approx(
         JERUSALEM_UNDULATION_M, abs=0.01
     )
+
+
+def test_unimplemented_pose_stage_reports_skipped_rather_than_missing(tiled_priors):
+    """A stage that is not written yet must be findable and say so.
+
+    Leaving it out of the pipeline made ``report.stage("pose_init")`` raise
+    KeyError, which reads to a consumer as a malformed report rather than as
+    work that has not been done. Skipped is the honest third answer.
+    """
+    init = MapInitializer(*JERUSALEM, prior_provider=LocalFilePriorProvider(tiled_priors))
+    report = init.run()
+
+    result = report.stage("pose_init")  # must not raise
+    assert result.status is StageStatus.SKIPPED
+    assert result.ok and not result.failed
+    assert report.ok, "a skipped stage does not fail the run"
+
+
+def test_geo_failure_types_are_reachable_from_the_package_root():
+    """A consumer catches these, so it must be able to name them.
+
+    The interface contract has consuming code import from ``mapinit`` alone and
+    also rely on these being raised. Both cannot hold unless they are exported
+    here, since they are defined under ``mapinit.geo``.
+    """
+    import mapinit
+
+    for name in ("GeoidGridUnavailable", "TileNotFound", "PriorPaths",
+                 "GroundEstimate", "EgoAltitudePrior", "BasePriorDataProvider"):
+        assert name in mapinit.__all__, f"{name} missing from __all__"
+        assert isinstance(getattr(mapinit, name), type)
+
+    with pytest.raises(AttributeError):
+        mapinit.NoSuchName
+
+
+def test_importing_the_package_does_not_require_pyproj():
+    """The documented promise, checked in a clean interpreter.
+
+    ``mapinit.geo`` imports pyproj at module level, so re-exporting a name from
+    it eagerly would quietly make PROJ a hard dependency of ``import mapinit``.
+    Run in a subprocess because pyproj is already loaded in this one.
+    """
+    import subprocess
+    import sys
+
+    probe = (
+        "import sys, mapinit; "
+        "assert 'pyproj' not in sys.modules, 'pyproj pulled in by import mapinit'; "
+        "mapinit.GeoidGridUnavailable; "
+        "assert 'pyproj' in sys.modules, 'lazy export did not resolve'"
+    )
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_initializer_carries_calibration_constraints_into_the_run():
     from mapinit.calibration import SurveyedTargetConstraint
 
     init = MapInitializer(*JERUSALEM, constraints=[SurveyedTargetConstraint(make_targets())])
-    assert init.pipeline().stages[-1].constraints, "constraints must reach CalibrationStage"
+    # Looked up by name, not by position: the stage list is appended to, and an
+    # index would silently start asserting about whichever stage landed last.
+    calibration = next(s for s in init.pipeline().stages if s.name == "calibration")
+    assert calibration.constraints, "constraints must reach CalibrationStage"
 
 
 # --------------------------------------------------------------------------

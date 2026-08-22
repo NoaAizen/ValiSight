@@ -72,9 +72,10 @@ class InitializationPipeline:
         # Imported here so that importing the runner does not pull in pyproj
         from .stages.calibration import CalibrationStage
         from .stages.geoid import GeoidStage
+        from .stages.pose import PoseInitStage
         from .stages.priors import PriorsStage
 
-        return cls([GeoidStage(), PriorsStage(), CalibrationStage()])
+        return cls([GeoidStage(), PriorsStage(), CalibrationStage(), PoseInitStage()])
 
     def run(self, ctx: InitContext, fail_fast: bool = True) -> InitReport:
         """Execute every stage in order.

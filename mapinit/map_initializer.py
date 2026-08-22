@@ -154,10 +154,17 @@ class MapInitializer:
         """The stages that will run, in order. Append to extend."""
         from .stages.calibration import CalibrationStage
         from .stages.geoid import GeoidStage
+        from .stages.pose import PoseInitStage
         from .stages.priors import PriorsStage
 
+        # PoseInitStage is unimplemented and reports itself skipped. It is
+        # registered rather than omitted so a consumer asking for it gets that
+        # answer instead of a KeyError, which reads as a broken report rather
+        # than as work that has not been done yet. Appended last: the relative
+        # order of geoid, priors and calibration is fixed by the interface
+        # contract, and appending leaves it untouched.
         return InitializationPipeline(
-            [GeoidStage(), PriorsStage(), CalibrationStage(self._constraints)]
+            [GeoidStage(), PriorsStage(), CalibrationStage(self._constraints), PoseInitStage()]
         )
 
     def run(self, fail_fast: bool = True) -> InitReport:
