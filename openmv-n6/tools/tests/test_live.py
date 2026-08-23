@@ -276,9 +276,11 @@ def threading_and_detection(y, thermal):
     state, work = {}, live.Latest()
 
     try:
-        det = detect.Detector(size=320)
-    except FileNotFoundError as e:
-        check("detector model is present", False, str(e))
+        det = detect.make_detector("gpu", model="yolov10n",
+                                   classes=["person"])
+        check("TensorRT detector model is present", True, det.model_name)
+    except Exception as e:
+        check("TensorRT detector model is present", False, str(e))
         det = None
 
     r = live.Renderer(pipe, state, work, det)
@@ -313,6 +315,9 @@ def threading_and_detection(y, thermal):
                   pipe.warped is False)
     finally:
         r.stop.set()
+        r.join(timeout=2.0)
+        if det is not None and hasattr(det, "close"):
+            det.close()
 
     # The visible temporal filter: live.py set cfg.y_temporal_knee and then never
     # called fusion_y_temporal(), so --y-knee reserved 256KB and filtered nothing.
@@ -436,6 +441,34 @@ def main():
           m0.astype(int).mean() < m50.mean() < m100.astype(int).mean()
           or m0.astype(int).mean() > m50.mean() > m100.astype(int).mean(),
           "%.1f / %.1f / %.1f" % (m0.mean(), m50.mean(), m100.mean()))
+
+    operator = live.compose("operator", fused, yarr, cover=cover, mix=60,
+                            outline=False)
+    check("operator view preserves visible structure without becoming grey",
+          operator.shape == fused.shape
+          and np.abs(operator.astype(int) - fused.astype(int)).mean() > 2
+          and np.abs(operator.astype(int) - vis.astype(int)).mean() > 2
+          and (np.max(operator, axis=2).astype(int)
+               - np.min(operator, axis=2).astype(int)).mean() > 1,
+          "distance fused %.1f, visible %.1f"
+          % (np.abs(operator.astype(int) - fused.astype(int)).mean(),
+             np.abs(operator.astype(int) - vis.astype(int)).mean()))
+
+    partial_for_operator = np.zeros_like(cover)
+    partial_for_operator[10:-10, 20:-20] = 1
+    soft = live.compose("operator", fused, yarr, cover=partial_for_operator,
+                        mix=60, outline=False)
+    check("operator view is visible outside the thermal footprint",
+          np.abs(soft[0, 0].astype(int) - vis[0, 0].astype(int)).max() <= 1,
+          "corner delta %d"
+          % np.abs(soft[0, 0].astype(int) - vis[0, 0].astype(int)).max())
+    edge_x = int(20 * live.OUT_W / cover.shape[1])
+    check("operator footprint has a soft edge instead of a hard seam",
+          np.abs(soft[live.OUT_H // 2, edge_x].astype(int)
+                 - vis[live.OUT_H // 2, edge_x].astype(int)).mean()
+          < np.abs(operator[live.OUT_H // 2, edge_x].astype(int)
+                   - vis[live.OUT_H // 2, edge_x].astype(int)).mean(),
+          "edge is partially blended")
 
     excl = pipe.repaired_grid()
     ed = live.compose("edges", fused, yarr, treg=treg, exclude=excl)
@@ -626,9 +659,12 @@ def main():
               pipe.view == "edges" and pipe.mix == 25 and pipe.outline is True,
               "view %s, mix %d, outline %s" % (pipe.view, pipe.mix, pipe.outline))
 
+        get("/set?view=operator")
+        check("/set accepts the operator view", pipe.view == "operator", pipe.view)
+
         get("/set?view=nonsense")
         check("/set ignores an unknown view rather than breaking the stream",
-              pipe.view == "edges")
+              pipe.view == "operator")
 
         get("/set?view=fused&outline=0")
 

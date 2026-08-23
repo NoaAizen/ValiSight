@@ -29,13 +29,11 @@ The collection algorithm, stated once:
      duplicates; a frame-level split leaks the train set into val and reports
      a model better than the one you have.
 
-What the thermal sample IS (so the notebook never guesses): 8-bit radiometric,
-linear over the board's SET_RANGE window [TMIN, TMAX] - c_per_lsb =
-(tmax - tmin) / 255. The Lepton's 14-bit never leaves the board with current
-firmware; the range window is the honest resolution statement, and it goes in
-the manifest so a future narrower-range session is not silently mixed with a
-wide-range one. Sessions recorded before meta.json carried the range have
-c_per_lsb: null - intensity, not temperature.
+What the thermal sample IS (so the notebook never guesses): uint8 or
+little-endian uint16 raw counts, with dtype and scale declared per session.
+Current live capture is uint8 radiometric, linear over the board's SET_RANGE
+window [TMIN, TMAX]. Sessions recorded before meta.json carried the range have
+c_per_lsb: null - intensity, not temperature. Unknown encodings fail closed.
 
 Radar points are exported exactly as radar.jsonl stores them - project frame,
 (x fwd, y left, z up, m), v FOLDED at 1.298 m/s (sign and magnitude untrusted),
@@ -45,12 +43,15 @@ of silent.
 
 Usage:
     python3 perception/export/export_shards.py --sessions live-20260812-100507 \
-        [--out-name v1] [--frames-per-shard 256] [--no-rgb] [--val SESS ...]
+        [--out-name v2] [--frames-per-shard 256] [--no-rgb] [--val SESS ...] \
+        [--verified-negative EMPTY_SESS ...]
 """
 import argparse
 import glob
+import hashlib
 import json
 import os
+import shutil
 import sys
 
 import numpy as np
@@ -67,14 +68,24 @@ OUT_ROOT = os.path.join(ROOT, 'perception', 'out', 'gexport')
 RADAR_K = 64        # points kept per frame, strongest SNR first
 MAX_BOXES = 8       # persons per frame; indoor sessions have 1-3
 V_ALIAS = 1.298     # m/s fold period, restated in the manifest
+LABEL_UNKNOWN = -1
+LABEL_NEGATIVE = 0
+LABEL_POSITIVE = 1
+
+
+def label_state(has_positive, verified_negative=False):
+    """Tri-state target. Missing evidence is never negative evidence."""
+    if verified_negative:
+        return LABEL_NEGATIVE
+    return LABEL_POSITIVE if has_positive else LABEL_UNKNOWN
 
 
 def load_teacher(sess):
     """Per-video-frame teacher detections, or {} when the session has none.
 
-    A missing teacher file is a WARNING, not an error: a dark session where
-    the RGB teacher saw nothing is exactly the hard-negative material the
-    student needs, and it must still export - with empty label planes.
+    A missing teacher file means UNKNOWN supervision, not a negative. A dark
+    session where RGB saw nothing is exactly where absence of a box cannot be
+    interpreted as absence of a person.
     """
     path = os.path.join(AUTOLABEL, f'{sess}_teacher.jsonl')
     if not os.path.exists(path):
@@ -120,9 +131,48 @@ def pad_boxes(rows, width):
     return out, n
 
 
-def export_session(sess, teacher, coco_boxes, keep_rgb):
+def load_heatmaps(sess):
+    """Radar dense streams keyed by frame number, or {} for point-only sessions.
+
+    Probes the first rows cheaply: a session recorded before
+    radar_people_ra.cfg has no TLV 4/5 anywhere, and scanning its whole
+    radar.bin to learn that would double export time for nothing.
+    """
+    from perception.export import radar_heatmaps
+    sess_dir = os.path.join(CAPTURES, sess)
+    if not os.path.exists(os.path.join(sess_dir, 'radar.bin')):
+        return {}
+    probe = {}
+    gen = radar_heatmaps.frames(sess_dir)
+    for i, fr in enumerate(gen):
+        if any(fr[k] is not None for k in ('ra', 'rd', 'range_profile')):
+            probe[fr['frame']] = fr
+        elif i >= 20 and not probe:
+            return {}                      # 20 frames, no heatmap TLVs: old era
+    if not probe:
+        return {}
+    out = {}
+    for f, fr in probe.items():
+        out[f] = {
+            'ra': (radar_heatmaps.ra_image(fr['ra']).astype(np.float16)
+                   if fr['ra'] is not None else None),
+            'rd': (fr['rd'].astype(np.float16) if fr['rd'] is not None
+                   else None),
+            'rp': (fr['range_profile'].astype(np.float16)
+                   if fr['range_profile'] is not None else None),
+        }
+    return out
+
+
+def export_session(sess, teacher, coco_boxes, keep_rgb,
+                   teacher_available=True, verified_negative=False):
     """One session -> list of per-frame dicts, in time order."""
     ls = LiveSession(os.path.join(CAPTURES, sess))
+    meta_by_i = {m['i']: m for m in ls.frames}
+    heatmaps = load_heatmaps(sess)
+    if heatmaps:
+        print(f'[export] {sess}: radar dense streams present '
+              f'({len(heatmaps)} radar frames) - exporting RA/RD/RP')
     frames = []
     prev_t = None
     n_dropped_radar = 0
@@ -156,28 +206,102 @@ def export_session(sess, teacher, coco_boxes, keep_rgb):
         row['n_radar'] = np.int16(n_pts)
         row['radar_age_ms'] = np.float32(tr.age_ms if tr.age_ms is not None
                                          else np.nan)
+        # RA/RD planes ride along when the session's radar.bin carries them
+        # (radar_people_ra.cfg sessions). Keyed by the SAME radar frame the
+        # points came from, so points and map describe one measurement.
+        # Sessions without heatmaps simply lack these keys - a loader checks
+        # for the key instead of trusting zeros that never happened.
+        if heatmaps and tr.radar is not None:
+            hm = heatmaps.get(tr.radar.frame)
+            if hm is not None:
+                if hm['ra'] is not None:
+                    row['range_angle'] = hm['ra']
+                if hm['rd'] is not None:
+                    row['range_doppler'] = hm['rd']
+                if hm['rp'] is not None:
+                    row['range_profile'] = hm['rp']
 
         rgb_rows = [[d['x'], d['y'], d['w'], d['h'], d['conf']]
                     for d in teacher.get(tr.i, [])]
         row['rgb_boxes'], row['n_rgb_boxes'] = pad_boxes(rgb_rows, 5)
         th_rows = coco_boxes.get((sess, tr.i), [])
         row['th_boxes'], row['n_th_boxes'] = pad_boxes(th_rows, 5)
+        # Tri-state supervision: +1 positive, 0 independently verified empty,
+        # -1 unknown. In particular, "teacher emitted no box" is UNKNOWN.
+        frame_negative = bool(
+            verified_negative or
+            meta_by_i.get(tr.i, {}).get('verified_negative', False))
+        row['radar_label_state'] = np.int8(
+            label_state(bool(rgb_rows), frame_negative))
+        row['thermal_label_state'] = np.int8(
+            label_state(bool(th_rows), frame_negative))
+        row['teacher_available'] = np.bool_(teacher_available)
         frames.append(row)
     if n_dropped_radar:
         print(f'[export] {sess}: {n_dropped_radar} radar points beyond '
               f'K={RADAR_K} dropped (weakest SNR first)')
+    # Shard rows must be key-uniform (np.stack). Frames that missed a map
+    # (session start, stale radar) get zeros plus a validity flag, so the
+    # loader can mask them instead of learning from silence.
+    for key, flag in (('range_angle', 'ra_valid'),
+                      ('range_doppler', 'rd_valid'),
+                      ('range_profile', 'rp_valid')):
+        shapes = [f[key].shape for f in frames if key in f]
+        if not shapes:
+            continue
+        shape = shapes[0]
+        for f in frames:
+            f[flag] = np.bool_(key in f)
+            if key not in f:
+                f[key] = np.zeros(shape, np.float16)
     return frames
 
 
-def session_c_per_lsb(sess):
-    """(tmin, tmax, c_per_lsb) from meta.json, or Nones when unrecorded."""
+def session_thermal_meta(sess, frames):
+    """Thermal scale and dtype, refusing mixed/ambiguous frame formats."""
     path = os.path.join(CAPTURES, sess, 'meta.json')
+    meta = {}
     if os.path.exists(path):
         with open(path) as f:
-            m = json.load(f)
-        if 'tmin' in m and 'tmax' in m:
-            return m['tmin'], m['tmax'], (m['tmax'] - m['tmin']) / 255.0
-    return None, None, None
+            meta = json.load(f)
+    dtypes = {str(f['thermal'].dtype) for f in frames}
+    if len(dtypes) != 1:
+        raise ValueError(f'{sess}: mixed thermal dtypes in one session: {dtypes}')
+    dtype = dtypes.pop()
+    dtype_name = 'uint16_le' if dtype == 'uint16' else dtype
+    counts_max = int(meta.get(
+        'thermal_counts_max', np.iinfo(frames[0]['thermal'].dtype).max))
+    tmin, tmax = meta.get('tmin'), meta.get('tmax')
+    c_per_lsb = meta.get('c_per_lsb')
+    if c_per_lsb is None and tmin is not None and tmax is not None:
+        c_per_lsb = (tmax - tmin) / counts_max
+    return {
+        'tmin': tmin, 'tmax': tmax, 'c_per_lsb': c_per_lsb,
+        'thermal_dtype': dtype_name,
+        'thermal_encoding': meta.get('thermal_encoding', 'unknown'),
+        'thermal_counts_max': counts_max,
+    }
+
+
+def session_provenance(sess):
+    """Source hashes needed to detect incompatible sessions before training."""
+    path = os.path.join(CAPTURES, sess, "meta.json")
+    meta = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            meta = json.load(f)
+    stamp = meta.get("radar_cfg_stamp") or {}
+    return {
+        "schema_version": meta.get("schema_version"),
+        "lepton_gain": meta.get("lepton_gain"),
+        "warp_lut_sha256": meta.get("warp_lut_sha256"),
+        "radar_calib_sha256": meta.get("radar_calib_sha256"),
+        "radar_cfg_sha256": stamp.get("sha256"),
+        "radar_cfg_name": stamp.get("name"),
+        "radar_cfg_stamp_note": meta.get("radar_cfg_stamp_note"),
+        "detector_model": meta.get("detector_model"),
+        "detector_engine_sha256": meta.get("detector_engine_sha256"),
+    }
 
 
 def write_shards(frames, sess, out_dir, per_shard, keep_rgb):
@@ -192,6 +316,47 @@ def write_shards(frames, sess, out_dir, per_shard, keep_rgb):
     return paths
 
 
+TRAINING_CODE_FILES = (
+    'perception/__init__.py',
+    'perception/student_data.py',
+    'perception/students.py',
+    'perception/train_students.py',
+)
+
+
+def write_training_bundle(out_dir):
+    """Snapshot runnable training code beside the shards for reproducible Colab."""
+    code_root = os.path.join(out_dir, 'code')
+    os.makedirs(os.path.join(code_root, 'perception'), exist_ok=True)
+    hashes = {}
+    for rel in TRAINING_CODE_FILES:
+        src = os.path.join(ROOT, rel)
+        dst = os.path.join(code_root, rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+        with open(dst, 'rb') as f:
+            hashes[rel] = hashlib.sha256(f.read()).hexdigest()
+
+    notebook_name = 'train_students_colab.ipynb'
+    notebook_src = os.path.join(ROOT, 'perception', 'export', notebook_name)
+    shutil.copy2(notebook_src, os.path.join(out_dir, notebook_name))
+    with open(notebook_src, 'rb') as f:
+        hashes[notebook_name] = hashlib.sha256(f.read()).hexdigest()
+    requirements = 'numpy\nscipy\ntorch\n'
+    requirements_path = os.path.join(code_root, 'requirements.txt')
+    with open(requirements_path, 'w') as f:
+        f.write(requirements)
+    hashes['requirements.txt'] = hashlib.sha256(
+        requirements.encode('ascii')).hexdigest()
+
+    return {
+        'code_dir': 'code',
+        'notebook': notebook_name,
+        'sha256': hashes,
+        'entrypoint': 'python -m perception.train_students',
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--sessions', nargs='+', required=True,
@@ -199,7 +364,10 @@ def main():
     ap.add_argument('--val', nargs='*', default=[],
                     help='sessions held out for validation (whole sessions - '
                          'a frame split leaks near-duplicates)')
-    ap.add_argument('--out-name', default='v1')
+    ap.add_argument('--verified-negative', nargs='*', default=[], metavar='SESS',
+                    help='sessions manually verified to contain no target; '
+                         'only these may supply negative supervision')
+    ap.add_argument("--out-name", default="v2")
     ap.add_argument('--frames-per-shard', type=int, default=256)
     ap.add_argument('--no-rgb', action='store_true',
                     help='omit the RGB plane (student-only export, ~14x smaller)')
@@ -212,9 +380,10 @@ def main():
 
     manifest = {
         'version': a.out_name,
-        'thermal': {'w': THERMAL_W, 'h': THERMAL_H, 'dtype': 'uint8',
-                    'note': 'linear over [tmin,tmax]; c_per_lsb null = '
-                            'intensity only, do not mix as temperature'},
+        'thermal': {'w': THERMAL_W, 'h': THERMAL_H,
+                    'dtype': 'per-session; uint8 or uint16_le',
+                    'note': 'c_per_lsb null = intensity only; training must '
+                            'not silently mix calibrated and unit scales'},
         'rgb': ({'w': RGB_W, 'h': RGB_H, 'dtype': 'uint8',
                  'note': 'mp4-decoded grayscale, lossy - teacher input, '
                          'never a measurement'} if keep_rgb else None),
@@ -222,34 +391,49 @@ def main():
                                          'noise_db'],
                   'frame': 'project (x fwd, y left, z up, metres)',
                   'v_alias_m_s': V_ALIAS,
+                  'optional_streams': ['range_angle', 'range_doppler',
+                                       'range_profile'],
                   'note': 'v folded - sign and magnitude untrusted'},
         'labels': {'rgb_boxes': 'teacher persons, RGB px, [x,y,w,h,conf]',
                    'th_boxes': 'grade-A only, thermal px, [x,y,w,h,delta]',
+                   'radar_label_state': '-1 unknown, 0 verified negative, 1 positive',
+                   'thermal_label_state': '-1 unknown, 0 verified negative, 1 positive',
                    'max_boxes': MAX_BOXES},
         'split': {'train': [], 'val': []},
         'sessions': {},
     }
 
+    verified_negative = set(a.verified_negative)
     for sess in a.sessions:
+        teacher_path = os.path.join(AUTOLABEL, f'{sess}_teacher.jsonl')
+        teacher_available = os.path.exists(teacher_path)
         teacher = load_teacher(sess)
-        frames = export_session(sess, teacher, coco_boxes, keep_rgb)
+        frames = export_session(
+            sess, teacher, coco_boxes, keep_rgb,
+            teacher_available=teacher_available,
+            verified_negative=sess in verified_negative)
         if not frames:
             print(f'[export] {sess}: nothing exportable (fused view or no '
                   f'thermal) - skipped')
             continue
         shards = write_shards(frames, sess, out_dir, a.frames_per_shard,
                               keep_rgb)
-        tmin, tmax, c = session_c_per_lsb(sess)
+        thermal_meta = session_thermal_meta(sess, frames)
         n_lab = sum(int(f['n_th_boxes']) > 0 for f in frames)
+        n_neg = sum(int(f['thermal_label_state']) == 0 for f in frames)
         manifest['sessions'][sess] = {
             'shards': shards, 'frames': len(frames),
             'frames_with_gradeA': n_lab,
-            'tmin': tmin, 'tmax': tmax, 'c_per_lsb': c,
+            'verified_negative_frames': n_neg,
+            'provenance': session_provenance(sess),
+            **thermal_meta,
         }
         which = 'val' if sess in a.val else 'train'
         manifest['split'][which].append(sess)
         print(f'[export] {sess}: {len(frames)} frames ({n_lab} with grade-A '
               f'boxes) -> {len(shards)} shard(s) [{which}]')
+
+    manifest['training_bundle'] = write_training_bundle(out_dir)
 
     with open(os.path.join(out_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)

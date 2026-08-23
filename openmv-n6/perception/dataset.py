@@ -8,8 +8,9 @@ settled once, in this file:
            mirrored (measured 2026-08-09, see radar_calib_web.py; the
            "mirrored stream!" note in holds1/corr.json predates that
            measurement and is wrong).
-  thermal  120x160 uint8, raw as recorded (per-capture linear scale; live
-           sessions carry no c_per_lsb, so it is intensity, not temperature).
+  thermal  120x160 uint8 or little-endian uint16, raw as recorded. The dtype
+           is taken from meta.json when present and otherwise inferred from
+           thermal_len. Unknown sizes are rejected rather than misaligned.
   radar    points in the PROJECT frame (x fwd, y left, z up, metres),
            exactly as radar.jsonl stores them - never rescaled. v is FOLDED
            (alias period 1.298 m/s); do not trust its sign or magnitude.
@@ -30,7 +31,12 @@ import cv2
 import numpy as np
 
 THERMAL_W, THERMAL_H = 160, 120
-THERMAL_BYTES = THERMAL_W * THERMAL_H
+THERMAL_PIXELS = THERMAL_W * THERMAL_H
+THERMAL_BYTES = THERMAL_PIXELS       # legacy uint8 frame size
+THERMAL_DTYPES = {
+    'uint8': np.dtype('u1'),
+    'uint16_le': np.dtype('<u2'),
+}
 RGB_W, RGB_H = 640, 400
 
 # Beyond this, radar and video are describing different moments: a person at
@@ -56,7 +62,7 @@ class Triplet:
     i: int                      # video frame index
     t_mono: float
     rgb: np.ndarray             # (400, 640) uint8
-    thermal: np.ndarray         # (120, 160) uint8
+    thermal: Optional[np.ndarray]  # (120, 160), uint8 or little-endian uint16
     radar: Optional[RadarObs]   # None when nothing within max_age_ms
     age_ms: Optional[float]     # video t_mono - radar t_mono
     view: str
@@ -71,6 +77,12 @@ class LiveSession:
     radar_records: List[dict] = field(default_factory=list)
 
     def __post_init__(self):
+        meta_path = os.path.join(self.path, 'meta.json')
+        if os.path.exists(meta_path):
+            with open(meta_path) as f:
+                self.meta = json.load(f)
+        else:
+            self.meta = {}
         with open(os.path.join(self.path, 'frames.jsonl')) as f:
             self.frames = [json.loads(l) for l in f if l.strip()]
         radar_path = os.path.join(self.path, 'radar.jsonl')
@@ -80,11 +92,48 @@ class LiveSession:
         self._by_frame = {r['frame']: r for r in self.radar_records}
         self._radar_t = np.array([r['t_mono'] for r in self.radar_records])
         tb = os.path.join(self.path, 'thermal.bin')
+        # Keep the file as bytes. Each row owns its offset/length and decides
+        # the dtype explicitly, so a future uint16 session cannot shift every
+        # frame after the first by half a frame.
         self._thermal = (np.memmap(tb, dtype=np.uint8, mode='r')
                          if os.path.exists(tb) else None)
 
     def __len__(self):
         return len(self.frames)
+
+    def thermal_dtype(self, frame_meta: dict):
+        """Return the declared/inferred dtype for one thermal frame.
+
+        Legacy sessions have no meta.json but do carry thermal_len, so their
+        19,200-byte uint8 frames remain readable. A 38,400-byte frame is only
+        interpreted as little-endian uint16. Anything else fails closed.
+        """
+        nbytes = frame_meta.get('thermal_len')
+        if nbytes is None:
+            nbytes = self.meta.get('thermal_frame_bytes', THERMAL_BYTES)
+        try:
+            nbytes = int(nbytes)
+        except (TypeError, ValueError):
+            raise ValueError(f'{self.path}: invalid thermal_len={nbytes!r}')
+
+        declared = self.meta.get('thermal_dtype')
+        if declared is not None:
+            if declared not in THERMAL_DTYPES:
+                raise ValueError(f'{self.path}: unsupported thermal_dtype '
+                                 f'{declared!r}')
+            dtype = THERMAL_DTYPES[declared]
+            expected = THERMAL_PIXELS * dtype.itemsize
+            if nbytes != expected:
+                raise ValueError(f'{self.path}: thermal_len={nbytes}, but '
+                                 f'thermal_dtype={declared} requires {expected}')
+            return dtype
+
+        if nbytes == THERMAL_PIXELS:
+            return THERMAL_DTYPES['uint8']
+        if nbytes == 2 * THERMAL_PIXELS:
+            return THERMAL_DTYPES['uint16_le']
+        raise ValueError(f'{self.path}: cannot infer thermal dtype from '
+                         f'thermal_len={nbytes}; declare thermal_dtype in meta.json')
 
     def thermal_frame(self, meta: dict):
         """The raw thermal frame recorded with this frames.jsonl row, without
@@ -92,8 +141,14 @@ class LiveSession:
         off = meta.get('thermal_off')
         if off is None or self._thermal is None:
             return None
-        return np.array(self._thermal[off:off + THERMAL_BYTES]
-                        ).reshape(THERMAL_H, THERMAL_W)
+        dtype = self.thermal_dtype(meta)
+        nbytes = THERMAL_PIXELS * dtype.itemsize
+        end = int(off) + nbytes
+        if int(off) < 0 or end > len(self._thermal):
+            raise ValueError(f'{self.path}: thermal frame at offset {off} needs '
+                             f'{nbytes} bytes, file has {len(self._thermal)}')
+        raw = np.array(self._thermal[int(off):end], copy=True)
+        return raw.view(dtype).reshape(THERMAL_H, THERMAL_W)
 
     def _radar_for(self, meta: dict, max_age_ms: float):
         rec = self._by_frame.get(meta.get('radar_frame'))
@@ -165,9 +220,7 @@ class LiveSession:
                 if off is None or self._thermal is None:
                     thermal = None
                 else:
-                    thermal = np.array(
-                        self._thermal[off:off + THERMAL_BYTES]
-                    ).reshape(THERMAL_H, THERMAL_W)
+                    thermal = self.thermal_frame(meta)
                 radar, age_ms = self._radar_for(meta, max_age_ms)
                 yield Triplet(meta['i'], meta['t_mono'], rgb, thermal,
                               radar, age_ms, meta.get('view', ''),

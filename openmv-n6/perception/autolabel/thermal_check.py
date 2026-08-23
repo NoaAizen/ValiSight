@@ -5,11 +5,10 @@ against the warp LUT so the autolabel stage needs neither libfusion nor a
 running pipeline. The LUT is the one calib.py emits: (100, 160, 2) uint16 Q8
 thermal coordinates per low-res grid cell, 0xFFFF = no valid mapping.
 
-Recorded live sessions carry NO radiometric scale (frames.jsonl has no
-tmin/c_per_lsb), so absolute "31-39 C" body-heat gating is impossible offline.
-The score is therefore RELATIVE: how far the box's warped maximum sits above
-the frame's background median, in 8-bit counts. The threshold is chosen from
-the measured distribution, not assumed.
+The score is RELATIVE: how far the box's warped maximum sits above the frame's
+background median, in 8-bit-equivalent counts. uint16 inputs are normalized by
+the session's declared thermal_counts_max; an unknown scale must be rejected by
+the caller instead of silently changing the grading thresholds.
 """
 import os
 
@@ -22,10 +21,22 @@ FUSION_INVALID = 0xFFFF
 TH_W, TH_H = 160, 120
 
 
+def to_uint8_equivalent(thermal, counts_max):
+    """Normalize raw integer counts while preserving the legacy thresholds."""
+    counts_max = int(counts_max)
+    if counts_max <= 0:
+        raise ValueError("thermal_counts_max must be positive")
+    arr = np.asarray(thermal)
+    if arr.size and (arr.min() < 0 or arr.max() > counts_max):
+        raise ValueError(f"thermal counts exceed declared maximum {counts_max}")
+    return arr.astype(np.float32) * (255.0 / counts_max)
+
+
 class ThermalBoxCheck:
-    def __init__(self, lut_path=None):
+    def __init__(self, lut_path=None, counts_max=255):
         path = lut_path or os.path.join(ART, 'warp_3.5.lut')
         lut = np.fromfile(path, dtype=np.uint16).reshape(LOW_H, LOW_W, 2)
+        self.counts_max = int(counts_max)
         self.valid = lut[..., 0] != FUSION_INVALID
         # Q8 -> integer thermal pixel to sample (same rounding as fusion.c)
         self.tu = np.clip((lut[..., 0].astype(np.int32) + 128) >> 8, 0, TH_W - 1)
@@ -37,6 +48,7 @@ class ThermalBoxCheck:
         Returns None when the box has no valid thermal coverage (outside the
         overlap ROI) - which downstream must treat as "unknown", never "cold".
         """
+        thermal = to_uint8_equivalent(thermal, self.counts_max)
         gx0 = max(0, int(x) // DECIMATION)
         gy0 = max(0, int(y) // DECIMATION)
         gx1 = min(LOW_W, int(np.ceil((x + w) / DECIMATION)))
@@ -52,8 +64,8 @@ class ThermalBoxCheck:
                 'max': int(vals.max()), 'mean': float(vals.mean()),
                 'p90': float(np.percentile(vals, 90))}
 
-    @staticmethod
-    def background(thermal):
+    def background(self, thermal):
         """Frame-level background level: the median is robust to one person
         occupying even a third of the (much wider) thermal FOV."""
+        thermal = to_uint8_equivalent(thermal, self.counts_max)
         return float(np.median(thermal))

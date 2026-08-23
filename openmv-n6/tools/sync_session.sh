@@ -13,7 +13,8 @@
 #   - A session whose meta.json lacks closed_wall died mid-recording: synced
 #     anyway, flagged DIED_MIDRECORDING on the NAS. Legacy sessions without
 #     meta.json are synced normally.
-#   - NAS disk is NTFS (no POSIX perms) => rsync -rt, not -a.
+#   - NAS disk is the 7.3T WD My Book, exFAT (no POSIX perms, 2 s timestamp
+#     granularity) => rsync -rt --modify-window=2, not -a.
 set -uo pipefail
 
 REPO_ROOT="$HOME/thermal-fusion"
@@ -21,7 +22,7 @@ CAPTURES_ROOT="${CAPTURES_ROOT:-$REPO_ROOT/openmv-n6/captures}"
 NAS_USER="hailo"
 # eth0 first, wifi second, tailscale last (nas-pi on the valisight tailnet)
 NAS_HOSTS=(192.168.1.104 192.168.1.112 100.125.148.82)
-NAS_BASE="/media/hailo/New Volume"
+NAS_BASE="/mnt/mybook/vailsigth_record"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=5)
 
 # pick first reachable host
@@ -40,7 +41,7 @@ if [ $# -gt 0 ]; then SESSIONS=("$@"); else
     mapfile -t SESSIONS < <(find "$CAPTURES_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort)
 fi
 
-RSYNC_COMMON=(-rts --exclude='.synced.ok' --exclude='DIED_MIDRECORDING' --exclude='*.tmp')
+RSYNC_COMMON=(-rts --modify-window=2 --exclude='.synced.ok' --exclude='DIED_MIDRECORDING' --exclude='*.tmp')
 ok=0; fail=0; died=0
 for s in "${SESSIONS[@]}"; do
     src="$CAPTURES_ROOT/$s"

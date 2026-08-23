@@ -138,7 +138,7 @@ class Detector:
         return dets
 
 
-def _gpu_comes_up(timeout_s=120):
+def _gpu_comes_up(engine=None, model="yolov10n", timeout_s=120):
     """Can TensorRT actually start right now? Asked in a process we can lose.
 
     On Tegra a CUDA/nvmap allocation failure does not raise - it takes the whole
@@ -165,7 +165,8 @@ def _gpu_comes_up(timeout_s=120):
     import sys
     here = os.path.dirname(os.path.abspath(__file__))
     code = ("import sys; sys.path.insert(0, %r); import trt_detect; "
-            "d = trt_detect.TrtDetector(); d.close()" % here)
+            "d = trt_detect.TrtDetector(engine=%r, model=%r); d.close()" %
+            (here, engine, model))
     try:
         rc = subprocess.call([sys.executable, "-c", code],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -175,7 +176,8 @@ def _gpu_comes_up(timeout_s=120):
     return rc == 0
 
 
-def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None):
+def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None,
+                  model="yolov10n", engine=None):
     """Pick a detector. Both backends return the same [{cls,conf,x,y,w,h}].
 
     'auto' prefers the GPU and says so on stderr when it falls back, because a
@@ -188,10 +190,19 @@ def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None):
         raise ValueError("backend must be auto, gpu or cpu, not %r" % (backend,))
 
     if backend != "cpu":
+        import trt_detect
+        selected_engine = engine or trt_detect.model_paths(model)[1]
+        if not os.path.isfile(selected_engine):
+            onnx = trt_detect.model_paths(model)[0]
+            raise FileNotFoundError(
+                "%s\nexpected NMS engine for %s; export %s with nms=True "
+                "and run: %s" %
+                (selected_engine, model, onnx,
+                 " ".join(trt_detect.build_command(model))))
         # Probe first. 'gpu' asks for the GPU explicitly, so it is entitled to
         # the real error rather than a fallback - but it should still get a
         # message instead of a core dump.
-        if not _gpu_comes_up():
+        if not _gpu_comes_up(selected_engine, model):
             msg = ("the GPU backend cannot start (TensorRT/CUDA failed to "
                    "initialise - usually no contiguous memory; check free -m)")
             if backend == "gpu":
@@ -200,8 +211,9 @@ def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None):
                   file=sys.stderr)
         else:
             try:
-                import trt_detect
-                det = trt_detect.TrtDetector(conf=conf, classes=classes, names=COCO)
+                det = trt_detect.TrtDetector(
+                    engine=selected_engine, conf=conf, classes=classes,
+                    names=COCO, model=model)
                 det.backend = "gpu"
                 return det
             except Exception as e:
@@ -213,6 +225,7 @@ def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None):
 
     det = Detector(size=size, conf=conf, classes=classes)
     det.backend = "cpu"
+    det.model_name = "yolov4-tiny"
     return det
 
 

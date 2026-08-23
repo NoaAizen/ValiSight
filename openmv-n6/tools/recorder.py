@@ -30,6 +30,9 @@ import time
 import cv2
 
 
+THERMAL_PIXELS = 160 * 120
+
+
 class SessionRecorder:
     """Writes one session directory. Create it, call write() per frame, close().
 
@@ -72,6 +75,7 @@ class SessionRecorder:
         sensor, which ports, when the clock started.
         """
         doc = {
+            'schema_version': 2,
             'created_wall': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
             'created_mono': time.monotonic(),
             'fps_nominal': self.fps,
@@ -114,7 +118,15 @@ class SessionRecorder:
             row['thermal_off'] = self._thermal_off
             row['thermal_len'] = len(thermal)
             if self._meta.get('thermal_frame_bytes') is None:
-                self._update_meta(thermal_frame_bytes=len(thermal))
+                if len(thermal) == THERMAL_PIXELS:
+                    dtype = 'uint8'
+                elif len(thermal) == 2 * THERMAL_PIXELS:
+                    dtype = 'uint16_le'
+                else:
+                    dtype = 'opaque'
+                self._update_meta(thermal_frame_bytes=len(thermal),
+                                  thermal_dtype=dtype,
+                                  thermal_shape=[120, 160])
             self._thermal_off += len(thermal)
         if extra:
             row.update(extra)

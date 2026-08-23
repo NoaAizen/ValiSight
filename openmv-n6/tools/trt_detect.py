@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""YOLOv10n over TensorRT on the Jetson's GPU, as a drop-in for detect.Detector.
+"""Selectable YOLOv8/YOLOv10/YOLO11 over TensorRT on the Jetson's GPU.
+
+This is a drop-in for detect.Detector.
 
 Why this exists: the cv2.dnn path in detect.py runs yolov4-tiny on the CPU at
 68 ms per frame at 416, and it takes four of the six cores to do it. Those cores
@@ -12,17 +14,16 @@ Measured on this box (Orin Nano Super, JetPack 6.2.1, TensorRT 10.3, FP16):
 GPU compute 4.83 ms, end-to-end 5.19 ms including both copies. Against the
 68 ms CPU number that is ~13x, and it runs on a device that was previously idle.
 
-Model choice. yolov4-tiny is COCO mAP ~22; yolov10n is ~38.5. For "is that a
-person at 15 m" the gap is most of the answer, so this is not only a speed swap.
-Two further consequences worth knowing:
+Model choice. The installed yolov10n is the measured default; yolov8n and
+yolo11n use the same runtime contract after a static export with NMS included.
+For a person at long range, the model choice is an accuracy change, not only a
+speed swap. Every accepted engine emits [1,max_det,6] suppressed boxes, so raw
+Ultralytics prediction planes are rejected before inference.
 
-  - v10 is NMS-free. It emits a fixed [1,300,6] of already-suppressed boxes, so
-    the cv2.dnn.NMSBoxes step and its threshold disappear. There is no NMS
-    tuning knob here because there is no NMS.
-  - The input is a static 640x640. The visible frame is 640x400, so letterboxing
-    is pure padding at scale 1.0 - 120 rows of grey above and below, and not one
-    pixel resampled. The cv2.dnn path squashed 640x400 into 416x416, distorting
-    the aspect ratio; this path does not.
+The input is a static 640x640. The visible frame is 640x400, so letterboxing
+is pure padding at scale 1.0 - 120 rows of grey above and below, and not one
+pixel resampled. The cv2.dnn path squashed 640x400 into 416x416, distorting
+the aspect ratio; this path does not.
 
 No pycuda, no cupy, no torch. Device memory is handled by calling libcudart
 through ctypes, the same way fusion.c is already loaded. That is deliberate:
@@ -36,13 +37,33 @@ import time
 import numpy as np
 
 MODEL_DIR = os.path.expanduser("~/archive/radar/models")
-ENGINE = os.path.join(MODEL_DIR, "yolov10n_fp16.engine")
-ONNX = os.path.join(MODEL_DIR, "yolov10n.onnx")
+MODEL_FILES = {
+    "yolov10n": ("yolov10n.onnx", "yolov10n_fp16.engine"),
+    # YOLOv8/11 must be exported with nms=True, batch=1, imgsz=640 so their
+    # output is [1, max_det, 6], not the raw [1, 84, anchors] prediction plane.
+    "yolov8n": ("yolov8n_nms.onnx", "yolov8n_nms_fp16.engine"),
+    "yolo11n": ("yolo11n_nms.onnx", "yolo11n_nms_fp16.engine"),
+}
 
-# The engine is built for this host's GPU and this TensorRT version. It is not
-# portable and it is not in git; build_engine() regenerates it from the ONNX.
-BUILD_CMD = ("/usr/src/tensorrt/bin/trtexec --onnx=%s --saveEngine=%s "
-             "--fp16 --memPoolSize=workspace:1024 --skipInference" % (ONNX, ENGINE))
+
+def model_paths(model):
+    if model not in MODEL_FILES:
+        raise ValueError("unknown TensorRT detector model %r; choose %s" %
+                         (model, ", ".join(sorted(MODEL_FILES))))
+    onnx_name, engine_name = MODEL_FILES[model]
+    return (os.path.join(MODEL_DIR, onnx_name),
+            os.path.join(MODEL_DIR, engine_name))
+
+
+def build_command(model):
+    onnx, engine = model_paths(model)
+    return ["/usr/src/tensorrt/bin/trtexec", "--onnx=" + onnx,
+            "--saveEngine=" + engine, "--fp16",
+            "--memPoolSize=workspace:1024", "--skipInference"]
+
+
+ONNX, ENGINE = model_paths("yolov10n")
+BUILD_CMD = " ".join(build_command("yolov10n"))
 
 # Ultralytics COCO-80. Same 80 classes and the same indices as the darknet list
 # in detect.COCO, but four names differ in spelling (motorbike/motorcycle,
@@ -106,17 +127,33 @@ class _Cudart:
         self._check(self.lib.cudaStreamSynchronize(stream), "streamSync")
 
 
-def build_engine(verbose=False):
-    """Regenerate the engine from the ONNX. Takes ~10 minutes on this board."""
+def build_engine(model="yolov10n", verbose=False):
+    """Build this Jetson's engine from a static, NMS-included ONNX export."""
     import subprocess
-    if not os.path.isfile(ONNX):
-        raise FileNotFoundError(ONNX)
-    rc = subprocess.call(BUILD_CMD, shell=True,
+    onnx, engine = model_paths(model)
+    cmd = build_command(model)
+    if not os.path.isfile(onnx):
+        raise FileNotFoundError(onnx)
+    rc = subprocess.call(cmd,
                          stdout=None if verbose else subprocess.DEVNULL,
                          stderr=None if verbose else subprocess.DEVNULL)
-    if rc != 0 or not os.path.isfile(ENGINE):
-        raise RuntimeError("trtexec failed (rc=%d): %s" % (rc, BUILD_CMD))
-    return ENGINE
+    if rc != 0 or not os.path.isfile(engine):
+        raise RuntimeError("trtexec failed (rc=%d): %s" %
+                           (rc, " ".join(cmd)))
+    return engine
+
+
+def validate_io_shapes(input_shape, output_shape):
+    """Reject raw or dynamic exports before their tensors reach postprocess."""
+    if len(input_shape) != 4 or input_shape[0] != 1 or input_shape[1] != 3:
+        raise RuntimeError(f"expected static NCHW [1,3,H,W], got {input_shape}")
+    if any(int(v) <= 0 for v in input_shape):
+        raise RuntimeError(f"dynamic input is unsupported: {input_shape}")
+    if (len(output_shape) != 3 or output_shape[0] != 1 or
+            output_shape[2] != 6 or any(int(v) <= 0 for v in output_shape)):
+        raise RuntimeError(
+            f"expected NMS output [1,max_det,6], got {output_shape}; "
+            "export YOLOv8/YOLO11 with nms=True, batch=1, dynamic=False")
 
 
 class TrtDetector:
@@ -127,13 +164,19 @@ class TrtDetector:
     that is acceptable here.
     """
 
-    def __init__(self, engine=ENGINE, conf=CONF, classes=None, names=None):
+    def __init__(self, engine=None, conf=CONF, classes=None, names=None,
+                 model="yolov10n"):
         import tensorrt as trt
 
+        _onnx, default_engine = model_paths(model)
+        engine = engine or default_engine
+        cmd = " ".join(build_command(model))
         if not os.path.isfile(engine):
             raise FileNotFoundError(
-                "%s\nbuild it with: %s" % (engine, BUILD_CMD))
+                "%s\nbuild it with: %s" % (engine, cmd))
 
+        self.model_name = model
+        self.engine_path = engine
         self.conf = conf
         self.names = tuple(names) if names else None
         self.ms = 0.0
@@ -145,29 +188,39 @@ class TrtDetector:
         if self._engine is None:
             raise RuntimeError("could not deserialize %s - a TensorRT engine is "
                                "tied to the GPU and TRT version that built it; "
-                               "rebuild with: %s" % (engine, BUILD_CMD))
+                               "rebuild with: %s" % (engine, cmd))
         self._ctx = self._engine.create_execution_context()
 
         # Discover the bindings rather than hardcoding names, so a re-export
         # under a different exporter does not silently bind the wrong tensor.
-        self._in_name = self._out_name = None
+        inputs, outputs = [], []
         for i in range(self._engine.num_io_tensors):
-            n = self._engine.get_tensor_name(i)
-            if self._engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT:
-                self._in_name, self._in_shape = n, tuple(self._engine.get_tensor_shape(n))
+            name = self._engine.get_tensor_name(i)
+            shape = tuple(self._engine.get_tensor_shape(name))
+            if self._engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                inputs.append((name, shape))
             else:
-                self._out_name, self._out_shape = n, tuple(self._engine.get_tensor_shape(n))
-        if self._in_name is None or self._out_name is None:
-            raise RuntimeError("engine does not have exactly one input and one output")
-
-        _, c, self.net_h, self.net_w = self._in_shape
-        if c != 3:
-            raise RuntimeError("expected a 3-channel input, got %r" % (self._in_shape,))
+                outputs.append((name, shape))
+        if len(inputs) != 1 or len(outputs) != 1:
+            raise RuntimeError("engine needs exactly one input and one output; "
+                               f"got {len(inputs)} input(s), {len(outputs)} output(s)")
+        self._in_name, self._in_shape = inputs[0]
+        self._out_name, self._out_shape = outputs[0]
+        validate_io_shapes(self._in_shape, self._out_shape)
+        _, _c, self.net_h, self.net_w = self._in_shape
+        self._in_dtype = np.dtype(trt.nptype(
+            self._engine.get_tensor_dtype(self._in_name)))
+        self._out_dtype = np.dtype(trt.nptype(
+            self._engine.get_tensor_dtype(self._out_name)))
+        if self._in_dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+            raise RuntimeError(f"unsupported input dtype {self._in_dtype}")
+        if self._out_dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
+            raise RuntimeError(f"unsupported output dtype {self._out_dtype}")
 
         self.cu = _Cudart()
         self._stream = self.cu.stream()
-        in_bytes = int(np.prod(self._in_shape)) * 4        # fp32 in, TRT casts
-        out_bytes = int(np.prod(self._out_shape)) * 4
+        in_bytes = int(np.prod(self._in_shape)) * self._in_dtype.itemsize
+        out_bytes = int(np.prod(self._out_shape)) * self._out_dtype.itemsize
         self._d_in = self.cu.malloc(in_bytes)
         self._d_out = self.cu.malloc(out_bytes)
 
@@ -175,8 +228,8 @@ class TrtDetector:
         # once: doing this per frame would cost more than the inference.
         h_in, self._p_in = self.cu.host_alloc(in_bytes)
         h_out, self._p_out = self.cu.host_alloc(out_bytes)
-        self.h_in = h_in.view(np.float32).reshape(self._in_shape)
-        self.h_out = h_out.view(np.float32).reshape(self._out_shape)
+        self.h_in = h_in.view(self._in_dtype).reshape(self._in_shape)
+        self.h_out = h_out.view(self._out_dtype).reshape(self._out_shape)
         self._in_bytes, self._out_bytes = in_bytes, out_bytes
 
         self._ctx.set_tensor_address(self._in_name, int(self._d_in.value))
@@ -194,7 +247,7 @@ class TrtDetector:
     # -- preprocessing ----------------------------------------------------
 
     def letterbox(self, img):
-        """HxW gray or HxWx3 BGR -> (NCHW float32 in self.h_in, scale, padx, pady).
+        """HxW gray or HxWx3 BGR -> (NCHW FP16/FP32 in self.h_in, scale, padx, pady).
 
         Writes straight into the pinned buffer. Returns the geometry needed to
         map boxes back to the caller's pixel coordinates.
@@ -283,13 +336,37 @@ class TrtDetector:
         return dets
 
     def close(self):
-        for p in (self._d_in, self._d_out):
-            self.cu.lib.cudaFree(p)
-        for p in (self._p_in, self._p_out):
-            self.cu.lib.cudaFreeHost(p)
+        cu = getattr(self, "cu", None)
+        if cu is None:
+            return
+        for attr in ("_d_in", "_d_out"):
+            p = getattr(self, attr, None)
+            if p is not None:
+                cu.lib.cudaFree(p)
+                setattr(self, attr, None)
+        for attr in ("_p_in", "_p_out"):
+            p = getattr(self, attr, None)
+            if p is not None:
+                cu.lib.cudaFreeHost(p)
+                setattr(self, attr, None)
+        self.cu = None
 
     def __del__(self):
         try:
             self.close()
         except Exception:
             pass
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Build a registered static-NMS TensorRT detector engine")
+    ap.add_argument("--build", required=True, choices=sorted(MODEL_FILES),
+                    metavar="MODEL")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+    print(build_engine(args.build, verbose=args.verbose))
+
+
+if __name__ == "__main__":
+    main()

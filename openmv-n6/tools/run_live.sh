@@ -1,7 +1,7 @@
 #!/bin/bash
 # Bring up the live viewer with the radar, from a cold or a running state.
 #
-#   ./run_live.sh                     # visible view, person detection, radar on
+#   ./run_live.sh                     # operator view, person detection, radar on
 #   ./run_live.sh --view fused        # anything here is passed through to live.py
 #   ./run_live.sh --record captures/session1   # ...including recording
 #   ./run_live.sh --stop              # stop the viewer and park the radar
@@ -128,7 +128,7 @@ fi
 # It only matters as a fallback: when the solved calib below exists, its K
 # (and R,t and distortion) replace the guess entirely.
 ARGS=(-p "$BOARD" --radar "$RADAR_DATA" --radar-hfov 62.7
-      --detect person --view visible --http "$HTTP")
+      --detect person --view operator --http "$HTTP")
 
 # The solved radar<->RGB extrinsic of 2026-08-18 (full R with pitch, t from
 # caliper, K + distortion). Bootstrap._load() understands this schema and

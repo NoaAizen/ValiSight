@@ -322,7 +322,7 @@ class Pipeline:
         # never sees it - but it lives here because this is the object the HTTP
         # handlers already reach and the streamer already holds.
         self.view = "fused"
-        self.mix = 50
+        self.mix = 60
         self.outline = False
         self.blink_period = 0.5      # seconds per half-cycle; ~2 alternations/s
         self.show_detections = True
@@ -520,11 +520,14 @@ class Pipeline:
 #   edges   thermal edges from t_reg drawn over the plain visible image. The
 #           strongest test of the three: those edges belong to the thermal camera,
 #           so if they land on the visible object's outline the warp is right.
+#   operator preserve visible luminance while carrying thermal information mostly
+#           in colour. Unlike fused, this is meant for a person watching the scene,
+#           not for reading a temperature back from the rendered pixel.
 #
 # All host-side numpy. None of this belongs in fusion.c - that file compiles into
 # firmware, and these are display questions asked while calibrating.
 
-VIEWS = ("fused", "visible", "blink", "mix", "edges")
+VIEWS = ("fused", "visible", "blink", "mix", "edges", "operator")
 
 
 def thermal_edges(treg, w, h, pct=97.0, exclude=None):
@@ -585,9 +588,64 @@ def coverage_outline(cover, w, h):
     return cv2.dilate(c, k) != cv2.erode(c, k)
 
 
-def compose(view, fused, y, treg=None, cover=None, mix=50, phase=True, exclude=None):
+def operator_fusion(fused, y, cover=None, mix=60):
+    """Operator-friendly fusion: visible structure with thermal colour.
+
+    The radiometric fused view intentionally lets temperature own the whole
+    low-frequency image and adds only visible high-frequency detail. That is an
+    honest thermogram, but it hides large visible structures behind an opaque
+    false-colour sheet. This view keeps the visible luminance and borrows the
+    thermal layer's colour, with two deliberately display-only adaptations:
+
+      * flat/low-contrast visible areas trust thermal luminance more, while
+        textured areas retain more of the camera image;
+      * the thermal footprint is feathered into visible grey instead of ending
+        at a hard rectangular seam.
+
+    Temperatures still come from temp_at()/temp_region(), never from this image.
+    mix is the nominal thermal weight and remains one live control shared with
+    the simple mix view.
+    """
+    gray = np.repeat(y[:, :, None], 3, 2)
+    base = max(0.0, min(1.0, mix / 100.0))
+
+    # Split fused into luma and colour residual directly. This has the useful
+    # property of LAB/YCbCr (visible brightness and thermal colour can be mixed
+    # independently) without two expensive full-frame colour conversions.
+    fused_luma = cv2.cvtColor(fused, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    yf = y.astype(np.float32)
+    local_mean = cv2.blur(y, (17, 17), borderType=cv2.BORDER_REFLECT)
+    local_detail = cv2.absdiff(y, local_mean).astype(np.float32)
+    visible_confidence = np.clip((local_detail - 2.0) / 22.0, 0.0, 1.0)
+    thermal_luma = np.clip(base + (0.5 - visible_confidence) * 0.30, 0.20, 0.90)
+
+    target_luma = fused_luma * thermal_luma + yf * (1.0 - thermal_luma)
+    chroma = 0.25 + 0.75 * base
+    out = target_luma[..., None] + (
+        fused.astype(np.float32) - fused_luma[..., None]) * chroma
+    out = np.clip(out, 0, 255).astype(np.uint8)
+
+    if cover is not None:
+        # Roughly a 20 px transition at 640x400: wide enough not to look like a
+        # calibration cut, narrow enough not to imply thermal coverage far past
+        # the last measured cell. Blur on the 160x100 grid first: the result is
+        # the same scale, with a quarter of each dimension to process.
+        footprint = cv2.GaussianBlur(cover.astype(np.float32), (0, 0),
+                                     sigmaX=2.0, sigmaY=2.0)
+        footprint = cv2.resize(footprint, (out.shape[1], out.shape[0]),
+                               interpolation=cv2.INTER_LINEAR)
+        footprint = np.clip(footprint, 0.0, 1.0)[..., None]
+        out = (out.astype(np.float32) * footprint
+               + gray.astype(np.float32) * (1.0 - footprint)).astype(np.uint8)
+    return out
+
+
+def compose(view, fused, y, treg=None, cover=None, mix=50, phase=True,
+            exclude=None, outline=True):
     """Build the frame the browser sees. `fused` is never modified in place."""
-    if view == "mix":
+    if view == "operator":
+        out = operator_fusion(fused, y, cover=cover, mix=mix)
+    elif view == "mix":
         a = max(0.0, min(1.0, mix / 100.0))
         out = (fused.astype(np.float32) * a
                + np.repeat(y[:, :, None], 3, 2).astype(np.float32) * (1.0 - a)).astype(np.uint8)
@@ -600,7 +658,7 @@ def compose(view, fused, y, treg=None, cover=None, mix=50, phase=True, exclude=N
     else:
         out = fused.copy()
 
-    if cover is not None:
+    if cover is not None and outline:
         out[coverage_outline(cover, out.shape[1], out.shape[0])] = (255, 210, 40)
     return out
 
@@ -1103,12 +1161,14 @@ class Renderer(threading.Thread):
 
             if p.view != "fused" or p.outline:
                 edges = p.view == "edges"
+                needs_cover = p.outline or p.view == "operator"
                 rgb = compose(p.view, rgb, y,
                               treg=p.treg_grid() if edges else None,
                               exclude=p.repaired_grid() if edges else None,
-                              cover=p.cover_grid() if p.outline else None,
+                              cover=p.cover_grid() if needs_cover else None,
                               mix=p.mix,
-                              phase=int(time.time() / p.blink_period) % 2 == 0)
+                              phase=int(time.time() / p.blink_period) % 2 == 0,
+                              outline=p.outline)
 
             # The recording feeds calibration picking, so it must not carry the
             # guessed radar overlay or detection boxes: a pixel clicked next to
@@ -2120,11 +2180,11 @@ SOC</div>
 
   <aside>
     <div class=card>
-      <h4>view <span class=k>1-5</span></h4>
+      <h4>view <span class=k>1-6</span></h4>
       <div class=body>
         <div class=seg id=view></div>
-        <div class=sl><label>mix &mdash; fused vs visible</label><output id=o_mix>50</output>
-          <input type=range id=mix min=0 max=100 value=50></div>
+        <div class=sl><label>thermal weight &mdash; mix/operator</label><output id=o_mix>60</output>
+          <input type=range id=mix min=0 max=100 value=60></div>
         <label class=chk><input type=checkbox id=outline> thermal footprint
           <span class=sub id=s_cov></span></label>
         <label class=chk><input type=checkbox id=boxes checked> detection boxes
@@ -2208,6 +2268,13 @@ SOC</div>
   the thermal camera stops seeing at all &mdash; outside it the grey is not a cold reading, it
   is no reading.</p></details>
 
+  <details><summary>Operator view</summary>
+  <p><b>operator</b> keeps visible luminance and uses the registered thermal layer
+  mainly for colour. Its weight adapts to local visible contrast and the footprint
+  fades into plain grey at the edge. It is easier to watch than <b>fused</b>, but its
+  rendered colour is not a temperature scale; use the probe and detection labels
+  for measurements.</p></details>
+
   <details><summary>The clock</summary>
   <p>One thermal period drawn to scale, with the moment the visible frame was actually grabbed
   marked inside it. Both timestamps come off the board's own clock; arrival times on this host
@@ -2279,7 +2346,7 @@ function seg(boxId, names, param, onpick) {
 function pick(boxId, v) {
   for (const b of $(boxId).children) b.className = (b.dataset.v === v) ? 'on' : '';
 }
-const VIEWS = ['fused','visible','blink','mix','edges'];
+const VIEWS = ['fused','visible','blink','mix','edges','operator'];
 seg('view', VIEWS, 'view');
 seg('pal', ['ironbow','white','black','gray'], 'palette');
 
@@ -2892,6 +2959,15 @@ def session_meta(args):
         with open(path, 'rb') as f:
             return hashlib.sha256(f.read()).hexdigest()
 
+    detector_engine = args.detect_engine
+    if (args.detect != 'off' and args.detect_backend != 'cpu' and
+            detector_engine is None):
+        try:
+            import trt_detect
+            detector_engine = trt_detect.model_paths(args.detect_model)[1]
+        except Exception:
+            detector_engine = None
+
     return {
         'tool': 'live.py',
         'argv': sys.argv[1:],
@@ -2903,11 +2979,17 @@ def session_meta(args):
         'radar_calib': args.radar_calib,
         'radar_calib_sha256': _sha(args.radar_calib),
         'detector': args.detect,
+        'detector_model': (args.detect_model if args.detect != 'off' else None),
+        'detector_engine': detector_engine,
+        'detector_engine_sha256': _sha(detector_engine),
         'radar_cfg_stamp': stamp,
         'radar_cfg_stamp_note': stamp_note,
         'tmin': tmin_c,
         'tmax': tmax_c,
         'c_per_lsb': (tmax_c - tmin_c) / 255.0,
+        'thermal_dtype': 'uint8',
+        'thermal_encoding': 'linear_set_range',
+        'thermal_counts_max': 255,
         # The bring-up has run the Lepton in HIGH gain since 2026-08-09
         # (capture._BRINGUP, SET_MODE(True, False)); recorded so a future
         # low-gain session cannot be silently mixed in as the same scale.
@@ -2983,10 +3065,13 @@ def main():
                          "class list such as 'person,cat'. Attaches a temperature to "
                          "every box")
     ap.add_argument("--detect-backend", default="auto", choices=["auto", "gpu", "cpu"],
-                    help="'gpu' runs yolov10n on TensorRT (~7ms, and leaves the cores "
-                         "for the serial reader); 'cpu' runs yolov4-tiny on cv2.dnn "
-                         "(~68-126ms, four of six cores). 'auto' prefers the GPU and "
-                         "warns on stderr if it falls back (default auto)")
+                    help="'gpu' runs the selected TensorRT model; 'cpu' runs "
+                         "yolov4-tiny with cv2.dnn. 'auto' prefers GPU")
+    ap.add_argument("--detect-model", default="yolov10n",
+                    choices=["yolov10n", "yolov8n", "yolo11n"],
+                    help="TensorRT detector model (GPU only; default yolov10n)")
+    ap.add_argument("--detect-engine", metavar="PATH",
+                    help="override the registered TensorRT engine path")
     ap.add_argument("--detect-size", type=int, default=416, choices=[320, 416],
                     help="detector input size, CPU backend only. 416 is 68ms and 320 is "
                          "46ms on this host, against a 114ms frame period. The GPU "
@@ -3017,7 +3102,7 @@ def main():
     ap.add_argument("--radar-calib", metavar="JSON",
                     help="solved intrinsics/extrinsics to project with, instead of the guess")
     ap.add_argument("--view", default="fused",
-                    choices=["fused", "visible", "blink", "mix", "edges"],
+                    choices=list(VIEWS),
                     help="view to start in, and therefore what gets recorded. "
                          "For picking a pixel off the recording, see the note in "
                          "radar_correspond.py: the thermal layer is NOT registered "
@@ -3060,10 +3145,17 @@ def main():
                 raise SystemExit("not COCO classes: %s\navailable: %s"
                                  % (", ".join(unknown), " ".join(detect.COCO)))
         try:
-            detector = detect.make_detector(args.detect_backend, size=args.detect_size,
-                                            conf=args.detect_conf, classes=classes)
-        except FileNotFoundError as e:
+            detector = detect.make_detector(
+                args.detect_backend, size=args.detect_size,
+                conf=args.detect_conf, classes=classes,
+                model=args.detect_model, engine=args.detect_engine)
+        except (FileNotFoundError, RuntimeError) as e:
             raise SystemExit("detector model missing: %s" % e)
+        # Session provenance must describe the backend that actually won.
+        # In auto mode this may be the CPU fallback, not the requested engine.
+        args.detect_backend = detector.backend
+        args.detect_model = detector.model_name
+        args.detect_engine = getattr(detector, "engine_path", None)
 
     work = Latest()
     radar = radar_proj = video = None
@@ -3123,7 +3215,8 @@ def main():
         gpu = getattr(detector, "backend", "cpu") == "gpu"
         print("detecting %s at %d px (%s)"
               % (args.detect, detector.net_w if gpu else args.detect_size,
-                 "yolov10n/TensorRT" if gpu else "yolov4-tiny/CPU"), file=sys.stderr)
+                 detector.model_name + "/TensorRT" if gpu else
+                 detector.model_name + "/CPU"), file=sys.stderr)
 
     # How long the stream may stay down before this gives up on it. The
     # supervisor in Streamer.run() exists to survive a fault - a wedged Lepton, a

@@ -16,6 +16,31 @@ of that pipeline lives in a subdirectory named for what it is.
 | `send_radar_cfg.py` | pushes the chirp config to the radar CLI UART — run this before `live.py --radar` |
 | `mpx.py` | minimal raw-REPL runner; how everything in `board/` gets onto the board |
 
+
+The viewer's `operator` mode preserves visible luminance, adds adaptive thermal
+colour and feathers the calibrated thermal footprint. It is the default in
+`run_live.sh`; use `--view visible` for calibration picking and `--view fused`
+when the rendered palette itself must remain a fixed thermal scale.
+
+## Detector models on the Jetson
+
+`live.py` accepts `--detect-model yolov10n|yolov8n|yolo11n`. The repository
+loader requires one static 640×640 TensorRT input and an NMS-included
+`[1,max_det,6]` output; raw Ultralytics exports are rejected. YOLOv10n is
+already installed on this rig. To prepare YOLO11n, export ONNX in an isolated
+Ultralytics environment (this may be a workstation or Colab), copy the ONNX to
+`~/archive/radar/models/`, then build the engine on the Jetson:
+
+```sh
+python3 tools/export_ultralytics_onnx.py --model yolo11n
+python3 tools/trt_detect.py --build yolo11n --verbose
+python3 tools/live.py --detect person --detect-backend gpu --detect-model yolo11n
+```
+
+TensorRT engines are specific to the target GPU/TensorRT version; do not copy
+an engine built on a different computer. Ultralytics code and pretrained models
+are AGPL-3.0 by default, so check licensing before closed-source deployment.
+
 ## board/ — runs ON the N6
 
 Pure MicroPython, pushed whole with `./mpx.py board/<script>.py`. The
