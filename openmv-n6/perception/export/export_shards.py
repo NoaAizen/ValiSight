@@ -166,14 +166,31 @@ def load_heatmaps(sess):
 
 def export_session(sess, teacher, coco_boxes, keep_rgb,
                    teacher_available=True, verified_negative=False):
-    """One session -> list of per-frame dicts, in time order."""
+    """One session -> iterator of per-frame dicts, in time order.
+
+    A generator rather than a list on purpose: multi5 alone is ~25k paired
+    frames, and holding one session's RGB in memory OOM-killed the export
+    twice on the 7.6GB Jetson (2026-08-23). Rows stream straight into
+    write_shards, which flushes a file every per_shard rows.
+    """
     ls = LiveSession(os.path.join(CAPTURES, sess))
     meta_by_i = {m['i']: m for m in ls.frames}
     heatmaps = load_heatmaps(sess)
     if heatmaps:
         print(f'[export] {sess}: radar dense streams present '
               f'({len(heatmaps)} radar frames) - exporting RA/RD/RP')
-    frames = []
+    # Shard rows must be key-uniform (np.stack). The map shapes are known
+    # from radar.bin before any row is built, so a frame that missed a map
+    # (session start, stale radar) gets zeros plus a validity flag right
+    # here, instead of in a second pass over a full in-memory session.
+    map_shape = {}
+    if heatmaps:
+        for key, short in (('range_angle', 'ra'), ('range_doppler', 'rd'),
+                           ('range_profile', 'rp')):
+            for hm in heatmaps.values():
+                if hm[short] is not None:
+                    map_shape[key] = hm[short].shape
+                    break
     prev_t = None
     n_dropped_radar = 0
     for tr in ls.triplets():
@@ -236,41 +253,33 @@ def export_session(sess, teacher, coco_boxes, keep_rgb,
         row['thermal_label_state'] = np.int8(
             label_state(bool(th_rows), frame_negative))
         row['teacher_available'] = np.bool_(teacher_available)
-        frames.append(row)
+        for key, flag in (('range_angle', 'ra_valid'),
+                          ('range_doppler', 'rd_valid'),
+                          ('range_profile', 'rp_valid')):
+            if key in map_shape:
+                row[flag] = np.bool_(key in row)
+                if key not in row:
+                    row[key] = np.zeros(map_shape[key], np.float16)
+        yield row
     if n_dropped_radar:
         print(f'[export] {sess}: {n_dropped_radar} radar points beyond '
               f'K={RADAR_K} dropped (weakest SNR first)')
-    # Shard rows must be key-uniform (np.stack). Frames that missed a map
-    # (session start, stale radar) get zeros plus a validity flag, so the
-    # loader can mask them instead of learning from silence.
-    for key, flag in (('range_angle', 'ra_valid'),
-                      ('range_doppler', 'rd_valid'),
-                      ('range_profile', 'rp_valid')):
-        shapes = [f[key].shape for f in frames if key in f]
-        if not shapes:
-            continue
-        shape = shapes[0]
-        for f in frames:
-            f[flag] = np.bool_(key in f)
-            if key not in f:
-                f[key] = np.zeros(shape, np.float16)
-    return frames
 
 
-def session_thermal_meta(sess, frames):
+def session_thermal_meta(sess, thermal_dtypes):
     """Thermal scale and dtype, refusing mixed/ambiguous frame formats."""
     path = os.path.join(CAPTURES, sess, 'meta.json')
     meta = {}
     if os.path.exists(path):
         with open(path) as f:
             meta = json.load(f)
-    dtypes = {str(f['thermal'].dtype) for f in frames}
+    dtypes = set(thermal_dtypes)
     if len(dtypes) != 1:
         raise ValueError(f'{sess}: mixed thermal dtypes in one session: {dtypes}')
     dtype = dtypes.pop()
     dtype_name = 'uint16_le' if dtype == 'uint16' else dtype
     counts_max = int(meta.get(
-        'thermal_counts_max', np.iinfo(frames[0]['thermal'].dtype).max))
+        'thermal_counts_max', np.iinfo(np.dtype(dtype)).max))
     tmin, tmax = meta.get('tmin'), meta.get('tmax')
     c_per_lsb = meta.get('c_per_lsb')
     if c_per_lsb is None and tmin is not None and tmax is not None:
@@ -304,16 +313,34 @@ def session_provenance(sess):
     }
 
 
-def write_shards(frames, sess, out_dir, per_shard, keep_rgb):
-    paths = []
-    for s0 in range(0, len(frames), per_shard):
-        chunk = frames[s0:s0 + per_shard]
-        arrs = {k: np.stack([f[k] for f in chunk])
-                for k in chunk[0] if k != 'rgb' or keep_rgb}
-        path = os.path.join(out_dir, f'{sess}-{s0 // per_shard:03d}.npz')
+def write_shards(rows, sess, out_dir, per_shard, keep_rgb):
+    """Consume the row iterator, flushing a shard file every per_shard rows.
+
+    Returns (paths, stats); stats carries what the manifest needs and was
+    previously recomputed from the full in-memory session list.
+    """
+    paths, buf = [], []
+    stats = {'frames': 0, 'n_lab': 0, 'n_neg': 0, 'thermal_dtypes': set()}
+
+    def flush():
+        arrs = {k: np.stack([f[k] for f in buf])
+                for k in buf[0] if k != 'rgb' or keep_rgb}
+        path = os.path.join(out_dir, f'{sess}-{len(paths):03d}.npz')
         np.savez_compressed(path, **arrs)
         paths.append(os.path.basename(path))
-    return paths
+        buf.clear()
+
+    for row in rows:
+        stats['frames'] += 1
+        stats['n_lab'] += int(int(row['n_th_boxes']) > 0)
+        stats['n_neg'] += int(int(row['thermal_label_state']) == 0)
+        stats['thermal_dtypes'].add(str(row['thermal'].dtype))
+        buf.append(row)
+        if len(buf) == per_shard:
+            flush()
+    if buf:
+        flush()
+    return paths, stats
 
 
 TRAINING_CODE_FILES = (
@@ -408,21 +435,21 @@ def main():
         teacher_path = os.path.join(AUTOLABEL, f'{sess}_teacher.jsonl')
         teacher_available = os.path.exists(teacher_path)
         teacher = load_teacher(sess)
-        frames = export_session(
+        rows = export_session(
             sess, teacher, coco_boxes, keep_rgb,
             teacher_available=teacher_available,
             verified_negative=sess in verified_negative)
-        if not frames:
+        shards, stats = write_shards(rows, sess, out_dir, a.frames_per_shard,
+                                     keep_rgb)
+        if not stats['frames']:
             print(f'[export] {sess}: nothing exportable (fused view or no '
                   f'thermal) - skipped')
             continue
-        shards = write_shards(frames, sess, out_dir, a.frames_per_shard,
-                              keep_rgb)
-        thermal_meta = session_thermal_meta(sess, frames)
-        n_lab = sum(int(f['n_th_boxes']) > 0 for f in frames)
-        n_neg = sum(int(f['thermal_label_state']) == 0 for f in frames)
+        thermal_meta = session_thermal_meta(sess, stats['thermal_dtypes'])
+        n_lab = stats['n_lab']
+        n_neg = stats['n_neg']
         manifest['sessions'][sess] = {
-            'shards': shards, 'frames': len(frames),
+            'shards': shards, 'frames': stats['frames'],
             'frames_with_gradeA': n_lab,
             'verified_negative_frames': n_neg,
             'provenance': session_provenance(sess),
@@ -430,7 +457,7 @@ def main():
         }
         which = 'val' if sess in a.val else 'train'
         manifest['split'][which].append(sess)
-        print(f'[export] {sess}: {len(frames)} frames ({n_lab} with grade-A '
+        print(f'[export] {sess}: {stats["frames"]} frames ({n_lab} with grade-A '
               f'boxes) -> {len(shards)} shard(s) [{which}]')
 
     manifest['training_bundle'] = write_training_bundle(out_dir)
