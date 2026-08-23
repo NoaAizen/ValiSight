@@ -1752,7 +1752,14 @@ class Streamer(threading.Thread):
             if stalled:
                 self.state["stalls"] = self.state.get("stalls", 0) + stalled
                 self.state["last_stall_t"] = now
-            if dt_ms is not None and dt_ms > LEPTON_SAFE_GAP_MS:
+            # frames > 1: the first interval of a session spans whatever came
+            # before the viewer attached - board idle, bring-up, a previous
+            # viewer's death - measured on the board clock, which survives
+            # attach. That time was not this session's draining and one such
+            # count would hold the panel red for the whole run (2026-08-23:
+            # worst 21737302ms = six idle hours, on a link running at 8.77fps).
+            if dt_ms is not None and dt_ms > LEPTON_SAFE_GAP_MS \
+                    and self.state.get("frames", 0) > 1:
                 self.state["starved"] = self.state.get("starved", 0) + 1
                 self.state["last_starve_ms"] = dt_ms
 
@@ -3150,12 +3157,20 @@ def main():
                 conf=args.detect_conf, classes=classes,
                 model=args.detect_model, engine=args.detect_engine)
         except (FileNotFoundError, RuntimeError) as e:
-            raise SystemExit("detector model missing: %s" % e)
-        # Session provenance must describe the backend that actually won.
-        # In auto mode this may be the CPU fallback, not the requested engine.
-        args.detect_backend = detector.backend
-        args.detect_model = detector.model_name
-        args.detect_engine = getattr(detector, "engine_path", None)
+            # The stream, the radar and the thermal measurement do not need the
+            # detector; losing all of them to a missing weights file or a GPU
+            # that would not come up turned every detector fault into a dead
+            # system (2026-08-23). Degrade loudly instead.
+            print("detector unavailable, RUNNING WITHOUT DETECTION: %s" % e,
+                  file=sys.stderr)
+            detector = None
+            args.detect = "off"
+        if detector:
+            # Session provenance must describe the backend that actually won.
+            # In auto mode this may be the CPU fallback, not the requested engine.
+            args.detect_backend = detector.backend
+            args.detect_model = detector.model_name
+            args.detect_engine = getattr(detector, "engine_path", None)
 
     work = Latest()
     radar = radar_proj = video = None
