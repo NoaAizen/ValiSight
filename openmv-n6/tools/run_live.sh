@@ -123,6 +123,20 @@ if [ "${SKIP_CFG:-0}" != "1" ]; then
 fi
 
 # --- launch ----------------------------------------------------------------
+# Port args in "$@" come AFTER ours and silently override the USB-resolved
+# ports - a bare --radar swings the reader onto whatever DATA_PORT's default
+# happens to be, which has already been the BOARD (radar3-walkdepth1,
+# 2026-08-24: 3 min of video, zero radar frames). This script owns the ports;
+# refuse rather than record a crippled session.
+for a in "$@"; do
+    case "$a" in
+        --radar|--radar=*|-p|--port)
+            echo "run_live.sh resolves the ports itself - drop '$a' from the" >&2
+            echo "arguments (it would override the detected port and can point" >&2
+            echo "the radar reader at the board)" >&2
+            exit 1;;
+    esac
+done
 # --radar-hfov 62.7 overrides live.py's 70 deg default with the measured value
 # (f = 525 px at 640 wide, caliper checkerboard against a tape measure).
 # It only matters as a fallback: when the solved calib below exists, its K
@@ -163,10 +177,12 @@ kill -0 "$NEW_PID" 2>/dev/null \
 
 # --- wait for the stream, then apply the solved extrinsic ------------------
 # Board bring-up is ~10 s (drain + Lepton sync), and live.py restarts it on a
-# fault, so allow for one retry before giving up.
+# fault, so allow for one retry before giving up. The detector's GPU probe can
+# add up to ~20 s of retries after a reboot (detect.py GPU_PROBE_TRIES) before
+# frames start, hence 70 and not 45.
 echo -n "waiting for the first frame"
 UP=0
-for _ in $(seq 45); do
+for _ in $(seq 70); do
     if curl -s --max-time 2 "http://localhost:$HTTP/health" 2>/dev/null \
        | grep -q '"name": "stream", "level": "ok"\|"name":"stream","level":"ok"'; then
         UP=1; break
@@ -198,11 +214,19 @@ echo
 if [ "$UP" = 1 ]; then
     echo "live on http://localhost:$HTTP"
 else
-    echo "stream did not come up in 45 s - check $LOG" >&2
+    echo "stream did not come up in 70 s - check $LOG" >&2
 fi
+
+# A viewer that came up without its detector, or on the 10x-slower CPU
+# fallback, streams identically to a healthy one - say so here or it is
+# discovered hours later in the recordings.
+grep -m1 -E 'RUNNING WITHOUT DETECTION|falling back to yolov4-tiny' "$LOG" >&2 || true
 curl -s --max-time 5 "http://localhost:$HTTP/health" 2>/dev/null | python3 -c '
 import json, sys
-d = json.load(sys.stdin)
+raw = sys.stdin.read()
+if not raw.strip():
+    sys.exit(0)          # viewer dead or unreachable - already reported above
+d = json.loads(raw)
 print("health: %s" % d["worst"].upper())
 for c in d["checks"]:
     if c["level"] != "ok":
