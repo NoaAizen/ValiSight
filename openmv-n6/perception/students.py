@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import time
 from typing import Dict, Iterable, Mapping, Optional, Sequence
 
@@ -321,10 +322,12 @@ class PointFeatureBuilder(nn.Module):
         count = nn_valid.sum(dim=-1).clamp(min=1)
         safe = torch.where(nn_valid, nn_dist, torch.zeros_like(nn_dist))
         mean_dist = safe.sum(dim=-1) / count
+        # inf is representable in float16; a 1e9 literal is not (AMP overflow)
         min_dist = torch.where(
-            nn_valid, nn_dist, torch.full_like(nn_dist, 1e9)
+            nn_valid, nn_dist, torch.full_like(nn_dist, float("inf"))
         ).min(dim=-1).values
-        min_dist = torch.where(min_dist > 1e8, torch.zeros_like(min_dist), min_dist)
+        min_dist = torch.where(
+            torch.isinf(min_dist), torch.zeros_like(min_dist), min_dist)
 
         def neighbour_delta(value):
             expanded = value[:, None, :].expand(b, k, k)
@@ -404,7 +407,10 @@ class PointSetEncoder(nn.Module):
 
     def forward(self, features, valid):
         f = self.point_mlp(self.input_norm(features))
-        fmax = f.masked_fill(~valid.unsqueeze(-1), -1e9).max(dim=1).values
+        # fill must fit the runtime dtype: under AMP f is float16, where a
+        # literal -1e9 overflows Half and forward() crashes on GPU
+        fill = torch.finfo(f.dtype).min
+        fmax = f.masked_fill(~valid.unsqueeze(-1), fill).max(dim=1).values
         any_valid = valid.any(dim=1)
         fmax = torch.where(any_valid[:, None], fmax, torch.zeros_like(fmax))
         count = valid.sum(dim=1, keepdim=True).clamp(min=1)
@@ -640,7 +646,8 @@ def evaluate_model(model, loader, image_width, image_height, device,
 
 def train_model(model, train_loader, val_loader, image_width, image_height,
                 device, epochs=50, learning_rate=1e-3,
-                weight_decay=1e-4, use_amp=True, tag="student"):
+                weight_decay=1e-4, use_amp=True, tag="student",
+                resume_path=None):
     model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -649,8 +656,26 @@ def train_model(model, train_loader, val_loader, image_width, image_height,
     amp_enabled = bool(use_amp and device.type == "cuda")
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
     best_state, best_score, best_metrics = None, float("inf"), None
+    start_epoch = 0
 
-    for epoch in range(epochs):
+    # Colab runtimes die without warning; a per-epoch resume file means an
+    # interrupted run continues instead of restarting from zero. The file
+    # lives next to the final checkpoint (on Drive in Colab) and is deleted
+    # by the caller once the final .pt is safely written.
+    if resume_path and os.path.exists(resume_path):
+        ckpt = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ckpt["model_state"])
+        optimizer.load_state_dict(ckpt["optimizer_state"])
+        scheduler.load_state_dict(ckpt["scheduler_state"])
+        scaler.load_state_dict(ckpt["scaler_state"])
+        best_state = ckpt["best_state"]
+        best_score = ckpt["best_score"]
+        best_metrics = ckpt["best_metrics"]
+        start_epoch = ckpt["epoch"] + 1
+        print(f"[{tag}] resuming from {resume_path} at epoch "
+              f"{start_epoch + 1}/{epochs}")
+
+    for epoch in range(start_epoch, epochs):
         model.train()
         running, batches = 0.0, 0
         started = time.time()
@@ -688,8 +713,30 @@ def train_model(model, train_loader, val_loader, image_width, image_height,
                 f"F1={metrics['f1']:.3f} "
                 f"u={metrics['median_u_px']:.1f}px "
                 f"v={metrics['median_v_px']:.1f}px "
-                f"{time.time() - started:.1f}s"
+                f"{time.time() - started:.1f}s",
+                flush=True,
             )
+        else:
+            print(
+                f"[{tag}] {epoch + 1:03d}/{epochs} "
+                f"loss={running / max(batches, 1):.4f} "
+                f"{time.time() - started:.1f}s",
+                flush=True,
+            )
+
+        if resume_path:
+            tmp = resume_path + ".tmp"
+            torch.save({
+                "epoch": epoch,
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "scaler_state": scaler.state_dict(),
+                "best_state": best_state,
+                "best_score": best_score,
+                "best_metrics": best_metrics,
+            }, tmp)
+            os.replace(tmp, resume_path)
 
     if best_state is not None:
         model.load_state_dict(best_state)

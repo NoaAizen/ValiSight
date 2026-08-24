@@ -135,11 +135,12 @@ def main():
         train_loader, val_loader = build_loaders(
             train, val, "thermal", args.max_objects,
             args.batch_size, args.workers)
+        resume = os.path.join(out_dir, "thermal_resume.pt")
         model, metrics = train_model(
             model, train_loader, val_loader, 160, 120, device,
             epochs=args.epochs, learning_rate=args.learning_rate,
             weight_decay=args.weight_decay, use_amp=not args.no_amp,
-            tag="THERMAL")
+            tag="THERMAL", resume_path=resume)
         path = os.path.join(out_dir, "thermal_student.pt")
         torch.save(checkpoint_payload(
             model, metrics, manifest, args, {
@@ -151,6 +152,8 @@ def main():
                 "disabled_channels": disabled,
                 "max_objects": args.max_objects,
             }), path)
+        if os.path.exists(resume):
+            os.remove(resume)
         print(f"saved {path}")
         print(json.dumps(metrics, indent=2))
 
@@ -175,11 +178,12 @@ def main():
         train_loader, val_loader = build_loaders(
             train, val, "radar", args.max_objects,
             args.batch_size, args.workers)
+        resume = os.path.join(out_dir, "radar_resume.pt")
         model, metrics = train_model(
             model, train_loader, val_loader, 640, 400, device,
             epochs=args.epochs, learning_rate=args.learning_rate,
             weight_decay=args.weight_decay, use_amp=not args.no_amp,
-            tag="RADAR")
+            tag="RADAR", resume_path=resume)
         path = os.path.join(out_dir, "radar_student.pt")
         torch.save(checkpoint_payload(
             model, metrics, manifest, args, {
@@ -200,6 +204,8 @@ def main():
                 "rp_channels": (model.rp_derived.channel_names
                                 if model.use_rp else []),
             }), path)
+        if os.path.exists(resume):
+            os.remove(resume)
         print(f"saved {path}")
         print(json.dumps(metrics, indent=2))
 

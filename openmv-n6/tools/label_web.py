@@ -24,11 +24,13 @@ then open http://localhost:8090 (or the Jetson's address from another machine).
 Keys: ->/Space save+next   <- save+prev   a accept teacher boxes
       c copy from last labeled frame      x clear frame (explicit empty)
       Delete remove selected box          g go to frame
+      u jump to next unlabeled frame
 """
 import argparse
 import json
 import os
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
@@ -69,7 +71,13 @@ def extract_frames(sess, cache_dir):
 
 
 def load_teacher(sess_name):
-    path = os.path.join(AUTOLABEL, sess_name + '_teacher.jsonl')
+    # Suggestions must come from the MACHINE teacher. After manual_to_teacher
+    # has run on a session, <sess>_teacher.jsonl IS the manual labels (moved
+    # machine file: <sess>.teacher-machine.jsonl) - feeding those back as
+    # "suggestions" shows nothing on any frame the human has not labeled yet.
+    path = os.path.join(AUTOLABEL, sess_name + '.teacher-machine.jsonl')
+    if not os.path.exists(path):
+        path = os.path.join(AUTOLABEL, sess_name + '_teacher.jsonl')
     if not os.path.exists(path):
         return {}
     out = {}
@@ -90,19 +98,42 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
  #bar b { color:#7f7; }
  canvas { border:1px solid #444; cursor:crosshair; }
  #help { color:#888; margin-top:6px; }
+ #nav { margin-top:8px; display:flex; gap:10px; }
+ #nav button { background:#2a2a2a; color:#ddd; border:1px solid #555;
+   border-radius:6px; padding:10px 22px; font:bold 15px monospace;
+   cursor:pointer; }
+ #nav button:hover { background:#3a3a3a; }
+ #nav #bnext { background:#1d4a1d; border-color:#4a8a4a; }
 </style></head><body>
 <div id="bar">frame <b id="fi">0</b>/%(last)d · labeled <b id="nl">0</b>
  · <span id="src"></span></div>
 <canvas id="cv" width="%(w)d" height="%(h)d"></canvas>
+<div id="nav">
+ <button id="bprev">&#9664; prev</button>
+ <button id="baccept">accept (a)</button>
+ <button id="bempty">empty (x)</button>
+ <button id="bunlab">unlabeled (u)</button>
+ <button id="bnext">next &#9654;</button>
+</div>
 <div id="help">drag=box · click=select · Del=remove · a=accept teacher ·
  c=copy prev · x=clear(empty) · &larr;/&rarr;/Space=nav (stride %(stride)d) ·
- g=goto · b=brighten (display only)</div>
+ g=goto · u=next unlabeled · b=brighten (display only)</div>
 <script>
 const W=%(w)d, H=%(h)d, LAST=%(last)d, STRIDE=%(stride)d;
 let i=%(start)d, boxes=[], teacher=[], sel=-1, dirty=false, drag=null;
 const cv=document.getElementById('cv'), cx=cv.getContext('2d');
-const img=new Image();
-img.onload=draw;
+// The dev-server sends no cache validators, so the browser re-downloads every
+// frame it re-visits; holding Image objects ourselves makes prefetch and
+// back-navigation instant on slow links. Window of 30 bounds memory.
+let img=new Image();
+const icache={}, iorder=[];
+function fimg(n){
+  if(n<0||n>LAST) return null;
+  if(!icache[n]){ const im=new Image(); im.src='/frame/'+n;
+    icache[n]=im; iorder.push(n);
+    if(iorder.length>30) delete icache[iorder.shift()]; }
+  return icache[n];
+}
 
 // Display-only brightening for dark sessions: applied to the image draw and
 // never to the pixels on disk or the box coordinates, so what is saved is
@@ -131,8 +162,14 @@ async function load(n){
   document.getElementById('src').textContent =
     r.manual!==null ? (r.manual.length?'manual':'manual: empty')
                     : (teacher.length?'teacher suggestion (a=accept)':'unlabeled');
-  img.src='/frame/'+i;
+  img=fimg(i);
+  if(img.complete) draw(); else img.onload=draw;
+  fimg(i+STRIDE); fimg(i+2*STRIDE);   // prefetch ahead in the nav direction
 }
+// save and load talk to independent endpoints and save snapshots its payload
+// synchronously, so navigation need not wait a full round-trip for the save -
+// on a high-latency link that wait was most of the felt slowness.
+async function nav(n){ const s=save(); load(n); await s; }
 async function save(){
   // A failed save must STOP the operator, loudly - silently losing an hour
   // of labeling to a dead server is the worst failure this tool can have.
@@ -164,22 +201,41 @@ cv.onmouseup=e=>{ if(!drag) return;
   draw(); };
 
 document.onkeydown=async e=>{
-  if(e.key==='ArrowRight'||e.key===' '){ e.preventDefault();
-    await save(); load(i+STRIDE); }
+  // e.code names the physical key, so shortcuts survive Hebrew layout and
+  // caps lock (e.key would be the mapped character, e.g. 'a' -> 'ש')
+  const k=(e.code&&e.code.startsWith('Key'))?e.code.slice(3).toLowerCase():e.key;
+  if(e.key==='ArrowRight'||e.key===' '||e.code==='Space'){ e.preventDefault();
+    await nav(i+STRIDE); }
   else if(e.key==='ArrowLeft'){ e.preventDefault();
-    await save(); load(i-STRIDE); }
+    await nav(i-STRIDE); }
   else if(e.key==='Delete'||e.key==='Backspace'){
     if(sel>=0){ boxes.splice(sel,1); sel=-1; dirty=true; draw(); } }
-  else if(e.key==='a'){ boxes=boxes.concat(
+  else if(k==='a'){ boxes=boxes.concat(
       teacher.map(b=>({x:b.x,y:b.y,w:b.w,h:b.h}))); teacher=[];
     dirty=true; draw(); }
-  else if(e.key==='x'){ boxes=[]; sel=-1; dirty=true; draw(); }
-  else if(e.key==='b'){ gain=(gain+1)%%GAINS.length; draw(); }
-  else if(e.key==='c'){ const r=await (await fetch('/prev/'+i)).json();
+  else if(k==='x'){ boxes=[]; sel=-1; dirty=true; draw(); }
+  else if(k==='b'){ gain=(gain+1)%%GAINS.length; draw(); }
+  else if(k==='c'){ const r=await (await fetch('/prev/'+i)).json();
     if(r.boxes){ boxes=r.boxes; dirty=true; draw(); } }
-  else if(e.key==='g'){ const n=prompt('frame:'); if(n!==null){
-    await save(); load(parseInt(n)||0); } }
+  else if(k==='g'){ const n=prompt('frame:'); if(n!==null){
+    await nav(parseInt(n)||0); } }
+  else if(k==='u'){ await gounlabeled(); }
 };
+async function gounlabeled(){
+  // save first so the current frame counts as labeled before the search
+  await save();
+  const r=await (await fetch('/unlabeled/'+i)).json();
+  if(r.i===null) alert('all frames labeled - session done!');
+  else await load(r.i);
+}
+// Mouse buttons for hosts that swallow the keyboard (VSCode's simple
+// browser, some remote-desktop setups): same save+navigate paths as the keys.
+document.getElementById('bnext').onclick=()=>nav(i+STRIDE);
+document.getElementById('bprev').onclick=()=>nav(i-STRIDE);
+document.getElementById('baccept').onclick=()=>{ boxes=boxes.concat(
+  teacher.map(b=>({x:b.x,y:b.y,w:b.w,h:b.h}))); teacher=[]; dirty=true; draw(); };
+document.getElementById('bempty').onclick=()=>{ boxes=[]; sel=-1; dirty=true; draw(); };
+document.getElementById('bunlab').onclick=()=>gounlabeled();
 load(i);
 </script></body></html>"""
 
@@ -187,6 +243,10 @@ load(i);
 class Handler(BaseHTTPRequestHandler):
     # filled in main()
     ctx = None
+    # ThreadingHTTPServer handles saves concurrently; without the lock two
+    # rapid navigations both write store+'.tmp' and the loser's os.replace
+    # finds it already gone
+    save_lock = threading.Lock()
 
     def log_message(self, *a):
         pass
@@ -195,6 +255,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', ctype)
         self.send_header('Content-Length', str(len(body)))
+        if ctype == 'image/jpeg':
+            # extracted frames never change; without this the browser
+            # re-downloads every frame it re-visits
+            self.send_header('Cache-Control', 'max-age=86400')
         self.end_headers()
         self.wfile.write(body)
 
@@ -216,6 +280,20 @@ class Handler(BaseHTTPRequestHandler):
                 'manual': c['manual'].get(str(i)),
                 'teacher': c['teacher'].get(i, []),
                 'n_labeled': len(c['manual'])}).encode())
+        if self.path.startswith('/unlabeled/'):
+            i = int(self.path[11:])
+            # next stride-slot with no manual entry ANYWHERE in [t, t+stride),
+            # searching forward from i then wrapping; null when done. Slot
+            # coverage (not exact-index) tolerates labels laid on a shifted
+            # grid - a label at t+1 covers slot t, re-labeling t is waste.
+            s = c['stride']
+
+            def covered(t):
+                return any(str(t + o) in c['manual'] for o in range(s))
+            targets = range(0, c['last'] + 1, s)
+            nxt = next((t for t in targets if t > i and not covered(t)),
+                       next((t for t in targets if not covered(t)), None))
+            return self._send(200, json.dumps({'i': nxt}).encode())
         if self.path.startswith('/prev/'):
             i = int(self.path[6:])
             prev = [int(k) for k in c['manual'] if int(k) < i]
@@ -235,11 +313,12 @@ class Handler(BaseHTTPRequestHandler):
         boxes = [{'x': int(b['x']), 'y': int(b['y']),
                   'w': int(b['w']), 'h': int(b['h'])}
                  for b in body['boxes']]
-        c['manual'][str(i)] = boxes
-        tmp = c['store'] + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump({'stride': c['stride'], 'boxes': c['manual']}, f)
-        os.replace(tmp, c['store'])
+        with self.save_lock:
+            c['manual'][str(i)] = boxes
+            tmp = c['store'] + '.tmp'
+            with open(tmp, 'w') as f:
+                json.dump({'stride': c['stride'], 'boxes': c['manual']}, f)
+            os.replace(tmp, c['store'])
         self._send(200, b'{"ok": true}')
 
 
