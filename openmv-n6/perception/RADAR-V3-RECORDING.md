@@ -14,7 +14,7 @@ not the extreme edges.
 
 ```bash
 RADAR_CFG=radar_people.cfg ./run_live.sh \
-    --record ../captures/radar3-<name> --range 0:60 --students
+    --record ../captures/radar3-<name> --range 0:60 --students --view visible
 ```
 
 Do NOT add `--radar` or `--warp` - run_live.sh passes both itself with the
