@@ -14,9 +14,13 @@ not the extreme edges.
 
 ```bash
 RADAR_CFG=radar_people.cfg ./run_live.sh \
-    --record radar3-<name> --range 0:60 --radar --students \
-    --warp ../calib-artifacts/warp_3.5.lut
+    --record radar3-<name> --range 0:60 --students
 ```
+
+Do NOT add `--radar` or `--warp` - run_live.sh passes both itself with the
+correct USB-resolved port and LUT; a bare `--radar` after it OVERRIDES the
+port with a default that may be the board (this exact collision killed the
+first walkdepth1 attempt).
 
 Non-negotiable: `radar_people.cfg` and `--range 0:60` — the exact config the
 students were trained on. A different chirp config shifts the point statistics

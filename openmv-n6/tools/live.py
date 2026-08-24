@@ -3294,10 +3294,16 @@ def main():
                 print("students: no --warp LUT, thermal-student boxes cannot "
                       "be drawn on the visible frame (still served on "
                       "/state)", file=sys.stderr)
+            # Same range->degrees mapping session_meta() documents: the
+            # recorded uint8 is (tmax - tmin) / 255 per count above tmin.
+            if args.range:
+                s_tmin, s_tmax = (int(v) for v in args.range.split(':'))
+            else:
+                s_tmin, s_tmax = -10, 140
             students = {"thermal": th_model, "radar": rd_model,
                         "th2vis": th2vis,
-                        "c_per_lsb": (tmax_c - tmin_c) / 255.0,
-                        "tmin": float(tmin_c)}
+                        "c_per_lsb": (s_tmax - s_tmin) / 255.0,
+                        "tmin": float(s_tmin)}
             print("students: thermal%s engine(s) up, conf>=%.2f"
                   % ("+radar" if rd_model else "", args.student_conf),
                   file=sys.stderr)
