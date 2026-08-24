@@ -1085,9 +1085,10 @@ class Renderer(threading.Thread):
     """
 
     def __init__(self, pipe, state, work, detector=None, radar=None,
-                 radar_proj=None, video=None):
+                 radar_proj=None, video=None, students=None):
         super().__init__(daemon=True)
         self.pipe, self.state, self.work = pipe, state, work
+        self.students = students
         self.stop = threading.Event()
         # The radar overlay is drawn here rather than in compose() because it is
         # not part of the fused image: it is a separate sensor annotated ON TOP
@@ -1137,6 +1138,63 @@ class Renderer(threading.Thread):
             self.state["detect_ms"] = round(self.det.ms, 1)
             self.state["detect_t"] = time.time()
 
+    # Student overlay colours, RGB frame order (imencode flips to BGR later).
+    STUDENT_TH_COL = (255, 150, 0)       # orange: thermal student
+    STUDENT_RD_COL = (0, 210, 255)       # cyan: radar student
+
+    def _run_students(self, thermal, rgb):
+        """Run the trained students on this tick and draw their boxes.
+
+        Runs inline in the render thread on purpose: both engines together
+        are ~1.5 ms, two orders of magnitude under the frame period, and a
+        third thread would buy nothing but a handoff to race.
+        """
+        s = self.students
+        tdets, rdets = [], []
+        if thermal is not None and len(thermal) == 160 * 120:
+            try:
+                th = (np.frombuffer(thermal, np.uint8)
+                      .astype(np.float32).reshape(120, 160)
+                      * s["c_per_lsb"] + s["tmin"])
+                tdets = s["thermal"].push(th, time.monotonic() * 1e3)
+            except Exception as e:
+                self.state["student_error"] = "thermal %s: %s" % (
+                    type(e).__name__, e)
+        if s["radar"] is not None and self.radar is not None:
+            fr = self.radar.get()
+            if fr is not None:
+                try:
+                    rdets = s["radar"](
+                        [[p['x'], p['y'], p['z'], p['v'], p['snr'],
+                          p['noise']] for p in fr['points']])
+                except Exception as e:
+                    self.state["student_error"] = "radar %s: %s" % (
+                        type(e).__name__, e)
+        self.state["student_thermal"] = tdets
+        self.state["student_radar"] = rdets
+        self.state["student_t"] = time.time()
+
+        for d in tdets:
+            if s["th2vis"] is None:
+                break                     # no LUT: nothing to draw them on
+            vis = s["th2vis"].box(d["x"], d["y"], d["w"], d["h"])
+            if vis is None:
+                continue                  # outside the thermal/visible overlap
+            x, y, w, h = vis
+            cv2.rectangle(rgb, (x, y), (x + w, y + h),
+                          self.STUDENT_TH_COL, 2)
+            cv2.putText(rgb, "T %.2f" % d["conf"], (x, max(12, y - 4)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        self.STUDENT_TH_COL, 1, cv2.LINE_AA)
+        for d in rdets:
+            x, y, w, h = d["x"], d["y"], d["w"], d["h"]
+            cv2.rectangle(rgb, (x, y), (x + w, y + h),
+                          self.STUDENT_RD_COL, 1)
+            cv2.putText(rgb, "R %.2f" % d["conf"],
+                        (x, min(OUT_H - 4, y + h + 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                        self.STUDENT_RD_COL, 1, cv2.LINE_AA)
+
     def run(self):
         while not self.stop.is_set():
             item = self.work.get()
@@ -1176,6 +1234,9 @@ class Renderer(threading.Thread):
             # projection being solved for. Copy before anything is drawn;
             # radar_calib_web.py refuses frames that lack the 'clean' flag.
             clean = rgb.copy() if self.video is not None else None
+
+            if self.students is not None:
+                self._run_students(thermal, rgb)
 
             if self.det_in is not None:
                 # The detector reads the plain visible luma, not the fused frame.
@@ -3115,6 +3176,13 @@ def main():
                          "radar_correspond.py: the thermal layer is NOT registered "
                          "until a warp LUT exists, so a pixel taken from the thermal "
                          "content carries that unknown offset into the extrinsic")
+    ap.add_argument("--students", action="store_true",
+                    help="run the trained thermal+radar person students "
+                         "(TensorRT engines from perception/out/gexport/v2/"
+                         "models/) as extra detection channels: orange boxes "
+                         "= thermal student, cyan = radar student")
+    ap.add_argument("--student-conf", type=float, default=0.5, metavar="C",
+                    help="confidence threshold for both students")
     ap.add_argument("--seconds", type=int, default=0, help="exit after N seconds (for tests)")
     args = ap.parse_args()
 
@@ -3206,8 +3274,39 @@ def main():
             print("  the projection is a GUESS until radar_extrinsics is solved - "
                   "nudge it with /set?yaw=..&pitch=..&tz=..", file=sys.stderr)
 
+    students = None
+    if args.students:
+        # The students are an OPT-IN extra: any failure here (missing engine,
+        # GPU not up, bad LUT) must leave the plain pipeline running.
+        try:
+            import trt_students
+            th_model = trt_students.ThermalStudentTrt(conf=args.student_conf)
+            rd_model = (trt_students.RadarStudentTrt(conf=args.student_conf)
+                        if args.radar else None)
+            th2vis = (trt_students.ThermalToVisible(args.warp)
+                      if args.warp else None)
+            if not args.range:
+                print("students: --range is not pinned, so the thermal input "
+                      "is scene-relative instead of the Celsius the model was "
+                      "trained on - expect degraded detections. Use the "
+                      "training range (e.g. --range 0:60).", file=sys.stderr)
+            if th2vis is None:
+                print("students: no --warp LUT, thermal-student boxes cannot "
+                      "be drawn on the visible frame (still served on "
+                      "/state)", file=sys.stderr)
+            students = {"thermal": th_model, "radar": rd_model,
+                        "th2vis": th2vis,
+                        "c_per_lsb": (tmax_c - tmin_c) / 255.0,
+                        "tmin": float(tmin_c)}
+            print("students: thermal%s engine(s) up, conf>=%.2f"
+                  % ("+radar" if rd_model else "", args.student_conf),
+                  file=sys.stderr)
+        except Exception as e:
+            print("students: DISABLED (%s: %s)" % (type(e).__name__, e),
+                  file=sys.stderr)
+
     render = Renderer(pipe, state, work, detector, radar=radar,
-                      radar_proj=radar_proj, video=video)
+                      radar_proj=radar_proj, video=video, students=students)
     render.radar_ai = bool(args.radar_ai)
     render.start()
     stream = Streamer(args.port, pipe, args.quality, state, work)
