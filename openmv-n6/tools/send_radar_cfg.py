@@ -184,6 +184,13 @@ def main():
         if args.stop:
             print('  cfg> sensorStop %s' % send_line(ser, 'sensorStop'))
             return 0
+        if not os.path.exists(args.cfg) and os.sep not in args.cfg:
+            # A bare name ("radar_people.cfg") means the standard configs
+            # dir - typing the ../radar/configs/ prefix at 2 AM is how a
+            # session gets recorded with the wrong chirp.
+            candidate = os.path.join(os.path.dirname(DEFAULT_CFG), args.cfg)
+            if os.path.exists(candidate):
+                args.cfg = candidate
         if not os.path.exists(args.cfg):
             print('no such config: %s' % args.cfg, file=sys.stderr)
             return 2
