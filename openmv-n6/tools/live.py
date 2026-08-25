@@ -44,6 +44,26 @@ on /ai:
               comes off a two-element aperture and says almost nothing about
               which box a return belongs to. A fused box carries the range.
 
+`lock` (key l, on by default) is what makes a person survive a frame nobody
+found them in. A person seen twice becomes a track with an id: associated
+frame to frame by IoU with a centre-distance fallback, smoothed alpha-beta,
+carried on their own velocity through the gaps, and dropped 1.5 s after the
+last measurement. All three sensors feed one tracker and what describes one
+person is merged before association, so a lock the detector loses in glare can
+be held by the thermal student - and the letters on the label (D T R F) say
+which sensors are holding it right now. A coasting track is amber and dashed
+and says so: it is where somebody probably is, not where anybody saw them.
+
+A candidate the DETECTOR has never confirmed must move before it is drawn as a
+person. Measured in the lobby this rig sits in: a lit glass door reads 31.7 C
+mean / 34.1 C p90 and a person reads 30.9 / 34.1 - the same temperature to
+within the sensor's noise, so no radiometric test can separate them, and the
+students and the radar will agree with each other about a door all day. What a
+door has never done is move. Those candidates are counted as `static` on the
+card and in /health rather than dropped quietly, because something warm and
+motionless is not nobody. A person the detector sees is drawn at once, standing
+still or not.
+
 With `person outline` on (key s, the default), a detection is drawn as the warm
 shape the thermal frame holds inside it rather than as a rectangle - the
 detector's green person boxes included, which is the pairing worth having: the
@@ -83,7 +103,8 @@ import serial
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import capture  # noqa: E402  - reuse the bring-up that is known to survive
 import detect   # noqa: E402
-import radar_overlay  # noqa: E402
+import radar_overlay
+import tracker as tracking  # noqa: E402
 import recorder  # noqa: E402
 import soc as hostsoc  # noqa: E402
 
@@ -392,6 +413,13 @@ class Pipeline:
         # rectangle wherever the shape cannot be found - no warp LUT, no
         # thermal coverage, or a box with nothing warm in it.
         self.ai_silhouette = True
+        # Lock mode. A detector answers one frame at a time and is right to;
+        # an operator watching a person walk does not want that answer
+        # re-litigated 8.7 times a second. With this on, a person who has been
+        # seen twice is TRACKED: kept through the frames no sensor found them
+        # in, carried on their own velocity, and dropped only after a bounded
+        # coast - drawn as coasting the whole time it is not a measurement.
+        self.ai_lock = True
         # The floor the engines themselves were built with: a slider below this
         # does nothing, so the page clamps to it rather than pretending.
         self.ai_conf_floor = 0.5
@@ -959,6 +987,27 @@ def health(pipe, state, now):
                    "" if not hidden else
                    ", %d below the confidence floor or deduplicated" % hidden))
 
+    # --- the lock. On its own line rather than inside the detector's: the
+    # question it answers is not "did a sensor see somebody" but "is the viewer
+    # still holding the person it had", and a lock held only by a coast is a
+    # different claim from a lock being measured.
+    if pipe.ai_lock:
+        tr = state.get("tracks") or []
+        static = state.get("tracks_static") or []
+        coasting = [t for t in tr if t.get("coasting")]
+        held = ", %d warm and motionless (not drawn)" % len(static) if static else ""
+        if not tr:
+            add("lock", "ok", "nothing locked" + held)
+        elif len(coasting) == len(tr):
+            add("lock", "warn", "%d track%s, all coasting - no sensor has "
+                "confirmed them this cycle (worst %.1fs)"
+                % (len(tr), "" if len(tr) == 1 else "s",
+                   max(t["coasting"] for t in coasting)))
+        else:
+            add("lock", "ok", "%d locked%s%s"
+                % (len(tr) - len(coasting),
+                   ", %d coasting" % len(coasting) if coasting else "", held))
+
     # --- recording. A recorder that died mid-session must not be discovered at
     # the end of the campaign; the mp4 writer's failure mode is a 0-byte file.
     rec = state.get("recording")
@@ -1203,6 +1252,15 @@ class Renderer(threading.Thread):
         # rate should be set by the sensor rather than by the network.
         self.det_in = Latest() if detector else None
         self.det = detector
+        # One tracker for the person class across every sensor. Fed once per
+        # rendered frame, including the frames nothing was found in - a miss is
+        # information and the tracker has to be told about it.
+        self.lock = tracking.Tracker()
+        # The detector runs on its own thread at its own rate, so the same
+        # detection list is visible for several rendered frames. Feeding it
+        # more than once would inflate the hit count and, worse, hold a lock
+        # open on evidence that arrived long ago.
+        self._fed_detect_t = None
         if detector:
             self.det_thread = threading.Thread(target=self._detect_loop, daemon=True)
             self.det_thread.start()
@@ -1526,6 +1584,85 @@ class Renderer(threading.Thread):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.46,
                         self.STUDENT_FU_COL, 1, cv2.LINE_AA)
 
+    # Lock overlay colours, RGB frame order.
+    LOCK_COL = (0, 230, 0)               # green, as the detector's person box
+    LOCK_COAST_COL = (255, 190, 60)      # amber: predicted, not measured
+    SRC_LETTER = {"det": "D", "thermal": "T", "radar": "R", "fusion": "F"}
+
+    def _lock_observations(self, thermal):
+        """This cycle's person evidence, from every sensor that has any.
+
+        The detector's list is only offered once per detection - it is produced
+        on another thread and stays visible for several rendered frames - while
+        the student channels are recomputed every frame and are offered every
+        frame. The tracker merges what describes one person before it
+        associates, so a person all three saw arrives as one observation
+        carrying all three names.
+        """
+        obs = []
+        det_t = self.state.get("detect_t")
+        if (det_t is not None and det_t != self._fed_detect_t
+                and time.time() - det_t < DETECT_STALE_S):
+            self._fed_detect_t = det_t
+            for d in self.state.get("detections") or []:
+                if d.get("cls") != "person":
+                    continue
+                obs.append({"x": d["x"], "y": d["y"], "w": d["w"], "h": d["h"],
+                            "conf": d.get("conf", 0.0), "src": "det",
+                            "radar_m": d.get("radar_m"), "max_c": d.get("max_c")})
+        for d in self.state.get("student_thermal") or []:
+            if d.get("vis"):
+                x, y, w, h = d["vis"]
+                obs.append({"x": x, "y": y, "w": w, "h": h,
+                            "conf": d["conf"], "src": "thermal"})
+        for d in self.state.get("student_radar") or []:
+            obs.append({"x": d["x"], "y": d["y"], "w": d["w"], "h": d["h"],
+                        "conf": d["conf"], "src": "radar"})
+        for d in self.state.get("student_fused") or []:
+            obs.append({"x": d["x"], "y": d["y"], "w": d["w"], "h": d["h"],
+                        "conf": d["conf"], "src": "fusion",
+                        "radar_m": d.get("radar_m")})
+        return obs
+
+    def _draw_tracks(self, rgb, tracks, thermal, now):
+        """Draw the locks. A coast never looks like a measurement."""
+        outline = self._person_outline(thermal, rgb)
+        for t in tracks:
+            x, y, w, h = t.box
+            coast = t.coasting_for(now)
+            col = self.LOCK_COAST_COL if coast > 0.15 else self.LOCK_COL
+            drawn = False
+            if outline is not None and coast <= 0.15:
+                # Only a measured lock gets the thermal shape: the silhouette
+                # is read out of THIS frame, and drawing it around a predicted
+                # box would dress a guess up as a reading.
+                drawn = bool(outline({"cls": "person", "x": x, "y": y,
+                                      "w": w, "h": h}, col))
+            if not drawn:
+                if coast > 0.15:
+                    detect._dashed_rect(rgb, x, y, x + w, y + h, col)
+                else:
+                    cv2.rectangle(rgb, (x, y), (x + w, y + h), col, 2)
+            label = "P%d" % t.id
+            if coast > 0.15:
+                label += " coast %.1fs" % coast
+            else:
+                held = "".join(self.SRC_LETTER.get(s, "?")
+                               for s in sorted(t.held_by))
+                if held:
+                    label += " " + held
+            if t.radar_m is not None:
+                label += "  %.1fm" % t.radar_m
+            if t.max_c is not None:
+                label += "  %.1fC" % t.max_c
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                          0.45, 1)
+            ty = y - 6 if y - 6 - th > 0 else y + h + th + 6
+            cv2.rectangle(rgb, (x, ty - th - 4), (x + tw + 6, ty + 3),
+                          (0, 0, 0), -1)
+            cv2.putText(rgb, label, (x + 3, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45, col, 1, cv2.LINE_AA)
+
     def _person_outline(self, thermal, rgb):
         """An annotate() callback that draws a person's thermal shape.
 
@@ -1613,8 +1750,37 @@ class Renderer(threading.Thread):
                         # drawing: the detector is the locator this rig
                         # trusts, and a rectangle is a claim about a bounding
                         # box that nothing in the scene has.
-                        detect.annotate(rgb, dets, p.warped,
-                                        outline=self._person_outline(thermal, rgb))
+                        if not p.ai_lock:
+                            detect.annotate(
+                                rgb, dets, p.warped,
+                                outline=self._person_outline(thermal, rgb))
+                        else:
+                            # In lock mode the person boxes are drawn by the
+                            # tracker below, with identity and coast state on
+                            # them. Anything that is not a person still gets
+                            # its box here.
+                            detect.annotate(
+                                rgb, [d for d in dets if d["cls"] != "person"],
+                                p.warped)
+
+            # The lock runs every frame, including the ones no sensor found
+            # anybody in: that is the frame a track learns it was missed, and
+            # skipping it would make a coast last as long as the scene is quiet.
+            if p.ai_lock:
+                now = time.time()
+                tracks = self.lock.update(self._lock_observations(thermal), now)
+                if p.show_detections:
+                    self._draw_tracks(rgb, tracks, thermal, now)
+                self.state["tracks"] = [t.as_dict(now) for t in tracks]
+                # Held back for never having moved and never having been seen
+                # by the detector - a warm door, a radiator, a lit sign. Counted
+                # and reported: "nothing there" and "something warm there that
+                # has never moved" are different answers.
+                self.state["tracks_static"] = [
+                    t.as_dict(now) for t in self.lock.suppressed(now)]
+            elif self.state.get("tracks"):
+                self.state["tracks"] = []
+                self.state["tracks_static"] = []
 
             if self.radar is not None and self.pipe.show_radar:
                 fr = self.radar.get()
@@ -2298,6 +2464,12 @@ def ui_payload(pipe, state, now):
         # Quantities that drift rather than jump, and which the page draws as a
         # 60s trace: a heap reading is not interesting, a heap reading that is
         # 0.6MB lower than a minute ago is the whole early-warning system.
+        # The locks. Separate from `detections`: a detection is what a sensor
+        # said about one frame, a track is what the viewer believes about a
+        # person across frames, and conflating them is how a coasted box ends
+        # up quoted as a measurement.
+        "tracks": state.get("tracks") or [],
+        "tracks_static": state.get("tracks_static") or [],
         "heap_free": state.get("heap_free"),
         "restarts": state.get("restarts", 0),
         "coverage": round(float(pipe.cover_grid().mean()), 4) if pipe.f.have_frame else None,
@@ -2319,6 +2491,7 @@ def ui_payload(pipe, state, now):
             "gain": c.detail_gain, "eps": c.gf_eps, "radius": c.gf_radius,
             "agc": c.agc_permille, "palette": pipe.palette_name, "view": pipe.view,
             "mix": pipe.mix, "outline": pipe.outline, "boxes": pipe.show_detections,
+            "lock": pipe.ai_lock,
             "emissivity": round(pipe.eps, 3), "reflected": pipe.refl,
             "warped": pipe.warped, "range": [lo, hi],
             # None, not a zeroed dict: "no radar attached" and "radar attached
@@ -2688,17 +2861,20 @@ SOC</div>
       </div>
     </div>
 
-    <div class=card id=aicard style=display:none>
-      <h4>ai channels <span class=k>t r c</span></h4>
+    <div class=card id=aicard>
+      <h4>ai <span class=k>t r c s l</span></h4>
       <div class=body>
+        <label class=chk><input type=checkbox id=lock checked> lock on people
+          <span class=sub id=s_lock></span></label>
+        <label class=chk><input type=checkbox id=silhouette checked>
+          person outline <span class=sub id=s_ai_sil></span></label>
+        <div id=aistudents style=display:none>
         <label class=chk><input type=checkbox id=ai_thermal checked> thermal
           <span class=sub id=s_ai_t></span></label>
         <label class=chk><input type=checkbox id=ai_radar checked> radar
           <span class=sub id=s_ai_r></span></label>
         <label class=chk><input type=checkbox id=ai_fusion checked> fusion
           <span class=sub id=s_ai_f></span></label>
-        <label class=chk><input type=checkbox id=silhouette checked>
-          person outline <span class=sub id=s_ai_sil></span></label>
         <div class=sl><label>thermal confidence</label><output id=o_conf_thermal>0.50</output>
           <input type=range id=conf_thermal min=50 max=99 value=50></div>
         <div class=sl><label>radar confidence</label><output id=o_conf_radar>0.50</output>
@@ -2708,6 +2884,22 @@ SOC</div>
           <i>shown of found</i>, so a quiet scene and a slider parked too high
           never look the same. They cannot go below the threshold the engines
           were started with (&minus;&minus;student-conf).</div>
+        <div class=hintline><b>lock</b> keeps a person between frames instead
+          of deciding again every frame: seen twice, they get an id (P1) and
+          are held through the frames no sensor found them in, for up to 1.5 s,
+          carried on their own velocity. A held box is amber and dashed and
+          says <i>coast 0.4s</i> &mdash; it is where somebody probably is, not
+          where anybody saw them. The letters after the id are the sensors
+          confirming it right now: D detector, T thermal, R radar, F fusion.
+          A channel switched off still feeds the lock &mdash; hiding a channel
+          hides its boxes, it does not make the viewer forget what it saw.</div>
+        <div class=hintline>a candidate the <b>detector</b> has never seen has
+          to MOVE before it is drawn as a person. In the lobby this rig sits in,
+          a lit glass door reads 31.7&deg;C and a person reads 30.9&deg;C
+          &mdash; the same temperature, so nothing radiometric can tell them
+          apart, and a door has never moved. Those candidates are counted as
+          <i>static</i> beside the lock rather than dropped silently: something
+          warm and motionless is not nobody.</div>
         <div class=hintline>with <b>person outline</b> on, the thermal channel
           draws the warm shape it found instead of a rectangle, and fusion
           draws a ring around it &mdash; the 4 px staircase is the warp LUT's
@@ -2723,6 +2915,7 @@ SOC</div>
         <div class=hintline>fusion keeps running the channel it needs even when
           that channel's own boxes are switched off &mdash; switching one off
           hides it, agreement still needs both.</div>
+        </div>
       </div>
     </div>
   </aside>
@@ -2780,7 +2973,7 @@ SOC</div>
   <p><kbd>1</kbd>-<kbd>5</kbd> view &middot; <kbd>f</kbd> field mode (hide everything but the
   stream and the health) &middot; <kbd>o</kbd> footprint &middot; <kbd>b</kbd> boxes &middot;
   <kbd>t</kbd> thermal ai &middot; <kbd>r</kbd> radar ai &middot; <kbd>c</kbd> fusion &middot;
-  <kbd>s</kbd> person outline &middot;
+  <kbd>s</kbd> person outline &middot; <kbd>l</kbd> lock &middot;
   <kbd>x</kbd> clear probes</p></details>
 </div>
 
@@ -2823,7 +3016,8 @@ for (const k of ['emis','refl'])
 for (const [id, param] of [['outline','outline'],['boxes','boxes'],
                            ['radar','radar'],['whisker','whisker'],
                            ['ai_thermal','ai_thermal'],['ai_radar','ai_radar'],
-                           ['ai_fusion','ai_fusion'],['silhouette','silhouette']])
+                           ['ai_fusion','ai_fusion'],['silhouette','silhouette'],
+                           ['lock','lock']])
   $(id).onchange = (e) => set(param + '=' + (e.target.checked ? 1 : 0));
 
 // Sent as a fraction, drawn as one, but an <input type=range> only counts in
@@ -2925,6 +3119,7 @@ addEventListener('keydown', (e) => {
   if (e.key === 'r') { $('ai_radar').click(); }
   if (e.key === 'c') { $('ai_fusion').click(); }
   if (e.key === 's') { $('silhouette').click(); }
+  if (e.key === 'l') { $('lock').click(); }
   const i = Number(e.key) - 1;
   if (i >= 0 && i < VIEWS.length) { pick('view', VIEWS[i]); set('view=' + VIEWS[i]); }
 });
@@ -3077,10 +3272,11 @@ function initControls(cfg) {
   $('refl').value = cfg.reflected;
   $('outline').checked = cfg.outline;
   $('boxes').checked = cfg.boxes;
+  $('lock').checked = cfg.lock;
   pick('view', cfg.view);
   pick('pal', cfg.palette);
   if (cfg.ai) {
-    $('aicard').style.display = '';
+    $('aistudents').style.display = '';
     $('ai_thermal').checked = cfg.ai.thermal.on;
     $('ai_radar').checked = cfg.ai.radar.on;
     $('ai_fusion').checked = cfg.ai.fusion.on;
@@ -3276,6 +3472,18 @@ async function poll() {
     $('s_ai_sil').textContent = cfg.ai.silhouette ? 'shape' : 'boxes';
   }
 
+  // A coasting lock is not a lock that is working; it has to read differently.
+  const held = d.tracks.filter(t => !t.coasting).length;
+  const coast = d.tracks.length - held;
+  const stat = (d.tracks_static || []).length;
+  $('s_lock').textContent = !cfg.lock ? 'off'
+    : !d.tracks.length && !stat ? 'nothing locked'
+    : (d.tracks.length ? held + ' locked' : 'none')
+      + (coast ? ' \u00b7 ' + coast + ' coasting' : '')
+      + (stat ? ' \u00b7 ' + stat + ' static' : '');
+  $('s_lock').style.color = !cfg.lock ? '' : coast && !held ? '#f0c060'
+    : held ? '#7fd39b' : '';
+
   if (probes.length) refreshProbes();
 }
 poll();
@@ -3317,6 +3525,8 @@ def make_handler(state, pipe):
                 # the flags are display state like every other switch here, and
                 # a 404 on a live control is harder to read than a switch that
                 # holds a value nothing is currently drawing.
+                if "lock" in q:
+                    pipe.ai_lock = q.pop("lock") not in ("0", "false", "")
                 if "silhouette" in q:
                     pipe.ai_silhouette = q.pop("silhouette") not in (
                         "0", "false", "")
@@ -3451,6 +3661,12 @@ def make_handler(state, pipe):
                              "radar": round(pipe.ai_conf_radar, 2),
                              "engine_floor": round(pipe.ai_conf_floor, 2)},
                     "found": state.get("student_seen") or {},
+                    "lock": {"on": pipe.ai_lock,
+                             "coast_s": tracking.MAX_COAST_S,
+                             "min_hits": tracking.MIN_HITS,
+                             "static_px": tracking.STATIC_PX,
+                             "tracks": state.get("tracks") or [],
+                             "suppressed": state.get("tracks_static") or []},
                     "error": state.get("student_error"),
                     "channels": {
                         "thermal": {"on": pipe.ai_thermal,
@@ -3731,6 +3947,10 @@ def main():
                          "--ai-channels, or live from the page")
     ap.add_argument("--student-conf", type=float, default=0.5, metavar="C",
                     help="confidence threshold for both students")
+    ap.add_argument("--no-lock", action="store_true",
+                    help="start with the person lock off, so every frame's "
+                         "boxes stand on that frame alone. The lock is on by "
+                         "default and switchable live (key l, /set?lock=0)")
     ap.add_argument("--ai-channels", default="thermal,radar,fusion", metavar="LIST",
                     help="which AI channels start switched on: any of "
                          "thermal,radar,fusion (or 'none'). All three are "
@@ -3775,6 +3995,7 @@ def main():
     pipe.ai_fusion = "fusion" in want_ai
     # The engines are built with --student-conf and cannot go below it later,
     # so that is where both sliders start and where they stop going down.
+    pipe.ai_lock = not args.no_lock
     pipe.ai_conf_floor = args.student_conf
     pipe.ai_conf_thermal = pipe.ai_conf_radar = args.student_conf
     # One sampler for the process; it primes its own counters, so the first

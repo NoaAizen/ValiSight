@@ -563,6 +563,130 @@ def ai_channels(thermal):
     r.stop.set()
 
 
+def lock_mode():
+    """The lock: identity between frames, and a coast that says it is one.
+
+    All offline and engine-free - the tracker is plain python - which is the
+    point: whether a person survives the frames nobody found them in is a
+    question about this logic, not about the GPU.
+    """
+    print("\nlock on people")
+    import tracker as tracking
+
+    def walk(t0, n, x0, step, src="det", tk=None, dt=0.114):
+        tk = tk or tracking.Tracker()
+        out = []
+        for i in range(n):
+            out = tk.update([{"x": x0 + i * step, "y": 100, "w": 60, "h": 180,
+                              "conf": 0.9, "src": src}], t0 + i * dt)
+        return tk, out
+
+    tk, tracks = walk(1000.0, 6, 100, 25)
+    check("a person walking across the frame stays one track",
+          len(tracks) == 1 and tracks[0].id == 1 and tracks[0].hits == 6,
+          "%d track(s), %d hits" % (len(tracks), tracks[0].hits if tracks else 0))
+    check("the box follows them rather than sitting where they started",
+          tracks[0].box[0] > 180, "x %d" % tracks[0].box[0])
+
+    # One observation is not a lock: a single frame of a false positive on a
+    # warm doorway is exactly what MIN_HITS exists to swallow.
+    tk = tracking.Tracker()
+    once = tk.update([{"x": 10, "y": 10, "w": 40, "h": 90, "conf": 0.9,
+                       "src": "det"}], 2000.0)
+    check("one sighting is not yet a lock", once == [] and len(tk.all()) == 1)
+
+    # The core of it: the detector drops out and the person is still held.
+    tk, _ = walk(3000.0, 4, 100, 20)
+    now = 3000.0 + 4 * 0.114
+    kept = []
+    for i in range(6):                     # six frames with nothing at all
+        now += 0.114
+        kept = tk.update([], now)
+    check("a person nobody sees this frame is still locked, and still P1",
+          len(kept) == 1 and kept[0].id == 1 and kept[0].coasting_for(now) > 0.5,
+          "coasting %.2fs" % (kept[0].coasting_for(now) if kept else -1))
+    check("the coast is carried on their velocity, not frozen in place",
+          kept[0].box[0] > 160, "x %d" % kept[0].box[0])
+
+    now += tracking.MAX_COAST_S
+    check("a coast that outlives its budget is dropped, not kept forever",
+          tk.update([], now) == [] and tk.all() == [])
+
+    # ...and the lock survives on another sensor when the detector is the one
+    # that dropped out, which is the whole reason three of them feed this.
+    tk, _ = walk(4000.0, 3, 100, 20)
+    now = 4000.0 + 3 * 0.114
+    held = tk.update([{"x": 160, "y": 100, "w": 60, "h": 180, "conf": 0.7,
+                       "src": "thermal"}], now + 0.114)
+    check("the thermal channel alone can hold a lock the detector lost",
+          len(held) == 1 and held[0].id == 1
+          and held[0].held_by == {"thermal"} and held[0].coasting_for(now) < 0.2,
+          "held by %s" % sorted(held[0].held_by) if held else "lost")
+
+    # Cross-sensor merge: three sensors, one person, one track.
+    tk = tracking.Tracker()
+    obs = [{"x": 100, "y": 50, "w": 60, "h": 180, "conf": 0.9, "src": "det",
+            "max_c": 32.1},
+           {"x": 104, "y": 54, "w": 58, "h": 176, "conf": 0.8, "src": "thermal"},
+           {"x": 96, "y": 40, "w": 70, "h": 200, "conf": 0.7, "src": "radar",
+            "radar_m": 4.2}]
+    for i in range(2):
+        merged = tk.update([dict(o) for o in obs], 5000.0 + i * 0.114)
+    check("one person seen by three sensors is one track, not three",
+          len(merged) == 1 and merged[0].held_by == {"det", "thermal", "radar"},
+          "%d track(s), held by %s" % (len(merged), sorted(merged[0].held_by)))
+    check("the lock carries the range and temperature the sensors brought",
+          merged[0].radar_m == 4.2 and merged[0].max_c == 32.1)
+    check("the detector's geometry wins the merge, not the radar's guess",
+          abs(merged[0].box[2] - 60) <= 2, "w %d" % merged[0].box[2])
+
+    # --- the warm door. Measured in the lobby this rig sits in: the lit glass
+    # door reads 31.7 C mean and a person reads 30.9 C, so the discriminator
+    # cannot be temperature. It is that a door has never moved.
+    tk = tracking.Tracker()
+    now = 6000.0
+    for i in range(40):
+        tk.update([{"x": 300, "y": 120, "w": 90, "h": 200, "conf": 0.95,
+                    "src": "thermal"},
+                   {"x": 298 + (i % 3), "y": 118, "w": 94, "h": 204,
+                    "conf": 0.9, "src": "radar"}], now + i * 0.114)
+    end = now + 40 * 0.114
+    check("a warm thing that never moves is not drawn as a person, however "
+          "confident the students are",
+          tk.confirmed(end) == [] and len(tk.suppressed(end)) == 1,
+          "%d drawn, %d suppressed" % (len(tk.confirmed(end)),
+                                       len(tk.suppressed(end))))
+    check("it is counted rather than discarded - warm and motionless is not "
+          "nobody",
+          tk.suppressed(end)[0].as_dict(end)["moved_px"] < tracking.STATIC_PX)
+
+    # ...and the same evidence, once it moves, is a person - which is what
+    # keeps this safe in the dark, where the visible detector sees nothing.
+    tk = tracking.Tracker()
+    for i in range(40):
+        tk.update([{"x": 100 + i * 12, "y": 120, "w": 90, "h": 200,
+                    "conf": 0.9, "src": "thermal"}], now + i * 0.114)
+    check("a walker the detector never saw is drawn once they have moved",
+          len(tk.confirmed(end)) == 1 and tk.suppressed(end) == [],
+          "moved %.0f px" % tk.all()[0].moved)
+
+    # The detector is trusted on sight: it knows a door from a person, and a
+    # person standing still must not need to walk to be believed.
+    tk = tracking.Tracker()
+    for i in range(6):
+        tk.update([{"x": 300, "y": 120, "w": 90, "h": 200, "conf": 0.95,
+                    "src": "det"}], now + i * 0.114)
+    check("a motionless person the detector sees is drawn immediately",
+          len(tk.confirmed(now + 0.7)) == 1)
+
+    # Two boxes from the SAME sensor are two people and must stay two.
+    two = tracking.merge([
+        {"x": 100, "y": 50, "w": 60, "h": 180, "conf": 0.9, "src": "det"},
+        {"x": 118, "y": 50, "w": 60, "h": 180, "conf": 0.8, "src": "det"}])
+    check("a sensor reporting two boxes is never overruled into one",
+          len(two) == 2, "%d group(s)" % len(two))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -966,6 +1090,13 @@ def main():
                   names.get("ai", {}).get("text", "no ai check at all"))
         finally:
             good.pop("students", None)
+        get("/set?lock=0")
+        check("/set can switch the lock off", pipe.ai_lock is False)
+        get("/set?lock=1")
+        check("/ui carries the tracks as their own list, not as detections",
+              "tracks" in json.loads(get("/ui")[1])
+              and json.loads(get("/ui")[1])["cfg"]["lock"] is True)
+
         get("/set?conf_thermal=0.8&conf_radar=0.75")
         check("/set carries a per-channel confidence floor",
               abs(pipe.ai_conf_thermal - 0.8) < 1e-6
@@ -1061,6 +1192,7 @@ def main():
     failure_reporting()
     threading_and_detection(y, thermal)
     ai_channels(thermal)
+    lock_mode()
 
     print()
     if FAILS:

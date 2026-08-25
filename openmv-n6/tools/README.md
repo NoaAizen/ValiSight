@@ -27,7 +27,17 @@ when the rendered palette itself must remain a fixed thermal scale.
 `live.py --students` runs the two trained person students beside the COCO
 detector and draws three switchable channels: thermal (orange), radar (cyan)
 and their fusion (white — the same person found by both, paired horizontally
-inside 50 px). With **person outline** on (key `s`), a person is drawn as the warm shape the
+inside 50 px). **lock** (key `l`, on by default) keeps a person between frames: seen twice
+they become `P1`, held through the frames no sensor found them in for up to
+1.5 s and carried on their own velocity, drawn amber and dashed while coasting.
+All three sensors feed one tracker, so a lock the detector loses can be held by
+the thermal student — the letters after the id (D/T/R/F) name who is holding
+it. A candidate the detector has never seen has to **move** before it is drawn:
+in this lobby a lit glass door reads 31.7 °C and a person 30.9 °C, so warmth
+cannot tell them apart and a door has never moved. Those are reported as
+*static* beside the lock, not dropped in silence. `/ui` and `/ai` carry the tracks; `--no-lock` starts without it.
+
+With **person outline** on (key `s`), a person is drawn as the warm shape the
 thermal frame holds inside the box — for the students *and* for the detector's
 green person boxes, which needs only `--warp`, not `--students`. Fusion draws
 its ring around that shape. Each channel has a confidence slider on that card (it hides boxes, it does not
