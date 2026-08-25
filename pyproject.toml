@@ -1,0 +1,50 @@
+# Packaging is optional here, and deliberately so.
+#
+# Two other repositories consume this one, and they consume it differently.
+# Perception vendors the health core into its own tree and adds the package
+# directory to sys.path, which is how the rig's own code is already imported;
+# fusion wants it installed. Both must work, so the layout stays flat: the
+# package sits at the repository root and is importable from a checkout with
+# no install step at all, while this file makes `pip install -e .` work for
+# anyone who prefers that.
+#
+# **There are no required dependencies, and that is the point.** The health
+# core and everything under mapinit.nav are pure arithmetic -- drift budgets,
+# heading matching, Allan deviation, validation records -- and a consumer who
+# wants only those should not inherit a raster stack to get them. The heavier
+# halves are extras, named after what they unlock:
+#
+#   pip install -e .                # health + navigation. No third-party code.
+#   pip install -e ".[calibration]" # + the IMU-to-camera solver
+#   pip install -e ".[geo]"         # + terrain, buildings, geoid, view, map init
+#   pip install -e ".[all,test]"    # everything, plus the suite
+#
+# The geo extra still needs one thing pip cannot deliver: the EGM2008 vertical
+# shift grid. requirements.txt says how to fetch it and why nothing else will
+# do. Without it the geoid stage refuses to run rather than returning a height
+# that is quietly ~20 m wrong in Israel.
+#
+# requirements.txt keeps the exact pins this repository develops and tests
+# against. The bounds below are deliberately looser, since a consumer's
+# environment is not ours to pin.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mapinit"
+version = "0.1.0"
+description = "Map-relative position initialization, rig calibration, and drift, with explicit checks at every stage"
+readme = "DRISHOT.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+calibration = ["numpy>=1.24"]
+geo = ["pyproj>=3.7", "rasterio>=1.4", "numpy>=1.24"]
+all = ["pyproj>=3.7", "rasterio>=1.4", "numpy>=1.24"]
+test = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["mapinit*"]

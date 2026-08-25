@@ -10,79 +10,160 @@ Consuming code needs one object::
     init.separation_probe               # geoid callable, signature (lon, lat)
     init.priors()                       # DEM and vector layers for this point
 
-The failure types are exported alongside it. A consumer is expected to catch
-them rather than to receive a fallback value, so it must be able to write
+Everything else this package offers is catalogued in ``mapinit.api``, which is
+the source of the names below rather than a description of them: ``__all__``
+and the lazy-import table are both built from it, so a public name always
+carries a summary of what it is and a note on what it is for. To read the
+catalogue::
+
+    python -c "import mapinit; print(mapinit.describe())"
+    python -c "import mapinit; print(mapinit.describe('navigation'))"
+
+The failure types are exported alongside the rest. A consumer is expected to
+catch them rather than to receive a fallback value, so it must be able to write
 ``except TileNotFound`` without reaching into ``mapinit.geo.*``; the returned
 records are exported for the same reason, so consuming code can annotate what
 it holds.
 
-Everything below MapInitializer is internal. Importing this package does not
-require pyproj: the geoid grid is opened on first use, and every name that
-lives under ``mapinit.geo`` is resolved lazily, because that subpackage imports
-pyproj when it is first touched.
+**Nothing is imported until it is named.** Every export resolves on first
+attribute access, so importing this package costs nothing and pulls in neither
+pyproj nor the raster stack unless something under ``mapinit.geo`` is actually
+touched. A process that only wants ``DeadReckoner`` never opens a GeoTIFF
+library, and one that only wants ``Check`` -- which is how perception vendors
+this core -- pays for nothing at all.
 """
 
 from typing import TYPE_CHECKING
 
-from .check import Check, CheckFailed
-from .context import GLOBAL_GEOID_BOUND_M, InitContext
-from .map_initializer import MapInitializer
-from .runner import InitializationPipeline, InitReport
-from .stage import InitStage, StageResult, StageStatus
+from .api import AREAS, PUBLIC_API, Export, describe, exports_by_area, extra_for
 
 if TYPE_CHECKING:  # for type checkers and editors only; never executed
-    from .geo.dem import EgoAltitudePrior, GroundEstimate
-    from .geo.geoid import GeoidGridUnavailable
-    from .geo.providers import BasePriorDataProvider, PriorPaths
-    from .geo.tiles import TileNotFound
+    from .calibration.constraints import CalibrationConstraint, Observation
+    from .calibration.imu import (
+        CalibrationDependencyMissing,
+        ImuCalibrationFailed,
+        ImuCameraConstraint,
+        ImuCameraSolution,
+        RigOrientation,
+        solve_imu_camera,
+        tilt_separation_deg,
+    )
+    from .calibration.targets import SurveyedTarget, SurveyedTargetConstraint
+    from .check import Check, CheckFailed
+    from .context import GLOBAL_GEOID_BOUND_M, InitContext
+    from .geo.buildings import Building, BuildingLayer, HeightSource, resolve_height
+    from .geo.dem import (
+        DemSampler,
+        DemUnavailable,
+        DependencyMissing,
+        EgoAltitudePrior,
+        GroundEstimate,
+        ScaleNotSupported,
+    )
+    from .geo.geoid import (
+        EGM2008_GRID_NAME,
+        EGM2008_GRID_URL,
+        GeoidGridUnavailable,
+        GeoidModel,
+    )
+    from .geo.providers import (
+        BasePriorDataProvider,
+        DatabasePriorProvider,
+        LocalFilePriorProvider,
+        PriorPaths,
+    )
+    from .geo.tiles import (
+        AmbiguousTiles,
+        TileBounds,
+        TileNotFound,
+        parse_tile_bounds,
+        select_tile,
+    )
+    from .geo.view import (
+        PredictedView,
+        SkylinePoint,
+        VerticalEdge,
+        ViewPredictor,
+        bearing_and_range,
+        relative_bearing,
+    )
+    from .map_initializer import MapInitializer
+    from .nav.heading import (
+        HeadingCandidate,
+        HeadingFix,
+        HeadingMatcher,
+        HeadingMatchError,
+        angular_difference_deg,
+        bearings_from_columns,
+        bearings_from_view,
+    )
+    from .nav.identification import (
+        Hold,
+        Recording,
+        RecordingError,
+        allan_deviation,
+        angle_random_walk_dps_sqrt_s,
+        identification_checks,
+        identify,
+        load_recording,
+    )
+    from .nav.propagation import (
+        RIG_ERROR_MODEL,
+        STANDARD_GRAVITY,
+        DeadReckoner,
+        DriftBudget,
+        DriftTerm,
+        ImuErrorModel,
+        NavState,
+        NoiseTerm,
+        PropagationError,
+        SpeedAiding,
+        advance,
+        propagate,
+    )
+    from .runner import InitializationPipeline, InitReport
+    from .stage import InitStage, StageResult, StageStatus
 
-#: Names re-exported from ``mapinit.geo``, mapped to the module that defines
-#: them. Resolved on first attribute access rather than at import, so that
-#: naming one of these does not pull pyproj into a process that never uses it.
-_LAZY = {
-    "BasePriorDataProvider": ".geo.providers",
-    "EgoAltitudePrior": ".geo.dem",
-    "GeoidGridUnavailable": ".geo.geoid",
-    "GroundEstimate": ".geo.dem",
-    "PriorPaths": ".geo.providers",
-    "TileNotFound": ".geo.tiles",
-}
+#: Public name -> the module that defines it, built from the catalogue so the
+#: two can never disagree. Resolved on first attribute access.
+_LAZY = {export.name: export.module for export in PUBLIC_API}
 
-__all__ = [
-    # The public surface
-    "MapInitializer",
-    # Failures a consumer catches. Returning a fallback instead of raising one
-    # of these is the break that moves positions without failing a test.
-    "GeoidGridUnavailable",
-    "TileNotFound",
-    # Records handed back, exported so consumers can name their own types
-    "EgoAltitudePrior",
-    "GroundEstimate",
-    "PriorPaths",
-    # Extension points, for adding stages or constraints
-    "BasePriorDataProvider",
-    "Check",
-    "CheckFailed",
-    "InitStage",
-    "StageResult",
-    "StageStatus",
-    # Internals, exposed for tests and advanced wiring
-    "GLOBAL_GEOID_BOUND_M",
-    "InitContext",
-    "InitializationPipeline",
-    "InitReport",
-]
+#: The catalogue's own entry points, which are not themselves catalogued: a
+#: description of the surface is not part of the surface it describes.
+_CATALOGUE = ["AREAS", "Export", "PUBLIC_API", "describe", "exports_by_area", "extra_for"]
+
+__all__ = sorted(_LAZY) + _CATALOGUE
 
 
 def __getattr__(name: str):
-    """Import a ``mapinit.geo`` name on first use, keeping pyproj out of import."""
+    """Import a public name on first use, keeping every dependency out of import."""
     module = _LAZY.get(name)
     if module is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}. "
+            f"Run mapinit.describe() for the public surface."
+        )
 
     from importlib import import_module
 
-    return getattr(import_module(module, __name__), name)
+    try:
+        resolved = import_module(module, __name__)
+    except ImportError as exc:
+        # A public name is not allowed to fail with somebody else's import
+        # error. Half this package installs with no dependencies at all, so
+        # reaching for the other half without its extra is an ordinary thing
+        # to do by accident, and the message has to say which extra rather
+        # than naming a third-party module the caller never asked for.
+        extra = extra_for(name)
+        if extra is None:
+            raise
+        raise ImportError(
+            f"mapinit.{name} needs the {extra!r} extra, which is not installed. "
+            f"Install it with: pip install 'mapinit[{extra}]'  "
+            f"(from a checkout: pip install -e '.[{extra}]')"
+        ) from exc
+
+    return getattr(resolved, name)
 
 
 def __dir__():
