@@ -2664,6 +2664,7 @@ background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:1
 color:var(--dim);text-transform:uppercase}
 #mapside canvas{width:100%;aspect-ratio:1;background:#0a0c0e;
 border:1px solid var(--line);border-radius:6px}
+#mapside.nowalls .hintline{opacity:.4}
 img{display:block;width:100%;height:auto}
 #ovl{position:absolute;inset:0;pointer-events:none}
 #read{position:absolute;padding:4px 8px;background:#000000d9;border:1px solid #5a636b;
@@ -3470,13 +3471,45 @@ function drawFix(d) {
         + '; inertial-only would hold ' + nav.horizon_1m_inertial_s + ' s';
   } else if (nav) { $('m_navtext').textContent = nav.error; }
 }
+// An empty square beside the picture is indistinguishable from a broken one,
+// and the reason used to be a 40-character slice in #667 at the top-left corner
+// - the one place nobody looks, cut mid-module-path. Centred, wrapped, and in
+// the warn colour, because a top-down that cannot draw is a finding.
+function tdMessage(g, W, H, lead, detail) {
+  g.textAlign = 'center';
+  g.fillStyle = '#f0c060';
+  g.font = '600 13px system-ui,-apple-system,sans-serif';
+  g.fillText(lead, W / 2, H / 2 - 16);
+  g.fillStyle = '#79838d';
+  g.font = '11px ui-monospace,Menlo,Consolas,monospace';
+  let line = '', y = H / 2 + 6;
+  for (const w of String(detail || '').split(/\s+/).filter(Boolean)) {
+    const t = line ? line + ' ' + w : w;
+    if (line && g.measureText(t).width > W - 36) { g.fillText(line, W / 2, y); y += 15; line = w; }
+    else line = t;
+  }
+  if (line) g.fillText(line, W / 2, y);
+  g.textAlign = 'start';
+}
 async function drawTopdown() {
   let td;
   try { td = await (await fetch('/topdown')).json(); } catch (e) { return; }
   const c = $('topdown'), g = c.getContext('2d'), W = c.width, H = c.height;
+  const side = $('mapside');
+  // The legend promises walls and dots. While there are none it is a
+  // description of a picture that is not on screen, so it goes quiet.
+  const quiet = on => { if (side) side.classList.toggle('nowalls', !!on); };
   g.clearRect(0, 0, W, H);
-  if (!td || td.error || !td.edges) { g.fillStyle = '#667'; g.font = '12px sans-serif';
-      g.fillText(td && td.error ? td.error.slice(0, 40) : 'no map', 8, 16); return; }
+  if (!td || td.error || !td.edges) {
+    quiet(true);
+    // Two different situations, and the fix differs: no --map is configuration,
+    // anything else is the wall layer failing with the reason it gives.
+    const cfg = td && /no map layer/.test(td.error || '');
+    tdMessage(g, W, H, cfg ? 'no map layer' : 'top-down unavailable',
+              (td && td.error) || 'no answer from /topdown');
+    return;
+  }
+  quiet(!td.edges.length);
   const R = td.radius_m, k = (W / 2) / R;
   const X = x => W / 2 + x * k, Y = y => H / 2 - y * k;
   g.strokeStyle = '#1e2429'; g.lineWidth = 1;
@@ -3496,6 +3529,10 @@ async function drawTopdown() {
   if (td.fix) { dots(td.returns_at_fix, '#5cf'); rig(td.fix, td.fix.accepted ? '#5cf' : '#c55'); }
   g.fillStyle = '#667'; g.font = '11px sans-serif';
   g.fillText('N', W / 2 - 4, 12); g.fillText(td.n_walls + ' returns', 8, H - 8);
+  // Buildings loaded, none within the radius: the rings and the returns are
+  // still worth drawing, but nothing here can confirm the prior.
+  if (!td.edges.length) tdMessage(g, W, H, 'no map walls in ' + td.radius_m + ' m',
+      'the priors loaded but hold no footprint within the radius, so the fix has nothing to match');
 }
 async function poll() {
   let d;
