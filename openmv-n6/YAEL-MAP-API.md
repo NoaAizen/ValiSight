@@ -116,3 +116,28 @@ curl -s localhost:8088/health                            # שורת "map": ok / 
 ו-`pose_init` (פתרון מיקום מול המפה). הדרישות שלה מהצד שלנו — ב-`DRISHOT.md`
 על הענף שלה: `radar_detections_all()` כולל החזרים סטטיים, `yaw_sigma_deg`,
 `camera_geometry()` עם המספרים המדודים, ו-`initial_fix()`.
+
+## מיקום מהקירות (pose_init v0, 2026-08-25)
+
+`mapinit` פותר עכשיו מיקום+כיוון מהחזרי-קיר סטטיים של הרדאר מול מתארי הבניינים
+(`mapinit.nav.walls.WallMatcher`). דרך החוזה:
+
+```python
+MapInitRequest(latitude, longitude,
+               heading_prior_deg=40.0,            # מצפני; אין לו מקור אחר — GPS/נעיצה
+               sigma_position_m=5.0, sigma_heading_deg=5.0,   # כנים! החיפוש הוא 3σ ולא יותר
+               wall_returns=((range_m, azimuth_deg), ...))    # + = ימינה, סטטיים, 0.5–40 מ'
+```
+
+התשובה מקבלת בלוק `pose`: `latitude_deg, longitude_deg, height_m, heading_deg`,
+הסיגמות, ו-**`accepted / ambiguous / ambiguity_axis / on_boundary`**. לקרוא את
+`accepted` ולא רק את המיקום: קיר ישר אחד לא קובע את הציר לאורכו (`ambiguous`
+עם שם הציר), ו-`on_boundary` אומר שה-prior גרוע ממה שהצהרת.
+
+CLI: `python3 -m perception.map_api --lat .. --lon .. --heading 40 --walls radar.jsonl`
+
+ב-`live.py`: `--map-heading DEG --map-sigma M DEG` (או `/set?heading=`), `/mapfix`
+פותר מההחזרים העדכניים (~5 ש'), `/topdown` נותן את קווי הבניינים וההחזרים במטרים
+מזרח/צפון, וב-`/ui` יש `nav` — אופק ניווט מ-`DeadReckoner` (שניות עד מטר סחיפה,
+עם/בלי עזרת מהירות מהרדאר). הכרטיס בדף מצייר את זה: **ההחזרים (ענבר) חייבים לשבת על
+הקירות (אפור)** — במעבדה הם לא, כי קירות פנימיים לא במפה, והפותר מסרב בהתאם.
