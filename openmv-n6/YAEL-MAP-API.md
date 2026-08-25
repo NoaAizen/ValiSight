@@ -5,8 +5,8 @@
 חישובי המפה; ענף ה־fusion אחראי על המרת התוצאה לחוזה JSON יציב דרך
 `perception.map_api`.
 
-החוזה נבדק מול `origin/yael` בקומיט
-`a54b7df309122528067d7c5ea45e1bfc4d134346`.
+החוזה נבדק מול `origin/yael` בקומיט `fce2918` (2026-08-25), בריצה מלאה על
+הג'טסון עם גריד EGM2008 ומטמון ה-priors של ירושלים: `ok=true`.
 
 ## מה צריך לקבל מיעל
 
@@ -84,3 +84,35 @@ PYTHONPATH=.. python3 -m perception.map_api \
 ```sh
 python3 -m pytest -q perception/tests/test_map_api.py
 ```
+
+## איך זה רץ על הג'טסון (2026-08-25)
+
+הענף של יעל **לא ממוזג** — הוא נשאר checkout נפרד ו-`perception.map_api` מוצא
+אותו לבד, לפי הסדר: `--mapinit-dir`, המשתנה `VALISIGHT_MAPINIT`, ואז
+`<repo>/mapinit/` או `ValiSight_yael/` לצד הריפו (`~/ValiSight_yael` על הג'טסון).
+
+מה שצריך להיות קיים פעם אחת במכונה:
+
+```sh
+git worktree add ~/ValiSight_yael origin/yael             # הקוד של יעל
+pip install --user pyproj==3.7.1 rasterio==1.4.4 'attrs>=23'   # התלויות (attrs: של אובונטו ישן מדי)
+curl -o ~/.local/share/proj/us_nga_egm08_25.tif https://cdn.proj.org/us_nga_egm08_25.tif
+cd ~/ValiSight_yael && python3 tools/fetch_priors.py --lat 31.7683 --lon 35.2137 --radius 2000
+```
+
+ואז ב-`live.py`:
+
+```sh
+./run_live.sh --map 31.7683,35.2137 --map-geoid 19 20.5
+curl -s localhost:8088/map | python3 -m json.tool      # החוזה (schema 1.0) כמו שהוא
+curl -s localhost:8088/health                            # שורת "map": ok / warn / fail
+```
+
+האתחול רץ ב-thread נפרד ולא מעכב את הווידאו. ב-`/health` הטקסט אומר איזה תיקון
+צריך: `stage failed: geoid` = חסר הגריד, `stage failed: priors` = אין מטמון
+לאזור הזה, `deployment: ...` = החבילה או תלות שלה חסרות.
+
+מה שיעל עוד לא מימשה, ומדווח `skipped`: `calibration` (צריך אילוצי כיול)
+ו-`pose_init` (פתרון מיקום מול המפה). הדרישות שלה מהצד שלנו — ב-`DRISHOT.md`
+על הענף שלה: `radar_detections_all()` כולל החזרים סטטיים, `yaw_sigma_deg`,
+`camera_geometry()` עם המספרים המדודים, ו-`initial_fix()`.

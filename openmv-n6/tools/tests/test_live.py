@@ -798,6 +798,35 @@ def main():
     check("a steady dead-row count does not fail",
           levels(dict(good, rows_window=[14] * 30))["dead rows"] != "fail")
 
+    # the map layer (Yael's mapinit through perception.map_api). Absent without
+    # --map, and when present the text must say WHICH fix: a failed stage is a
+    # map-data problem, a boundary error is a deployment problem.
+    check("no --map, no map check", "map" not in base)
+    loc = {"latitude_deg": 31.7683, "longitude_deg": 35.2137}
+    check("a map still initialising warns",
+          levels(dict(good, map={"pending": True, "location": loc}))["map"] == "warn")
+    okmap = {"ok": True, "location": loc, "geoid": {"undulation_m": 19.76},
+             "ego_altitude_prior": {"orthometric_m": 778.2, "sigma_m": 5.4},
+             "stages": [{"name": "geoid", "status": "ok"},
+                        {"name": "priors", "status": "ok"},
+                        {"name": "pose_init", "status": "skipped"}]}
+    texts = {c["name"]: c for c in live.health(pipe, dict(good, map=okmap), now)}
+    check("an initialised map reads green with its numbers",
+          texts["map"]["level"] == "ok" and "19.76" in texts["map"]["text"],
+          texts["map"]["text"])
+    failed = dict(okmap, ok=False, stages=[{"name": "geoid", "status": "failed"},
+                                           {"name": "priors", "status": "ok"}])
+    texts = {c["name"]: c for c in live.health(pipe, dict(good, map=failed), now)}
+    check("a failed stage fails and is named",
+          texts["map"]["level"] == "fail" and "geoid" in texts["map"]["text"],
+          texts["map"]["text"])
+    texts = {c["name"]: c for c in live.health(
+        pipe, dict(good, map={"ok": False, "deployment": True, "location": loc,
+                              "error": "MapAPIUnavailable: no mapinit"}), now)}
+    check("a missing package fails as a deployment problem",
+          texts["map"]["level"] == "fail" and texts["map"]["text"].startswith("deployment:"),
+          texts["map"]["text"])
+
     check("a missing sensor range fails", levels(dict(good, range=(0, 0)))["range"] == "fail")
     check("a coarse range warns", levels(dict(good, range=(-10, 140)))["range"] == "warn")
     check("a narrow range is fine", levels(dict(good, range=(20, 40)))["range"] == "ok")

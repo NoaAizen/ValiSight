@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from perception import map_api
 from perception.map_api import (
     MapAPIContractError,
     MapAPIUnavailable,
@@ -163,3 +164,47 @@ def test_missing_yael_runtime_dependency_is_actionable():
 
     with pytest.raises(MapAPIUnavailable, match="rasterio"):
         MapInitializationAPI(MissingDependency).initialize(MapInitRequest(31.7, 35.2))
+
+
+# --- finding Yael's package. It is never merged, so the adapter has to locate
+#     the checkout; a wrong pointer must fail with the path it tried.
+
+def _fake_mapinit(root: Path) -> Path:
+    (root / "mapinit").mkdir(parents=True)
+    (root / "mapinit" / "__init__.py").write_text("")
+    return root
+
+
+def test_locate_prefers_explicit_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", ())
+    root = _fake_mapinit(tmp_path / "yael")
+    assert map_api.locate_mapinit(root) == root
+    assert str(root) in map_api.sys.path
+
+
+def test_locate_reads_env_var(tmp_path, monkeypatch):
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", ())
+    root = _fake_mapinit(tmp_path / "elsewhere")
+    monkeypatch.setenv(map_api.MAPINIT_ENV, str(root))
+    assert map_api.locate_mapinit() == root
+
+
+def test_locate_falls_back_to_known_layouts(tmp_path, monkeypatch):
+    monkeypatch.delenv(map_api.MAPINIT_ENV, raising=False)
+    root = _fake_mapinit(tmp_path / "beside")
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", (tmp_path / "missing", root))
+    assert map_api.locate_mapinit() == root
+
+
+def test_locate_names_a_bad_pointer(tmp_path, monkeypatch):
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", ())
+    monkeypatch.setenv(map_api.MAPINIT_ENV, str(tmp_path / "nope"))
+    with pytest.raises(MapAPIUnavailable) as err:
+        map_api.locate_mapinit()
+    assert "nope" in str(err.value) and map_api.MAPINIT_ENV in str(err.value)
+
+
+def test_locate_returns_none_when_nothing_found(tmp_path, monkeypatch):
+    monkeypatch.delenv(map_api.MAPINIT_ENV, raising=False)
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", (tmp_path / "a", tmp_path / "b"))
+    assert map_api.locate_mapinit() is None

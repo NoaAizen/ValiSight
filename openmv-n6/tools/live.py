@@ -969,6 +969,30 @@ def health(pipe, state, now):
             add("recording", "ok", "%d frames -> %s"
                 % (state.get("video_frames", 0), os.path.basename(rec)))
 
+    # --- the map layer (Yael's mapinit, via perception.map_api). Only present
+    #     when --map was given. A failed stage is reported with its name because
+    #     "map failed" has two unrelated fixes: install the EGM2008 grid, or
+    #     fetch the priors for this operating area.
+    m = state.get("map")
+    if m is not None:
+        if m.get("pending"):
+            add("map", "warn", "initialising at %.4f,%.4f" % (
+                m["location"]["latitude_deg"], m["location"]["longitude_deg"]))
+        elif m.get("ok"):
+            alt = m.get("ego_altitude_prior") or {}
+            add("map", "ok", "geoid %.2f m, ground %.0f m, %s" % (
+                (m.get("geoid") or {}).get("undulation_m", float("nan")),
+                alt.get("orthometric_m", float("nan")),
+                "+".join(s["name"] for s in m.get("stages", [])
+                         if s["status"] == "ok") or "no stage"))
+        elif m.get("error"):
+            add("map", "fail", ("deployment: " if m.get("deployment") else "")
+                + m["error"].splitlines()[0])
+        else:
+            failed = [s["name"] for s in m.get("stages", []) if s["status"] == "failed"]
+            add("map", "fail", "stage%s failed: %s" % (
+                "" if len(failed) == 1 else "s", ", ".join(failed) or "unknown"))
+
     # --- VoSPI tearing. Unlike the dead rows this really is random, and a torn
     #     frame is stale data in part of the image, not a marked defect.
     #
@@ -3284,6 +3308,56 @@ setInterval(poll, 1000);
 """
 
 
+def start_map_init(state, latlon, geoid_range=None, mapinit_dir=None):
+    """Run Yael's map initialisation off the main thread, into state["map"].
+
+    The result is Moshe's JSON contract (perception.map_api, schema 1.0), so
+    what /map serves is exactly what the CLI prints.  Three shapes land in
+    state["map"]:  {"pending": True} while it runs; the contract dict once it
+    returns (ok may be false - that is a MAP finding, e.g. no EGM grid); and
+    {"ok": False, "error": ...} when the boundary itself failed (package or a
+    dependency missing) - a DEPLOYMENT finding, named so in the text.
+    """
+    try:
+        lat, lon = (float(v) for v in latlon.split(","))
+    except ValueError:
+        raise SystemExit("--map wants LAT,LON in decimal degrees, got %r" % latlon)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    from perception import map_api
+    request = map_api.MapInitRequest(
+        latitude=lat, longitude=lon,
+        expected_geoid_range_m=tuple(geoid_range) if geoid_range else None)
+    state["map"] = {"pending": True, "location": {"latitude_deg": lat,
+                                                   "longitude_deg": lon}}
+
+    def run():
+        try:
+            api = map_api.MapInitializationAPI(mapinit_dir=mapinit_dir)
+            # fail_fast=False: the health line should name every failed stage,
+            # not only the first, because the fixes differ (grid vs priors).
+            result = api.initialize(request, fail_fast=False)
+        except map_api.MapAPIError as e:
+            result = {"ok": False, "error": "%s: %s" % (type(e).__name__, e),
+                      "deployment": True, "location": state["map"]["location"]}
+        except Exception as e:  # never take the viewer down for the map
+            result = {"ok": False, "error": "%s: %s" % (type(e).__name__, e),
+                      "location": state["map"]["location"]}
+        state["map"] = result
+        if result.get("ok"):
+            alt = result.get("ego_altitude_prior") or {}
+            print("map: initialised at %.5f,%.5f - geoid %.2f m, ground %.1f m "
+                  "orthometric (sigma %.1f m), %s"
+                  % (lat, lon, (result.get("geoid") or {}).get("undulation_m", float("nan")),
+                     alt.get("orthometric_m", float("nan")), alt.get("sigma_m", float("nan")),
+                     os.path.basename((result.get("priors") or {}).get("overture_path", "?"))),
+                  file=sys.stderr)
+        else:
+            print("map: FAILED - %s" % (result.get("error") or result.get("summary", "")),
+                  file=sys.stderr)
+
+    threading.Thread(target=run, name="map-init", daemon=True).start()
+
+
 def make_handler(state, pipe):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -3396,6 +3470,23 @@ def make_handler(state, pipe):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(body.encode())
+            elif u.path == "/map":
+                # Yael's map layer as the schema-1.0 contract, or the reason
+                # there is none. 404 only when live.py was started without
+                # --map: then "no map" is configuration, not a failure.
+                m = state.get("map")
+                if m is None:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": "no map layer; start live.py with --map LAT,LON",
+                    }).encode())
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(m).encode())
             elif u.path == "/health":
                 checks = health(pipe, state, time.time())
                 body = json.dumps({"worst": worst_level(checks), "checks": checks})
@@ -3737,6 +3828,18 @@ def main():
                          "switchable live from the page and over "
                          "/set?ai_thermal=0&ai_radar=1&ai_fusion=1, so this only "
                          "picks what the first frame shows")
+    ap.add_argument("--map", metavar="LAT,LON", default=None,
+                    help="initialise Yael's map layer (mapinit) at this WGS84 "
+                         "position: geoid undulation, ground/surface height, "
+                         "building priors. Served on /map, graded in /health. "
+                         "Runs in the background; the viewer never waits on it")
+    ap.add_argument("--map-geoid", type=float, nargs=2, metavar=("LOW", "HIGH"),
+                    default=None, help="assert the geoid undulation is in this "
+                                       "range (m) - Jerusalem is 19..20.5")
+    ap.add_argument("--mapinit-dir", default=None, metavar="DIR",
+                    help="directory holding Yael's mapinit/ package (default: "
+                         "$VALISIGHT_MAPINIT, then a ValiSight_yael checkout "
+                         "beside this repo)")
     ap.add_argument("--seconds", type=int, default=0, help="exit after N seconds (for tests)")
     args = ap.parse_args()
 
@@ -3904,6 +4007,9 @@ def main():
     # card when this is None, and health() asks it whether a channel that is
     # switched on can actually draw.
     state["students"] = students
+
+    if args.map:
+        start_map_init(state, args.map, args.map_geoid, args.mapinit_dir)
 
     render = Renderer(pipe, state, work, detector, radar=radar,
                       radar_proj=radar_proj, video=video, students=students,

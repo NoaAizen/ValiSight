@@ -27,13 +27,32 @@ import argparse
 import importlib
 import json
 import math
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 SCHEMA_VERSION = "1.0"
-YAEL_API_COMMIT = "a54b7df309122528067d7c5ea45e1bfc4d134346"
+# Verified against origin/yael at this commit (2026-08-25): all stages the
+# adapter reads still expose the keys below, and a full run on the Jetson with
+# the EGM2008 grid and the Jerusalem priors cache returned ok=True.
+YAEL_API_COMMIT = "fce2918"
+
+# Where Yael's package is looked for when it is not already importable, in
+# order.  Her branch shares no history with this one and is never merged, so
+# the package lives in its own checkout and has to be found rather than
+# assumed.  The env var is the deployment knob; the two directories are the
+# layouts actually used on the Jetson (a worktree beside this repo) and the
+# one a future merge would produce (mapinit/ at the repo root).
+MAPINIT_ENV = "VALISIGHT_MAPINIT"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+MAPINIT_CANDIDATES: Tuple[Path, ...] = (
+    _REPO_ROOT,                              # merged: <repo>/mapinit/
+    _REPO_ROOT.parent / "ValiSight_yael",    # worktree of origin/yael beside the repo
+    Path.home() / "ValiSight_yael",
+)
 
 
 class MapAPIError(RuntimeError):
@@ -74,16 +93,54 @@ class MapInitRequest:
                 raise ValueError("expected_geoid_range_m must be finite with low <= high")
 
 
-def _public_map_initializer() -> Callable[..., Any]:
+def locate_mapinit(explicit: Optional[Path] = None) -> Optional[Path]:
+    """Return the directory that holds ``mapinit/`` and put it on sys.path.
+
+    ``explicit`` (the CLI flag) wins, then ``$VALISIGHT_MAPINIT``, then the
+    known layouts.  A directory only counts when ``mapinit/__init__.py`` is
+    actually in it, so a stale env var fails here with the path it tried
+    rather than later with a bare ImportError.  Returns None when nothing was
+    found; an already-importable ``mapinit`` (pip install -e) needs no path.
+    """
+    tried: List[Path] = []
+    for raw in ((explicit,) if explicit is not None else ()) + \
+               ((Path(os.environ[MAPINIT_ENV]),) if os.environ.get(MAPINIT_ENV) else ()):
+        root = Path(raw).expanduser()
+        if not (root / "mapinit" / "__init__.py").is_file():
+            raise MapAPIUnavailable(
+                f"no mapinit package under {root} (from "
+                f"{'--mapinit-dir' if explicit is not None else MAPINIT_ENV}); "
+                "expected <dir>/mapinit/__init__.py")
+        _prepend_path(root)
+        return root
+    for root in MAPINIT_CANDIDATES:
+        tried.append(root)
+        if (root / "mapinit" / "__init__.py").is_file():
+            _prepend_path(root)
+            return root
+    return None
+
+
+def _prepend_path(root: Path) -> None:
+    text = str(root)
+    if text not in sys.path:
+        sys.path.insert(0, text)
+
+
+def _public_map_initializer(mapinit_dir: Optional[Path] = None) -> Callable[..., Any]:
     """Load only the public object promised by Yael's branch."""
+    located = locate_mapinit(mapinit_dir)
     try:
         module = importlib.import_module("mapinit")
     except ModuleNotFoundError as exc:
         if exc.name != "mapinit":
             raise
         raise MapAPIUnavailable(
-            "mapinit is unavailable; merge Yael's branch (minimum commit "
-            f"{YAEL_API_COMMIT[:7]}) or install that package on PYTHONPATH"
+            "mapinit is unavailable; check out origin/yael (minimum commit "
+            f"{YAEL_API_COMMIT}) beside this repo, point {MAPINIT_ENV} at it, "
+            "or pip install it. Looked in: "
+            + ", ".join(str(c) for c in MAPINIT_CANDIDATES)
+            + ("" if located is None else f" (found {located} but import failed)")
         ) from exc
 
     initializer = getattr(module, "MapInitializer", None)
@@ -179,11 +236,13 @@ class MapInitializationAPI:
     a geoid grid, DEM files, or a checkout of another branch.
     """
 
-    def __init__(self, initializer_factory: Optional[Callable[..., Any]] = None) -> None:
+    def __init__(self, initializer_factory: Optional[Callable[..., Any]] = None,
+                 mapinit_dir: Optional[Path] = None) -> None:
         self._initializer_factory = initializer_factory
+        self._mapinit_dir = mapinit_dir
 
     def initialize(self, request: MapInitRequest, fail_fast: bool = True) -> Dict[str, Any]:
-        factory = self._initializer_factory or _public_map_initializer()
+        factory = self._initializer_factory or _public_map_initializer(self._mapinit_dir)
         kwargs: Dict[str, Any] = {
             "latitude": float(request.latitude),
             "longitude": float(request.longitude),
@@ -263,6 +322,8 @@ def main() -> None:
     parser.add_argument("--expect-geoid", nargs=2, type=float, metavar=("LOW", "HIGH"))
     parser.add_argument("--repo-dir", type=Path, default=None, help="Yael package data root")
     parser.add_argument("--diagnose", action="store_true", help="run all stages after a failure")
+    parser.add_argument("--mapinit-dir", type=Path, default=None,
+                        help=f"directory containing Yael's mapinit/ (else ${MAPINIT_ENV} or the known layouts)")
     args = parser.parse_args()
 
     request = MapInitRequest(
@@ -271,7 +332,8 @@ def main() -> None:
         expected_geoid_range_m=tuple(args.expect_geoid) if args.expect_geoid else None,
         repo_dir=args.repo_dir,
     )
-    result = MapInitializationAPI().initialize(request, fail_fast=not args.diagnose)
+    result = MapInitializationAPI(mapinit_dir=args.mapinit_dir).initialize(
+        request, fail_fast=not args.diagnose)
     print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))
     raise SystemExit(0 if result["ok"] else 1)
 
