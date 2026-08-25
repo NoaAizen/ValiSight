@@ -46,6 +46,22 @@ COCO_DIR = os.path.join(ROOT, 'perception', 'out', 'thermal_coco')
 
 GRADE_A_DELTA = 60.0
 REJECT_DELTA = 30.0
+# The 60/30 counts were picked from the legacy AGC-era sessions, whose
+# scene-stretched scale packs a person's contrast into ~120 counts. A
+# linear_set_range session declares c_per_lsb, and there the same person
+# sits at ~30 counts (range 0:60) - so known-scale sessions grade in
+# degrees C instead. 4.7/3.5 measured 2026-08-23 over TEST11+test10+test7:
+# person median 7.1 C vs false-heat 2.8 C; >=4.7 C keeps 90% of persons
+# and passes 4% of false heat.
+GRADE_A_DEG_C = 4.7
+REJECT_DEG_C = 3.5
+
+
+def session_thresholds(sess):
+    c = sess.meta.get('c_per_lsb')
+    if c:
+        return GRADE_A_DEG_C / c, REJECT_DEG_C / c
+    return GRADE_A_DELTA, REJECT_DELTA
 IOU_MIN = 0.30
 MAX_GAP = 8          # frames a track survives without a match (~1 s)
 
@@ -98,15 +114,15 @@ def track_session(teacher_path):
     return done + active
 
 
-def grade_track(t):
+def grade_track(t, a_delta=GRADE_A_DELTA, rej_delta=REJECT_DELTA):
     d = [x for x in t['deltas'] if x is not None]
     coverage = sum(t['covered']) / len(t['covered'])
     if not d:
         return 'B', None, coverage          # thermal never saw it: unknown
     med = float(np.median(d))
-    if med >= GRADE_A_DELTA and coverage >= 0.5:
+    if med >= a_delta and coverage >= 0.5:
         return 'A', med, coverage
-    if med < REJECT_DELTA:
+    if med < rej_delta:
         return 'REJ', med, coverage
     return 'B', med, coverage
 
@@ -152,12 +168,16 @@ def main():
         sess_name = os.path.basename(path).replace('_teacher.jsonl', '')
         sess = LiveSession(os.path.join(ROOT, 'captures', sess_name))
         meta_by_i = {m['i']: m for m in sess.frames}
+        a_delta, rej_delta = session_thresholds(sess)
+        if (a_delta, rej_delta) != (GRADE_A_DELTA, REJECT_DELTA):
+            print(f'[build] {sess_name}: c_per_lsb scale, A>={a_delta:.0f} '
+                  f'REJ<{rej_delta:.0f} counts ({GRADE_A_DEG_C}/{REJECT_DEG_C} C)')
 
         tracks = [t for t in track_session(path)
                   if len(t['boxes']) >= a.min_track]
         graded = []
         for t in tracks:
-            g, med, cov = grade_track(t)
+            g, med, cov = grade_track(t, a_delta, rej_delta)
             graded.append({'grade': g, 'median_delta': med, 'coverage': cov,
                            'n': len(t['boxes']),
                            'i0': t['frames'][0], 'i1': t['frames'][-1]})
@@ -166,7 +186,7 @@ def main():
             # grade-A tracks feed the thermal COCO, box by box - but only
             # boxes the thermal actually covers and confirms individually.
             for d, i, delta in zip(t['boxes'], t['frames'], t['deltas']):
-                if delta is None or delta < GRADE_A_DELTA:
+                if delta is None or delta < a_delta:
                     continue
                 m = meta_by_i.get(i)
                 if m is None or m.get('thermal_off') is None:

@@ -4,6 +4,10 @@
 #   ./run_live.sh                     # operator view, person detection, radar on
 #   ./run_live.sh --view fused        # anything here is passed through to live.py
 #   ./run_live.sh --record captures/session1   # ...including recording
+#   ./run_live.sh --ai-channels fusion   # start with only the agreement channel
+#   ./run_live.sh --ai-channels none     # students loaded, nothing drawn
+#   ./run_live.sh --range 20:45          # override the students' training range
+#   NO_STUDENTS=1 ./run_live.sh          # do not load the students at all
 #   ./run_live.sh --stop              # stop the viewer and park the radar
 #   SKIP_CFG=1 ./run_live.sh          # leave the radar's chirp config alone
 #   KEEP_RADAR=1 ./run_live.sh --stop # stop the viewer, leave the radar chirping
@@ -164,6 +168,47 @@ else
     echo "warp        none yet - thermal is stretched, temperatures read (unreg)"
 fi
 
+# --- the AI channels -------------------------------------------------------
+# The three student channels - thermal, radar, and the agreement between them -
+# are part of a normal launch, not something to remember to switch on. Two
+# things have to be true for them to mean anything, and neither can be decided
+# inside live.py:
+#
+#   --range 0:60  the thermal student was trained on Celsius at exactly this
+#                 scale - gexport v2's manifest carries c_per_lsb 60/255 and
+#                 tmin 0 for every one of its seven sessions. Auto-range hands
+#                 the model a scene-relative unit instead, which does not fail,
+#                 it just quietly detects worse. Pinning also puts c_per_lsb in
+#                 meta.json, which is what makes a recording exportable at all.
+#   the warp LUT  thermal boxes sit on the 160x120 plane until the LUT maps
+#                 them onto the picture, and fusion pairs on the visible plane.
+#                 With no LUT the thermal channel reports and draws nothing and
+#                 fusion has nothing to pair.
+#
+# Everything past that is live: the three channels switch from the page (keys
+# t, r, c) or over /set?ai_thermal=0&ai_radar=1&ai_fusion=1.
+STUDENT_ENGINE="$ROOT/perception/out/gexport/v2/models/thermal_student.engine"
+HAS_RANGE=0
+for a in "$@"; do
+    case "$a" in --range|--range=*) HAS_RANGE=1;; esac
+done
+if [ "${NO_STUDENTS:-0}" = "1" ]; then
+    echo "students   off (NO_STUDENTS=1)"
+elif [ -f "$STUDENT_ENGINE" ]; then
+    ARGS+=(--students)
+    if [ "$HAS_RANGE" = 0 ]; then
+        ARGS+=(--range 0:60)
+        echo "students   thermal + radar + fusion, range pinned 0:60 (training scale)"
+    else
+        # Their range wins - it comes after ours on the command line - but the
+        # students were trained at 0:60 and this is the only place that says so.
+        echo "students   thermal + radar + fusion, YOUR --range (trained at 0:60)"
+    fi
+    [ -f "$WARP" ] || echo "  no warp LUT: the thermal channel cannot be drawn and fusion cannot pair" >&2
+else
+    echo "students   none - $STUDENT_ENGINE is missing (build it with trtexec)" >&2
+fi
+
 LOG="${LOG:-/tmp/live_radar.log}"
 nohup setsid python3 "$HERE/live.py" "${ARGS[@]}" "$@" >"$LOG" 2>&1 </dev/null &
 NEW_PID=$!
@@ -221,6 +266,11 @@ fi
 # fallback, streams identically to a healthy one - say so here or it is
 # discovered hours later in the recordings.
 grep -m1 -E 'RUNNING WITHOUT DETECTION|falling back to yolov4-tiny' "$LOG" >&2 || true
+# The students are opt-in inside live.py and degrade silently by design: a
+# missing engine or a GPU that would not come up leaves the rest of the viewer
+# running and prints one line. Unrepeated here, that line is three minutes of
+# scrollback away by the time anyone notices the boxes are missing.
+grep -m3 -E '^students: ' "$LOG" >&2 || true
 curl -s --max-time 5 "http://localhost:$HTTP/health" 2>/dev/null | python3 -c '
 import json, sys
 raw = sys.stdin.read()

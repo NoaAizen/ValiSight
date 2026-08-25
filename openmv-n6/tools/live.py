@@ -5,6 +5,7 @@
     ./live.py --warp calib/warp.lut --gain 220
     ./live.py --radar               live + IWR1843 overlay (USB DATA port)
     ./live.py --record              live + recording to captures/live-<stamp>/
+    ./live.py --radar --students    live + the three AI channels (see below)
     ./live.py --radar --record DIR  a full calibration session: session.mp4,
                                     frames.jsonl, thermal.bin, radar.bin+jsonl
 
@@ -29,6 +30,40 @@ what the V3 plan section 5d exists to stop.
 The view selector is there to judge registration, which the fused image cannot
 show you on its own - see the VIEWS comment below for why, and use blink/edges
 during a calibration session rather than trusting how sharp the picture looks.
+
+--students brings up three AI channels, switched on and off live from the page
+(keys t, r, c) or over /set?ai_thermal=0&ai_radar=1&ai_fusion=1, and read back
+on /ai:
+
+    thermal   orange - the thermal student, drawn on the visible plane through
+              the warp LUT. Without a LUT its boxes are still reported, on the
+              thermal plane, but cannot be placed on the picture.
+    radar     cyan   - the radar student, straight onto the visible plane.
+    fusion    white  - the two of them agreeing: one person, seen by both. The
+              pair is made on u only, inside 50 px, because radar elevation
+              comes off a two-element aperture and says almost nothing about
+              which box a return belongs to. A fused box carries the range.
+
+With `person outline` on (key s, the default), a detection is drawn as the warm
+shape the thermal frame holds inside it rather than as a rectangle - the
+detector's green person boxes included, which is the pairing worth having: the
+COCO detector is the locator this rig trusts, and the thermal frame is the only
+sensor here that knows the shape. Fusion draws its ring around that shape. The
+split inside a box is Otsu, not a fixed body-heat threshold, and where no shape
+can be found (no LUT, no thermal coverage, nothing warm in the box) the box
+comes back.
+
+Each channel has a confidence slider on the same card. It hides boxes rather
+than restarting the engines, so the card counts `shown of found` and a quiet
+scene never looks like a slider parked too high; below 0.75 a box is drawn as
+four corner ticks rather than a rectangle, because a candidate and a detection
+should not look alike. Overlapping and nested duplicates - the students emit
+eight slots with no NMS of their own - are dropped before any of that.
+
+They are three switches rather than a mode selector because agreement is only
+readable beside its components: two channels that fire on everything agree on
+everything too. Switching a channel off stops its engine - except when fusion
+needs it, which still runs it and simply does not draw it.
 """
 import argparse
 import ctypes
@@ -332,6 +367,34 @@ class Pipeline:
         # sensor: elevation comes from a two-element aperture and is the least
         # trustworthy thing on the screen.
         self.radar_whisker = True
+        # The three AI channels. Switchable live rather than picked at launch:
+        # which of them is worth believing is a question about the scene in
+        # front of the rig - light, motion, clutter - and the operator answering
+        # it must not have to restart the viewer and cut the recording in two.
+        # Independent switches and not a mode selector, because `fusion` is the
+        # AGREEMENT between the other two: seeing it beside its components is
+        # the only way to tell a real agreement from two channels that are each
+        # firing on everything.
+        self.ai_thermal = True
+        self.ai_radar = True
+        self.ai_fusion = True
+        # Per-channel confidence floors, applied to what is DRAWN rather than
+        # inside the engines. Two reasons: the engine's own threshold cannot be
+        # lowered again without a restart, and a box that was found and then
+        # hidden has to stay countable - the card says "3 of 7", because a
+        # filter that silently eats detections is worse than the clutter it
+        # removes. Set from --student-conf at startup; the page moves them.
+        self.ai_conf_thermal = 0.5
+        self.ai_conf_radar = 0.5
+        # Draw the person rather than a rectangle around the person: the
+        # thermal channel knows the shape, and a box is a claim about a
+        # bounding rectangle that nothing in the scene has. Falls back to the
+        # rectangle wherever the shape cannot be found - no warp LUT, no
+        # thermal coverage, or a box with nothing warm in it.
+        self.ai_silhouette = True
+        # The floor the engines themselves were built with: a slider below this
+        # does nothing, so the page clamps to it rather than pretending.
+        self.ai_conf_floor = 0.5
 
         if args.warp:
             with open(args.warp, "rb") as fp:
@@ -860,6 +923,42 @@ def health(pipe, state, now):
                    state.get("radar_offscreen", 0),
                    ", %d bytes dropped" % drop if drop else ""))
 
+    # --- the AI channels. Not "is the model loaded" - the switches are live,
+    # so the question worth answering is whether what is on the screen right now
+    # is what the operator thinks they are looking at. A fusion channel that
+    # cannot pair draws nothing, and nothing looks exactly like an empty scene.
+    st = state.get("students")
+    if st is not None:
+        n_t = len(state.get("student_thermal") or [])
+        n_r = len(state.get("student_radar") or [])
+        n_f = len(state.get("student_fused") or [])
+        on = [n for n, flag in (("thermal", pipe.ai_thermal),
+                                ("radar", pipe.ai_radar),
+                                ("fusion", pipe.ai_fusion)) if flag]
+        no_lut = st.get("th2vis") is None
+        no_radar = st.get("radar") is None
+        if state.get("student_error"):
+            add("ai", "fail", state["student_error"])
+        elif not on:
+            add("ai", "warn", "all three channels switched off - the students "
+                "are loaded and nothing is running")
+        elif pipe.ai_fusion and (no_lut or no_radar):
+            add("ai", "warn", "fusion is on but cannot pair: %s"
+                % ("no warp LUT, so thermal boxes never reach the visible plane"
+                   if no_lut else "no radar student engine on this run"))
+        elif pipe.ai_thermal and no_lut:
+            add("ai", "warn", "thermal channel has no warp LUT - %d box%s found, "
+                "none can be placed on the picture"
+                % (n_t, "" if n_t == 1 else "es"))
+        else:
+            seen = state.get("student_seen") or {}
+            hidden = (max(0, seen.get("thermal", 0) - n_t)
+                      + max(0, seen.get("radar", 0) - n_r))
+            add("ai", "ok", "%s on - T %d / R %d / TR %d%s"
+                % ("+".join(on), n_t, n_r, n_f,
+                   "" if not hidden else
+                   ", %d below the confidence floor or deduplicated" % hidden))
+
     # --- recording. A recorder that died mid-session must not be discovered at
     # the end of the campaign; the mp4 writer's failure mode is a 0-byte file.
     rec = state.get("recording")
@@ -1085,10 +1184,14 @@ class Renderer(threading.Thread):
     """
 
     def __init__(self, pipe, state, work, detector=None, radar=None,
-                 radar_proj=None, video=None, students=None):
+                 radar_proj=None, video=None, students=None, th2vis=None):
         super().__init__(daemon=True)
         self.pipe, self.state, self.work = pipe, state, work
         self.students = students
+        # The thermal->visible mapper. Held here and not inside `students`
+        # because the person outline is drawn for the DETECTOR's boxes too,
+        # and the detector runs whether or not the students were loaded.
+        self.th2vis = th2vis
         self.stop = threading.Event()
         # The radar overlay is drawn here rather than in compose() because it is
         # not part of the fused image: it is a separate sensor annotated ON TOP
@@ -1141,17 +1244,157 @@ class Renderer(threading.Thread):
     # Student overlay colours, RGB frame order (imencode flips to BGR later).
     STUDENT_TH_COL = (255, 150, 0)       # orange: thermal student
     STUDENT_RD_COL = (0, 210, 255)       # cyan: radar student
+    STUDENT_FU_COL = (255, 255, 255)     # white: both channels agree
+    # The pairing gate for the fusion channel, in visible-plane pixels, applied
+    # to u ONLY. D3 measured the thermal/radar disagreement at du median 14.4 px
+    # and p90 37.5 px, inside the extrinsic envelope; elevation comes off a
+    # two-element aperture (sigma ~12 deg) and says almost nothing about which
+    # box a return belongs to, so v is not gated on at all. Same stance as
+    # radar_overlay.attach_range(), for the same measured reason.
+    FUSION_DU_PX = 50.0
+
+    # Two ways of being the same object twice, because the students emit eight
+    # slots per frame with no NMS of their own:
+    #   IoU        near-identical rectangles a pixel or two apart.
+    #   CONTAINED  the nested case - a box around a person and another around
+    #              the whole doorway they are standing in. Their IoU can be as
+    #              low as 0.3 while one sits entirely inside the other, so IoU
+    #              alone leaves exactly the overlapping pair that makes the
+    #              picture unreadable. Measured against the smaller box, so a
+    #              big weak claim cannot survive by being big.
+    DEDUP_IOU = 0.55
+    DEDUP_CONTAINED = 0.8
+
+    # Above this a student box is drawn as a rectangle; below it, as four
+    # corner ticks. A candidate and a detection should not look alike, and on
+    # this scene at 0.6 the students claim doorways and warm pillars - drawn
+    # solid they compete with the detector's green person box for attention
+    # they have not earned. The number is the drawn form only; what is a
+    # detection at all is the confidence slider's business.
+    STRONG_CONF = 0.75
+
+    # How far outside the person the fusion ring is drawn, in visible pixels.
+    # Far enough to read as a ring around them rather than a second outline.
+    HALO_PX = 5
+
+    @staticmethod
+    def _draw_shape(rgb, mask, col, thick, grow=0):
+        """Outline a visible-plane mask, optionally grown into a ring."""
+        m = mask.astype(np.uint8)
+        if grow:
+            k = 2 * grow + 1
+            m = cv2.dilate(m, np.ones((k, k), np.uint8))
+        cnts = cv2.findContours(m, cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE)[0]
+        if not cnts:
+            return False
+        cv2.drawContours(rgb, cnts, -1, col, thick, cv2.LINE_AA)
+        return True
+
+    @staticmethod
+    def _corners(rgb, x, y, w, h, col):
+        """Four corner ticks instead of a rectangle: a weaker visual claim."""
+        d = int(min(max(6, min(w, h) // 5), 18))
+        x1, y1 = x + w, y + h
+        for (cx, sx) in ((x, 1), (x1, -1)):
+            for (cy, sy) in ((y, 1), (y1, -1)):
+                cv2.line(rgb, (cx, cy), (cx + sx * d, cy), col, 1, cv2.LINE_AA)
+                cv2.line(rgb, (cx, cy), (cx, cy + sy * d), col, 1, cv2.LINE_AA)
+
+    @classmethod
+    def _dedup(cls, dets):
+        """Drop each box that claims a region a more confident box already has.
+
+        Plain greedy NMS over one channel's own output, on whichever plane the
+        boxes are already in - the caller runs it before the thermal boxes are
+        mapped to the visible plane, so the comparison is always like for like.
+        _boxes_to_dets already sorts by confidence, so the first box to claim a
+        region is the strongest one.
+        """
+        kept = []
+        for d in dets:
+            x0, y0 = d["x"], d["y"]
+            x1, y1 = x0 + d["w"], y0 + d["h"]
+            for k in kept:
+                kx0, ky0 = k["x"], k["y"]
+                kx1, ky1 = kx0 + k["w"], ky0 + k["h"]
+                iw = min(x1, kx1) - max(x0, kx0)
+                ih = min(y1, ky1) - max(y0, ky0)
+                if iw <= 0 or ih <= 0:
+                    continue
+                inter = float(iw * ih)
+                union = d["w"] * d["h"] + k["w"] * k["h"] - inter
+                smaller = float(min(d["w"] * d["h"], k["w"] * k["h"]))
+                if ((union > 0 and inter / union >= cls.DEDUP_IOU)
+                        or (smaller > 0
+                            and inter / smaller >= cls.DEDUP_CONTAINED)):
+                    break
+            else:
+                kept.append(d)
+        return kept
+
+    @classmethod
+    def _fuse(cls, tdets, rdets):
+        """Pair thermal-student and radar-student boxes that are one person.
+
+        Greedy on |du| rather than Hungarian: each channel emits at most 8
+        boxes, so the assignment is small enough that nearest-under-a-hard-gate
+        gives the same answer, and it keeps scipy out of the render thread.
+
+        The fused box keeps the THERMAL extent. The radar box's height is a
+        guess from that same two-element aperture; what the radar channel
+        contributes here is agreement and range, not geometry. The score is the
+        noisy-OR of the two - two independent sensors each half-believing a
+        person is a stronger claim than either alone - and both components ride
+        along so the page can show what was actually combined rather than a
+        number nobody can take apart.
+        """
+        pairs = []
+        for i, t in enumerate(tdets):
+            tv = t.get("vis")
+            if tv is None:
+                continue              # not on the visible plane: nothing to pair
+            tu = tv[0] + tv[2] / 2.0
+            for j, r in enumerate(rdets):
+                du = abs(tu - (r["x"] + r["w"] / 2.0))
+                if du <= cls.FUSION_DU_PX:
+                    pairs.append((du, i, j))
+        pairs.sort()
+        used_t, used_r, fused = set(), set(), []
+        for du, i, j in pairs:
+            if i in used_t or j in used_r:
+                continue
+            used_t.add(i)
+            used_r.add(j)
+            t, r = tdets[i], rdets[j]
+            x, y, w, h = t["vis"]
+            t["fused"] = r["fused"] = True
+            fused.append({"x": x, "y": y, "w": w, "h": h,
+                          "conf": 1.0 - (1.0 - t["conf"]) * (1.0 - r["conf"]),
+                          "conf_thermal": round(t["conf"], 3),
+                          "conf_radar": round(r["conf"], 3),
+                          "du": round(du, 1)})
+        return fused
 
     def _run_students(self, thermal, rgb):
-        """Run the trained students on this tick and draw their boxes.
+        """Run the enabled student channels on this tick and draw them.
 
         Runs inline in the render thread on purpose: both engines together
         are ~1.5 ms, two orders of magnitude under the frame period, and a
         third thread would buy nothing but a handoff to race.
+
+        Which engines run is decided here and not at launch. A channel switched
+        off does not run at all - "off" has to mean off, or the GPU work and the
+        error surface stay whether or not anything is drawn - but a channel that
+        is off while fusion is on still runs, because fusion is a statement
+        about both of them.
         """
         s = self.students
-        tdets, rdets = [], []
-        if thermal is not None and len(thermal) == 160 * 120:
+        pl = self.pipe
+        want_t = pl.ai_thermal or pl.ai_fusion
+        want_r = pl.ai_radar or pl.ai_fusion
+        tdets, rdets, fused, fr = [], [], [], None
+        if want_t and thermal is not None and len(thermal) == 160 * 120:
             try:
                 th = (np.frombuffer(thermal, np.uint8)
                       .astype(np.float32).reshape(120, 160)
@@ -1160,7 +1403,26 @@ class Renderer(threading.Thread):
             except Exception as e:
                 self.state["student_error"] = "thermal %s: %s" % (
                     type(e).__name__, e)
-        if s["radar"] is not None and self.radar is not None:
+        seen_t = len(tdets)
+        if tdets and not getattr(s["thermal"], "primed", True):
+            # The first two frames of a session run with no temporal chain
+            # behind them and answer confidently about cold structure - a
+            # pillar, a doorway (measured on captures/test6). Two frames is
+            # 230 ms of a session; they are dropped rather than drawn, and
+            # seen_t above still counts them, so the card shows "0 of 2"
+            # rather than a silent gap.
+            tdets = []
+        tdets = self._dedup([d for d in tdets
+                             if d["conf"] >= pl.ai_conf_thermal])
+        # The visible-plane box travels with the detection from here on: it is
+        # what gets drawn, what the radar channel is paired against, and what
+        # /ai reports. None means the box fell outside the thermal/visible
+        # overlap - or that there is no warp LUT to map it with at all, which is
+        # the same "cannot be placed" answer arrived at earlier.
+        for d in tdets:
+            d["vis"] = (s["th2vis"].box(d["x"], d["y"], d["w"], d["h"])
+                        if s["th2vis"] is not None else None)
+        if want_r and s["radar"] is not None and self.radar is not None:
             fr = self.radar.get()
             if fr is not None:
                 try:
@@ -1170,30 +1432,118 @@ class Renderer(threading.Thread):
                 except Exception as e:
                     self.state["student_error"] = "radar %s: %s" % (
                         type(e).__name__, e)
+        seen_r = len(rdets)
+        rdets = self._dedup([d for d in rdets
+                             if d["conf"] >= pl.ai_conf_radar])
+        # One mask per thermal box, keyed by the visible box it maps to - which
+        # is exactly the box the fused entry carries, so the fusion ring can
+        # find its person without threading an index through _fuse().
+        shapes = {}
+        if (pl.ai_silhouette and self.th2vis is not None
+                and thermal is not None and len(thermal) == 160 * 120):
+            raw8 = np.frombuffer(thermal, np.uint8).reshape(120, 160)
+            for d in tdets:
+                if d["vis"] is None:
+                    continue
+                m = self.th2vis.shape_in(raw8, *d["vis"])
+                if m is not None:
+                    shapes[tuple(d["vis"])] = m
+
+        if pl.ai_fusion:
+            fused = self._fuse(tdets, rdets)
+            if fused and fr is not None and self.radar_proj is not None:
+                # Range is the one thing the radar channel knows that the
+                # picture cannot show. Taken from the raw returns rather than
+                # from the radar student, whose output is a box and carries no
+                # distance at all.
+                radar_overlay.attach_range(fused, fr["points"], self.radar_proj)
         self.state["student_thermal"] = tdets
         self.state["student_radar"] = rdets
+        self.state["student_fused"] = fused
+        # What the engines produced before the floor and the dedup, so the page
+        # can say how much it is hiding and the operator can tell "quiet scene"
+        # from "slider too high".
+        self.state["student_seen"] = {"thermal": seen_t, "radar": seen_r}
         self.state["student_t"] = time.time()
 
-        for d in tdets:
-            if s["th2vis"] is None:
-                break                     # no LUT: nothing to draw them on
-            vis = s["th2vis"].box(d["x"], d["y"], d["w"], d["h"])
-            if vis is None:
-                continue                  # outside the thermal/visible overlap
-            x, y, w, h = vis
-            cv2.rectangle(rgb, (x, y), (x + w, y + h),
-                          self.STUDENT_TH_COL, 2)
-            cv2.putText(rgb, "T %.2f" % d["conf"], (x, max(12, y - 4)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                        self.STUDENT_TH_COL, 1, cv2.LINE_AA)
-        for d in rdets:
-            x, y, w, h = d["x"], d["y"], d["w"], d["h"]
-            cv2.rectangle(rgb, (x, y), (x + w, y + h),
-                          self.STUDENT_RD_COL, 1)
-            cv2.putText(rgb, "R %.2f" % d["conf"],
-                        (x, min(OUT_H - 4, y + h + 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42,
-                        self.STUDENT_RD_COL, 1, cv2.LINE_AA)
+        # A component that has been paired keeps its box and loses its label:
+        # the white one is already quoting a number for that person, and three
+        # labels stacked on one head is how a 40 px box at 15 m becomes
+        # unreadable. Which channel contributed is still visible - that is what
+        # the box colour is for - and an UNpaired box keeps its label, which is
+        # the case where the number actually decides something.
+        if pl.ai_thermal:
+            for d in tdets:
+                if d["vis"] is None:
+                    continue          # no LUT, or outside the overlap
+                x, y, w, h = d["vis"]
+                m = shapes.get((x, y, w, h))
+                strong = d["conf"] >= self.STRONG_CONF
+                if m is None or not self._draw_shape(
+                        rgb, m, self.STUDENT_TH_COL, 2 if strong else 1):
+                    if strong:
+                        cv2.rectangle(rgb, (x, y), (x + w, y + h),
+                                      self.STUDENT_TH_COL, 2)
+                    else:
+                        self._corners(rgb, x, y, w, h, self.STUDENT_TH_COL)
+                if not d.get("fused"):
+                    cv2.putText(rgb, "T" + ("%.2f" % d["conf"]).lstrip("0"),
+                                (x, max(11, y - 4)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                                self.STUDENT_TH_COL, 1, cv2.LINE_AA)
+        if pl.ai_radar:
+            for d in rdets:
+                x, y, w, h = d["x"], d["y"], d["w"], d["h"]
+                if d["conf"] >= self.STRONG_CONF:
+                    cv2.rectangle(rgb, (x, y), (x + w, y + h),
+                                  self.STUDENT_RD_COL, 1)
+                else:
+                    self._corners(rgb, x, y, w, h, self.STUDENT_RD_COL)
+                if not d.get("fused"):
+                    cv2.putText(rgb, "R" + ("%.2f" % d["conf"]).lstrip("0"),
+                                (x, min(OUT_H - 4, y + h + 12)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                                self.STUDENT_RD_COL, 1, cv2.LINE_AA)
+        # Drawn around the components rather than instead of them: a white box
+        # with an orange one inside it says "the thermal channel found this and
+        # the radar agreed", which is a different and more useful statement than
+        # a single box in a third colour.
+        for d in fused:
+            x, y = max(0, d["x"] - 3), max(0, d["y"] - 3)
+            m = shapes.get((d["x"], d["y"], d["w"], d["h"]))
+            # A ring at HALO_PX outside the person, so agreement reads as
+            # something drawn AROUND them rather than a second outline on top
+            # of the thermal channel's.
+            if m is None or not self._draw_shape(rgb, m, self.STUDENT_FU_COL,
+                                                 2, grow=self.HALO_PX):
+                x2 = min(OUT_W - 1, d["x"] + d["w"] + 3)
+                y2 = min(OUT_H - 1, d["y"] + d["h"] + 3)
+                cv2.rectangle(rgb, (x, y), (x2, y2), self.STUDENT_FU_COL, 2)
+            label = "TR %.2f" % d["conf"]
+            if d.get("radar_m") is not None:
+                label += "  %.1fm" % d["radar_m"]
+            cv2.putText(rgb, label, (x, max(12, y - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46,
+                        self.STUDENT_FU_COL, 1, cv2.LINE_AA)
+
+    def _person_outline(self, thermal, rgb):
+        """An annotate() callback that draws a person's thermal shape.
+
+        None when nothing could draw one - no LUT, no thermal frame, or the
+        outline switched off - so annotate() falls straight back to its boxes
+        rather than calling something that always says no.
+        """
+        if (not self.pipe.ai_silhouette or self.th2vis is None
+                or thermal is None or len(thermal) != 160 * 120):
+            return None
+        raw8 = np.frombuffer(thermal, np.uint8).reshape(120, 160)
+
+        def draw(d, col):
+            if d["cls"] != "person":
+                return False
+            m = self.th2vis.shape_in(raw8, d["x"], d["y"], d["w"], d["h"])
+            return m is not None and self._draw_shape(rgb, m, col, 2)
+        return draw
 
     def run(self):
         while not self.stop.is_set():
@@ -1258,7 +1608,13 @@ class Renderer(threading.Thread):
                             if fr is not None:
                                 radar_overlay.attach_range(dets, fr["points"],
                                                            self.radar_proj)
-                        detect.annotate(rgb, dets, p.warped)
+                        # The detector says WHERE and the thermal frame says
+                        # what shape is warm there. This is the pairing worth
+                        # drawing: the detector is the locator this rig
+                        # trusts, and a rectangle is a claim about a bounding
+                        # box that nothing in the scene has.
+                        detect.annotate(rgb, dets, p.warped,
+                                        outline=self._person_outline(thermal, rgb))
 
             if self.radar is not None and self.pipe.show_radar:
                 fr = self.radar.get()
@@ -1975,6 +2331,37 @@ def ui_payload(pipe, state, now):
                 "roll": round(rp.roll, 2),
                 "tx": round(rp.t[0] * 1000), "ty": round(rp.t[1] * 1000),
                 "tz": round(rp.t[2] * 1000)},
+            # None when --students was not given or its engines did not come
+            # up: same argument as the radar block above, and the page hides
+            # the card rather than offering switches that move nothing.
+            # `ready` is separate from `on` because a channel can be switched on
+            # and still be unable to draw - a thermal box with no warp LUT has
+            # nowhere to go, and fusion needs both channels to exist at all.
+            "ai": None if state.get("students") is None else {
+                # `found` is what the engine produced this tick and `n` is what
+                # survived the confidence floor and the dedup. Both, always: a
+                # card that only showed `n` cannot tell a quiet scene from a
+                # slider parked too high.
+                "floor": round(pipe.ai_conf_floor, 2),
+                "silhouette": pipe.ai_silhouette,
+                "thermal": {"on": pipe.ai_thermal,
+                            "n": len(state.get("student_thermal") or []),
+                            "found": (state.get("student_seen") or {}).get("thermal", 0),
+                            "conf": round(pipe.ai_conf_thermal, 2),
+                            "ready": state["students"].get("th2vis") is not None},
+                "radar": {"on": pipe.ai_radar,
+                          "n": len(state.get("student_radar") or []),
+                          "found": (state.get("student_seen") or {}).get("radar", 0),
+                          "conf": round(pipe.ai_conf_radar, 2),
+                          "ready": state["students"].get("radar") is not None},
+                "fusion": {"on": pipe.ai_fusion,
+                           "n": len(state.get("student_fused") or []),
+                           "ready": (state["students"].get("th2vis") is not None
+                                     and state["students"].get("radar") is not None)},
+                "age_s": (round(now - state["student_t"], 2)
+                          if state.get("student_t") else None),
+                "error": state.get("student_error"),
+            },
         },
     }
 
@@ -2300,6 +2687,44 @@ SOC</div>
           uncertainty &mdash; the bare dot flatters a two-element aperture</div>
       </div>
     </div>
+
+    <div class=card id=aicard style=display:none>
+      <h4>ai channels <span class=k>t r c</span></h4>
+      <div class=body>
+        <label class=chk><input type=checkbox id=ai_thermal checked> thermal
+          <span class=sub id=s_ai_t></span></label>
+        <label class=chk><input type=checkbox id=ai_radar checked> radar
+          <span class=sub id=s_ai_r></span></label>
+        <label class=chk><input type=checkbox id=ai_fusion checked> fusion
+          <span class=sub id=s_ai_f></span></label>
+        <label class=chk><input type=checkbox id=silhouette checked>
+          person outline <span class=sub id=s_ai_sil></span></label>
+        <div class=sl><label>thermal confidence</label><output id=o_conf_thermal>0.50</output>
+          <input type=range id=conf_thermal min=50 max=99 value=50></div>
+        <div class=sl><label>radar confidence</label><output id=o_conf_radar>0.50</output>
+          <input type=range id=conf_radar min=50 max=99 value=50></div>
+        <div class=hintline>the sliders hide boxes, they do not stop the
+          engines: the count beside each channel reads
+          <i>shown of found</i>, so a quiet scene and a slider parked too high
+          never look the same. They cannot go below the threshold the engines
+          were started with (&minus;&minus;student-conf).</div>
+        <div class=hintline>with <b>person outline</b> on, the thermal channel
+          draws the warm shape it found instead of a rectangle, and fusion
+          draws a ring around it &mdash; the 4 px staircase is the warp LUT's
+          real resolution, not a rendering artefact. Where the shape cannot be
+          found (no thermal coverage, nothing warm in the box) it falls back
+          to a rectangle: a full rectangle above 0.75, four corner
+          ticks below. orange = thermal student, cyan = radar
+          student, white = the same person in both. The pair is made on the horizontal
+          only (&plusmn;50 px): radar elevation comes from two elements and
+          says almost nothing about which box a return belongs to. A fused box
+          carries the range, which is the one thing the picture cannot show,
+          and its components keep their colour but drop their own labels.</div>
+        <div class=hintline>fusion keeps running the channel it needs even when
+          that channel's own boxes are switched off &mdash; switching one off
+          hides it, agreement still needs both.</div>
+      </div>
+    </div>
   </aside>
 </div>
 
@@ -2354,6 +2779,8 @@ SOC</div>
   <details><summary>Keys</summary>
   <p><kbd>1</kbd>-<kbd>5</kbd> view &middot; <kbd>f</kbd> field mode (hide everything but the
   stream and the health) &middot; <kbd>o</kbd> footprint &middot; <kbd>b</kbd> boxes &middot;
+  <kbd>t</kbd> thermal ai &middot; <kbd>r</kbd> radar ai &middot; <kbd>c</kbd> fusion &middot;
+  <kbd>s</kbd> person outline &middot;
   <kbd>x</kbd> clear probes</p></details>
 </div>
 
@@ -2394,8 +2821,20 @@ for (const k of SLIDERS) {
 for (const k of ['emis','refl'])
   $(k).onchange = () => set('emissivity=' + $('emis').value + '&reflected=' + $('refl').value);
 for (const [id, param] of [['outline','outline'],['boxes','boxes'],
-                           ['radar','radar'],['whisker','whisker']])
+                           ['radar','radar'],['whisker','whisker'],
+                           ['ai_thermal','ai_thermal'],['ai_radar','ai_radar'],
+                           ['ai_fusion','ai_fusion'],['silhouette','silhouette']])
   $(id).onchange = (e) => set(param + '=' + (e.target.checked ? 1 : 0));
+
+// Sent as a fraction, drawn as one, but an <input type=range> only counts in
+// integers - so the slider is in percent and nothing else in the page is.
+for (const k of ['conf_thermal', 'conf_radar']) {
+  const el = $(k);
+  el.oninput = () => {
+    $('o_' + k).textContent = (el.value / 100).toFixed(2);
+    set(k + '=' + (el.value / 100));
+  };
+}
 
 $('posego').onclick = () => { const v = $('poseid').value.trim(); if (v) stamp(v); };
 $('poseclr').onclick = () => stamp(null);
@@ -2482,6 +2921,10 @@ addEventListener('keydown', (e) => {
   if (e.key === 'f') document.body.classList.toggle('field');
   if (e.key === 'o') { $('outline').click(); }
   if (e.key === 'b') { $('boxes').click(); }
+  if (e.key === 't') { $('ai_thermal').click(); }
+  if (e.key === 'r') { $('ai_radar').click(); }
+  if (e.key === 'c') { $('ai_fusion').click(); }
+  if (e.key === 's') { $('silhouette').click(); }
   const i = Number(e.key) - 1;
   if (i >= 0 && i < VIEWS.length) { pick('view', VIEWS[i]); set('view=' + VIEWS[i]); }
 });
@@ -2579,7 +3022,7 @@ const GROUPS = [
   ['link', ['stream','framing','jpeg','render']],
   ['sensor', ['cadence','pairing','thermal load','ffc','tearing','dead rows','board heap']],
   ['measurement', ['registration','coverage','range','clipping','agc','emissivity']],
-  ['perception', ['detect','radar','recording']],
+  ['perception', ['detect','radar','ai','recording']],
   ['host', ['host cpu','host memory','host thermal','host power']],
 ];
 const RANK = {ok: 0, warn: 1, fail: 2}, LVL = ['ok','warn','fail'];
@@ -2636,6 +3079,19 @@ function initControls(cfg) {
   $('boxes').checked = cfg.boxes;
   pick('view', cfg.view);
   pick('pal', cfg.palette);
+  if (cfg.ai) {
+    $('aicard').style.display = '';
+    $('ai_thermal').checked = cfg.ai.thermal.on;
+    $('ai_radar').checked = cfg.ai.radar.on;
+    $('ai_fusion').checked = cfg.ai.fusion.on;
+    $('silhouette').checked = cfg.ai.silhouette;
+    for (const [k, c] of [['conf_thermal', cfg.ai.thermal],
+                          ['conf_radar', cfg.ai.radar]]) {
+      $(k).min = Math.round(100 * cfg.ai.floor);
+      $(k).value = Math.round(100 * c.conf);
+      $('o_' + k).textContent = c.conf.toFixed(2);
+    }
+  }
   if (cfg.radar) {
     $('radarcard').style.display = '';
     $('radar').checked = cfg.radar.on;
@@ -2801,6 +3257,25 @@ async function poll() {
     + (dd.warped ? '' : '<span class=flag>UNREGISTERED</span>')
     + '</div>').join('');
 
+  // --- the ai channels. The count is the point of the sub-label, but 'off'
+  // and 'cannot draw' have to be told apart from 'nobody there': all three look
+  // like a zero, and only one of them is news about the scene.
+  if (cfg.ai) {
+    const chan = (id, c) => {
+      const el = $(id);
+      const hidden = (c.found === undefined) ? 0 : c.found - c.n;
+      el.textContent = !c.ready ? 'unavailable'
+        : !c.on ? 'off'
+        : hidden > 0 ? c.n + ' of ' + c.found
+        : c.n + (c.n === 1 ? ' box' : ' boxes');
+      el.style.color = !c.ready ? '#f0c060' : (c.on && c.n) ? '#7fd39b' : '';
+    };
+    chan('s_ai_t', cfg.ai.thermal);
+    chan('s_ai_r', cfg.ai.radar);
+    chan('s_ai_f', cfg.ai.fusion);
+    $('s_ai_sil').textContent = cfg.ai.silhouette ? 'shape' : 'boxes';
+  }
+
   if (probes.length) refreshProbes();
 }
 poll();
@@ -2838,6 +3313,25 @@ def make_handler(state, pipe):
                     pipe.show_radar = q.pop("radar") not in ("0", "false", "")
                 if "whisker" in q:
                     pipe.radar_whisker = q.pop("whisker") not in ("0", "false", "")
+                # The AI channels. Accepted even when --students was not given:
+                # the flags are display state like every other switch here, and
+                # a 404 on a live control is harder to read than a switch that
+                # holds a value nothing is currently drawing.
+                if "silhouette" in q:
+                    pipe.ai_silhouette = q.pop("silhouette") not in (
+                        "0", "false", "")
+                for k in ("ai_thermal", "ai_radar", "ai_fusion"):
+                    if k in q:
+                        setattr(pipe, k, q.pop(k) not in ("0", "false", ""))
+                # Clamped at the bottom by the floor the engines were built
+                # with: a slider below it would look like it was letting more
+                # through while changing nothing at all.
+                for k, attr in (("conf_thermal", "ai_conf_thermal"),
+                                ("conf_radar", "ai_conf_radar")):
+                    if k in q:
+                        setattr(pipe, attr,
+                                min(0.99, max(pipe.ai_conf_floor,
+                                              float(q.pop(k)))))
                 rp = state.get("radar_proj")
                 if rp is not None:
                     for k in ("yaw", "pitch", "roll"):
@@ -2940,6 +3434,36 @@ def make_handler(state, pipe):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(body.encode())
+            elif u.path in ("/ai", "/students"):
+                # The curl-side view of the three channels, with the same
+                # numbers the page draws. `vis` on a thermal box is what it maps
+                # to on the visible plane - null means it could not be placed,
+                # and a consumer that logs a thermal box without it is logging a
+                # coordinate in the wrong plane.
+                st = state.get("students")
+                body = json.dumps({
+                    "available": st is not None,
+                    "age_s": (round(time.time() - state["student_t"], 2)
+                              if state.get("student_t") else None),
+                    "gate_du_px": Renderer.FUSION_DU_PX,
+                    "dedup_iou": Renderer.DEDUP_IOU,
+                    "conf": {"thermal": round(pipe.ai_conf_thermal, 2),
+                             "radar": round(pipe.ai_conf_radar, 2),
+                             "engine_floor": round(pipe.ai_conf_floor, 2)},
+                    "found": state.get("student_seen") or {},
+                    "error": state.get("student_error"),
+                    "channels": {
+                        "thermal": {"on": pipe.ai_thermal,
+                                    "list": state.get("student_thermal") or []},
+                        "radar": {"on": pipe.ai_radar,
+                                  "list": state.get("student_radar") or []},
+                        "fusion": {"on": pipe.ai_fusion,
+                                   "list": state.get("student_fused") or []},
+                    }})
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(body.encode())
             elif u.path == "/stat":
                 lo, hi = state.get("range", (0, 0))
                 msg = "%.1f fps | range %d..%dC (%.3f C/code) | %s | eps %.2f, refl %.0fC%s" % (
@@ -3036,6 +3560,20 @@ def session_meta(args):
         except Exception:
             detector_engine = None
 
+    # Which student engines this session ran, hashed for the same reason the
+    # detector engine is: an engine is rebuilt in place whenever TensorRT or the
+    # GPU moves under it, and "the v2 students" names a file, not a model.
+    student_engines = {}
+    if args.students:
+        try:
+            import trt_students
+            for name in ('thermal_student.engine', 'radar_student.engine'):
+                path = os.path.join(trt_students.ENGINE_DIR, name)
+                student_engines[name] = {'path': os.path.abspath(path),
+                                         'sha256': _sha(path)}
+        except Exception:                      # provenance never breaks a run
+            student_engines = {}
+
     return {
         'tool': 'live.py',
         'argv': sys.argv[1:],
@@ -3050,6 +3588,14 @@ def session_meta(args):
         'detector_model': (args.detect_model if args.detect != 'off' else None),
         'detector_engine': detector_engine,
         'detector_engine_sha256': _sha(detector_engine),
+        'students': bool(args.students),
+        'student_conf': args.student_conf if args.students else None,
+        # What the session STARTED with. The channels are switchable live, so a
+        # reader wanting to know what was on screen at frame N has to read the
+        # picture, not this - but the engines and the threshold cannot change
+        # under a running session, and those are what a label depends on.
+        'ai_channels_at_start': args.ai_channels if args.students else None,
+        'student_engines': student_engines or None,
         'radar_cfg_stamp': stamp,
         'radar_cfg_stamp_note': stamp_note,
         'tmin': tmin_c,
@@ -3180,9 +3726,17 @@ def main():
                     help="run the trained thermal+radar person students "
                          "(TensorRT engines from perception/out/gexport/v2/"
                          "models/) as extra detection channels: orange boxes "
-                         "= thermal student, cyan = radar student")
+                         "= thermal student, cyan = radar student, white = the "
+                         "two of them agreeing. Pick which channels are on with "
+                         "--ai-channels, or live from the page")
     ap.add_argument("--student-conf", type=float, default=0.5, metavar="C",
                     help="confidence threshold for both students")
+    ap.add_argument("--ai-channels", default="thermal,radar,fusion", metavar="LIST",
+                    help="which AI channels start switched on: any of "
+                         "thermal,radar,fusion (or 'none'). All three are "
+                         "switchable live from the page and over "
+                         "/set?ai_thermal=0&ai_radar=1&ai_fusion=1, so this only "
+                         "picks what the first frame shows")
     ap.add_argument("--seconds", type=int, default=0, help="exit after N seconds (for tests)")
     args = ap.parse_args()
 
@@ -3206,6 +3760,23 @@ def main():
 
     pipe = Pipeline(args)
     pipe.view = args.view
+
+    # Validated here rather than shrugged off later: a typo in --ai-channels
+    # would otherwise silently switch a channel off for a whole session, and a
+    # channel that is off is indistinguishable on screen from a channel that is
+    # on and finding nobody.
+    want_ai = {c.strip() for c in args.ai_channels.split(",") if c.strip()} - {"none"}
+    unknown_ai = want_ai - {"thermal", "radar", "fusion"}
+    if unknown_ai:
+        raise SystemExit("--ai-channels: not a channel: %s (thermal, radar, "
+                         "fusion, none)" % ", ".join(sorted(unknown_ai)))
+    pipe.ai_thermal = "thermal" in want_ai
+    pipe.ai_radar = "radar" in want_ai
+    pipe.ai_fusion = "fusion" in want_ai
+    # The engines are built with --student-conf and cannot go below it later,
+    # so that is where both sliders start and where they stop going down.
+    pipe.ai_conf_floor = args.student_conf
+    pipe.ai_conf_thermal = pipe.ai_conf_radar = args.student_conf
     # One sampler for the process; it primes its own counters, so the first
     # /ui already carries a CPU figure rather than a null.
     state = {"soc": hostsoc.Soc()}
@@ -3274,6 +3845,20 @@ def main():
             print("  the projection is a GUESS until radar_extrinsics is solved - "
                   "nudge it with /set?yaw=..&pitch=..&tz=..", file=sys.stderr)
 
+    # The thermal->visible mapper, loaded once for everything that needs it:
+    # the person outline on the detector's boxes, the student channels, and
+    # the fusion ring. Independent of --students on purpose - the outline is
+    # worth having on a run with no students at all - and never fatal: a bad
+    # LUT costs the outline, not the viewer.
+    th2vis = None
+    if args.warp:
+        try:
+            import trt_students
+            th2vis = trt_students.ThermalToVisible(args.warp)
+        except Exception as e:
+            print("person outline unavailable (%s: %s) - boxes only"
+                  % (type(e).__name__, e), file=sys.stderr)
+
     students = None
     if args.students:
         # The students are an OPT-IN extra: any failure here (missing engine,
@@ -3283,8 +3868,6 @@ def main():
             th_model = trt_students.ThermalStudentTrt(conf=args.student_conf)
             rd_model = (trt_students.RadarStudentTrt(conf=args.student_conf)
                         if args.radar else None)
-            th2vis = (trt_students.ThermalToVisible(args.warp)
-                      if args.warp else None)
             if not args.range:
                 print("students: --range is not pinned, so the thermal input "
                       "is scene-relative instead of the Celsius the model was "
@@ -3304,15 +3887,27 @@ def main():
                         "th2vis": th2vis,
                         "c_per_lsb": (s_tmax - s_tmin) / 255.0,
                         "tmin": float(s_tmin)}
-            print("students: thermal%s engine(s) up, conf>=%.2f"
-                  % ("+radar" if rd_model else "", args.student_conf),
+            print("students: thermal%s engine(s) up, conf>=%.2f, channels on: %s"
+                  % ("+radar" if rd_model else "", args.student_conf,
+                     "+".join(sorted(want_ai)) or "none"),
                   file=sys.stderr)
+            if pipe.ai_fusion and (rd_model is None or th2vis is None):
+                print("students: the fusion channel cannot pair without %s - it "
+                      "will draw nothing" % ("a radar student engine"
+                                             if rd_model is None else "a warp LUT"),
+                      file=sys.stderr)
         except Exception as e:
             print("students: DISABLED (%s: %s)" % (type(e).__name__, e),
                   file=sys.stderr)
 
+    # The HTTP threads reach the students only through state: /ui hides the
+    # card when this is None, and health() asks it whether a channel that is
+    # switched on can actually draw.
+    state["students"] = students
+
     render = Renderer(pipe, state, work, detector, radar=radar,
-                      radar_proj=radar_proj, video=video, students=students)
+                      radar_proj=radar_proj, video=video, students=students,
+                      th2vis=th2vis)
     render.radar_ai = bool(args.radar_ai)
     render.start()
     stream = Streamer(args.port, pipe, args.quality, state, work)

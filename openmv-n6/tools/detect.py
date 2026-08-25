@@ -47,6 +47,12 @@ SIZE = 416
 CONF = 0.35
 NMS = 0.45
 
+# A CUDA context that will not come up right after boot usually comes up a few
+# seconds later; 3 probes over ~20 s is cheap next to losing the GPU (10x) for
+# the whole session. Only paid when the first probe fails.
+GPU_PROBE_TRIES = 3
+GPU_PROBE_WAIT_S = 10
+
 # Leave the reader thread a core. cv2.dnn takes every core it is given, and the
 # one thing this whole split exists to protect is the serial reader's latency:
 # a host that stops draining the CDC for 500ms makes the board's out.write give
@@ -202,7 +208,22 @@ def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None,
         # Probe first. 'gpu' asks for the GPU explicitly, so it is entitled to
         # the real error rather than a fallback - but it should still get a
         # message instead of a core dump.
-        if not _gpu_comes_up(selected_engine, model):
+        #
+        # The probe fails transiently for the first minute or so after boot
+        # (2026-08-23: same "no contiguous memory" signature at 04:59, gone on
+        # rerun) and that failure is indistinguishable from real memory
+        # exhaustion, so ask more than once before believing it.
+        up = False
+        for attempt in range(GPU_PROBE_TRIES):
+            if _gpu_comes_up(selected_engine, model):
+                up = True
+                break
+            if attempt + 1 < GPU_PROBE_TRIES:
+                print("detector: GPU probe failed (try %d/%d), retrying in %d s"
+                      % (attempt + 1, GPU_PROBE_TRIES, GPU_PROBE_WAIT_S),
+                      file=sys.stderr)
+                time.sleep(GPU_PROBE_WAIT_S)
+        if not up:
             msg = ("the GPU backend cannot start (TensorRT/CUDA failed to "
                    "initialise - usually no contiguous memory; check free -m)")
             if backend == "gpu":
@@ -250,8 +271,15 @@ def _dashed_rect(img, x0, y0, x1, y1, col, dash=9):
         cv2.line(img, (x1, y), (x1, min(y + dash, y1)), col, 2)
 
 
-def annotate(img, dets, warped):
+def annotate(img, dets, warped, outline=None):
     """Draw the boxes and their readings. Modifies img in place.
+
+    `outline` is an optional callable (det, colour) -> bool. When it returns
+    True it has drawn the detection itself - the thermal silhouette of the
+    person, rather than a rectangle around them - and no box is drawn over the
+    top. It is a callback rather than a mask argument so that this module
+    keeps knowing nothing about warps and LUTs; whether a shape can be found
+    at all is the caller's problem.
 
     `warped` is not decoration. Without a calibrated LUT the thermal layer is
     stretched over the frame rather than registered to it, so the temperature
@@ -269,7 +297,10 @@ def annotate(img, dets, warped):
             col = PERSON_COL
         else:
             col = (120, 255, 120) if warped else (140, 170, 255)
-        if person and not verified:
+        drawn = outline is not None and bool(outline(d, col))
+        if drawn:
+            pass                     # the shape has already been drawn
+        elif person and not verified:
             _dashed_rect(img, x, y, x + w, y + h, col)
         else:
             cv2.rectangle(img, (x, y), (x + w, y + h), col, 2)

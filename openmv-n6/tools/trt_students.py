@@ -21,6 +21,7 @@ Neither class is thread-safe; give each instance one thread.
 """
 import os
 
+import cv2
 import numpy as np
 
 import trt_detect  # reuse the ctypes cudart wrapper that already works here
@@ -134,6 +135,71 @@ class ThermalToVisible:
         self.tu = (lut[..., 0].astype(np.int32) + 128) >> 8
         self.tv = (lut[..., 1].astype(np.int32) + 128) >> 8
 
+    def shape_in(self, thermal, x, y, w, h):
+        """Warm shape inside a VISIBLE-plane box -> visible-plane bool mask.
+
+        The locator and the shape come from different sensors on purpose: any
+        box on the visible plane - a student's, or the COCO detector's, which
+        is the one this rig trusts - names WHERE, and the thermal frame behind
+        it says what shape is warm there.
+
+        The split is Otsu over the thermal values the box actually samples, not
+        a fixed body-heat threshold: what has to be separated is this person
+        from THIS background, and that boundary moves with distance,
+        emissivity and whatever is behind them. Only the largest connected
+        component survives, because a box almost always clips some warm
+        background at its edge and those leftovers are what turn an outline
+        into static.
+
+        Returns None when the box is outside the thermal footprint, samples
+        nothing, or holds no contrast to split.
+        """
+        d = self.DECIMATION
+        c0, r0 = max(0, int(x) // d), max(0, int(y) // d)
+        c1 = min(self.LOW_W, -(-(int(x) + int(w)) // d))
+        r1 = min(self.LOW_H, -(-(int(y) + int(h)) // d))
+        if c1 <= c0 or r1 <= r0:
+            return None
+        sub_valid = self.valid[r0:r1, c0:c1]
+        if not sub_valid.any():
+            return None
+        vals = thermal[self.tv[r0:r1, c0:c1][sub_valid],
+                       self.tu[r0:r1, c0:c1][sub_valid]]
+        if vals.size < 16 or vals.max() == vals.min():
+            return None
+        thr, _ = cv2.threshold(np.ascontiguousarray(vals.reshape(-1, 1)),
+                               0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        low = np.zeros((self.LOW_H, self.LOW_W), dtype=np.uint8)
+        piece = np.zeros(sub_valid.shape, dtype=np.uint8)
+        # Strictly above: cv2's THRESH_BINARY is `> thr`, and on a box holding
+        # exactly two levels Otsu returns the lower one - `>=` would then call
+        # the whole box warm and outline the rectangle it was given.
+        piece[sub_valid] = (vals > thr).astype(np.uint8)
+        low[r0:r1, c0:c1] = piece
+        n, lab = cv2.connectedComponents(low)
+        if n <= 1:
+            return None
+        sizes = np.bincount(lab.ravel())
+        sizes[0] = 0
+        keep = lab == int(sizes.argmax())
+        return np.repeat(np.repeat(keep, d, axis=0), d, axis=1)
+
+    def mask(self, hot):
+        """Thermal-plane bool mask -> visible-plane bool mask (400x640).
+
+        The same correspondence box() uses, applied per cell instead of per
+        box: a visible 4x4 cell belongs to the silhouette when the thermal
+        pixel that cell samples does. The 4 px staircase this leaves on an
+        outline is real - the LUT is decimated by 4 - and is not smoothed
+        away here, because a smooth curve would claim a precision the
+        registration does not have.
+        """
+        low = np.zeros((self.LOW_H, self.LOW_W), dtype=bool)
+        v = self.valid
+        low[v] = hot[self.tv[v], self.tu[v]]
+        d = self.DECIMATION
+        return np.repeat(np.repeat(low, d, axis=0), d, axis=1)
+
     def box(self, x, y, w, h):
         """Thermal-px box -> visible-px box, or None outside the overlap."""
         m = (self.valid
@@ -167,6 +233,14 @@ class ThermalStudentTrt:
         self.ms = 0.0
         self._hist = []            # [(frame_f32, t_ms)] newest last, len<=3
         self._prev_link_valid = False
+        # Whether the last push ran on a full temporal chain. Measured on
+        # captures/test6: the first two frames of a session, with no history
+        # behind them, put 0.99-confidence boxes on cold structure - a pillar
+        # and a doorway - and from the third frame on the same engine tracks
+        # the person exactly. The model takes valid_prev1/2 as inputs and is
+        # not wrong to answer without them, but a caller drawing those answers
+        # on a screen wants to know.
+        self.primed = False
 
     def push(self, celsius_frame, t_ms):
         """Add a frame (HxW float32 Celsius, monotonic ms) and detect.
@@ -196,6 +270,7 @@ class ThermalStudentTrt:
                     seq[0, 2] = self._hist[-3][0]
                     valid2 = 1.0
         self._prev_link_valid = bool(valid1)
+        self.primed = valid2 == 1.0
 
         t_start = time.time()
         out = self.runner.infer({

@@ -49,6 +49,21 @@ def main():
         # test, so the CPU it uses fusing the same frame over and over is
         # exactly what the panel is meant to show.
         "soc": live.hostsoc.Soc(),
+        # The AI card is hidden unless the students are loaded, so the preview
+        # has to claim they are or the panel cannot be worked on at all. Both
+        # sub-objects are stand-ins for engines; nothing here runs one.
+        "students": {"thermal": object(), "radar": object(),
+                     "th2vis": object()},
+        "student_t": time.time(),
+        # More found than shown, so the card's "1 of 3" path is on screen and
+        # the confidence sliders have something to be about.
+        "student_seen": {"thermal": 3, "radar": 2},
+        "student_thermal": [{"x": 20, "y": 30, "w": 12, "h": 26, "conf": 0.81,
+                             "vis": (80, 120, 48, 104)}],
+        "student_radar": [{"x": 96, "y": 130, "w": 44, "h": 100, "conf": 0.63}],
+        "student_fused": [{"x": 80, "y": 120, "w": 48, "h": 104, "conf": 0.93,
+                           "conf_thermal": 0.81, "conf_radar": 0.63,
+                           "du": 6.0, "radar_m": 4.2}],
     }
 
     # The red path is the one nobody sees until it matters, so it has to be

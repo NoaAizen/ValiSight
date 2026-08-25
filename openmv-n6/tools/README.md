@@ -22,6 +22,24 @@ colour and feathers the calibrated thermal footprint. It is the default in
 `run_live.sh`; use `--view visible` for calibration picking and `--view fused`
 when the rendered palette itself must remain a fixed thermal scale.
 
+## AI channels in the viewer
+
+`live.py --students` runs the two trained person students beside the COCO
+detector and draws three switchable channels: thermal (orange), radar (cyan)
+and their fusion (white — the same person found by both, paired horizontally
+inside 50 px). With **person outline** on (key `s`), a person is drawn as the warm shape the
+thermal frame holds inside the box — for the students *and* for the detector's
+green person boxes, which needs only `--warp`, not `--students`. Fusion draws
+its ring around that shape. Each channel has a confidence slider on that card (it hides boxes, it does not
+restart the engines — the count reads *shown of found*), boxes under 0.75 are
+drawn as corner ticks rather than rectangles, and duplicate/nested boxes from
+the same channel are dropped. Switch the channels from the card, with `t`/`r`/`c`,
+or over `/set?ai_thermal=0&ai_radar=1&ai_fusion=1`; `--ai-channels` picks which
+ones the session starts with, and `/ai` reports all three as JSON. The thermal
+channel needs `--warp` to reach the visible plane and the radar channel needs
+`--radar`; a channel that cannot draw says so on the card and in `/health`
+rather than showing an empty count.
+
 ## Detector models on the Jetson
 
 `live.py` accepts `--detect-model yolov10n|yolov8n|yolo11n`. The repository

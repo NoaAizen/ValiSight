@@ -332,6 +332,237 @@ def threading_and_detection(y, thermal):
     check("temporal_reset is reachable and does not fault", True)
 
 
+class _FakeStudent:
+    """An engine that records whether it was asked to run.
+
+    The point of most of these checks is what did NOT happen: a channel that is
+    switched off must not reach the GPU at all, and no assertion about the drawn
+    picture can tell that apart from a channel that ran and found nobody.
+    """
+
+    def __init__(self, dets):
+        self.dets, self.calls = dets, 0
+
+    def push(self, frame, t_ms):          # thermal student
+        self.calls += 1
+        return [dict(d) for d in self.dets]
+
+    def __call__(self, points):           # radar student
+        self.calls += 1
+        return [dict(d) for d in self.dets]
+
+
+class _FakeLut:
+    """thermal 160x120 -> visible 640x480, the 4x the placeholder warp implies."""
+
+    def box(self, x, y, w, h):
+        return (4 * x, 4 * y, 4 * w, 4 * h)
+
+
+class _FakeRadar:
+    def __init__(self):
+        self.frames, self.dropped_bytes, self.error = 1, 0, None
+
+    def get(self):
+        return {"frame_number": 1,
+                "points": [{"x": 0.1, "y": 3.0, "z": 0.0, "v": 0.8,
+                            "snr": 20.0, "noise": 5.0}]}
+
+
+def ai_channels(thermal):
+    """The three student channels: pairing, and what each switch actually stops.
+
+    Offline and engine-free. The fusion rule is a geometric claim - pair on u
+    only, inside the gate D3 measured - and it is worth a test that does not
+    need a GPU, a radar or a person to walk in front of the rig.
+    """
+    print("\nai channels")
+
+    T = [{"conf": 0.8, "vis": (100, 50, 40, 90)},
+         {"conf": 0.6, "vis": (300, 50, 40, 90)}]
+    R = [{"conf": 0.5, "x": 110, "y": 40, "w": 44, "h": 100},   # du = 12
+         {"conf": 0.9, "x": 500, "y": 40, "w": 40, "h": 100}]   # du = 200
+    f = live.Renderer._fuse([dict(d) for d in T], [dict(d) for d in R])
+    check("only the pair inside the horizontal gate is fused",
+          len(f) == 1 and f[0]["du"] <= live.Renderer.FUSION_DU_PX,
+          "%d pair(s), du %s" % (len(f), [x["du"] for x in f]))
+    check("the fused box keeps the thermal extent, not the radar's guess",
+          (f[0]["x"], f[0]["y"], f[0]["w"], f[0]["h"]) == T[0]["vis"])
+    check("agreement scores above either channel on its own",
+          f[0]["conf"] > max(T[0]["conf"], R[0]["conf"])
+          and f[0]["conf_thermal"] == 0.8 and f[0]["conf_radar"] == 0.5,
+          "%.2f from %.2f and %.2f" % (f[0]["conf"], f[0]["conf_thermal"],
+                                       f[0]["conf_radar"]))
+
+    # Two thermal boxes over one radar return is the crossing-walkers case: the
+    # nearer one takes it, and the other stays an unconfirmed thermal box rather
+    # than borrowing the same evidence twice.
+    f = live.Renderer._fuse(
+        [{"conf": 0.7, "vis": (100, 50, 40, 90)},
+         {"conf": 0.7, "vis": (130, 50, 40, 90)}],
+        [{"conf": 0.7, "x": 105, "y": 40, "w": 40, "h": 100}])
+    check("one radar return cannot confirm two thermal boxes",
+          len(f) == 1 and f[0]["x"] == 100, "%d pair(s)" % len(f))
+
+    f = live.Renderer._fuse([{"conf": 0.9, "vis": None}],
+                            [{"conf": 0.9, "x": 0, "y": 0, "w": 40, "h": 100}])
+    check("a thermal box that never reached the visible plane is not fused",
+          f == [])
+
+    # --- the clutter controls. A student emits eight slots with no NMS of its
+    # own, and a person standing still fills two or three of them.
+    dup = live.Renderer._dedup([
+        {"conf": 0.9, "x": 100, "y": 50, "w": 40, "h": 90},
+        {"conf": 0.7, "x": 103, "y": 52, "w": 40, "h": 90},   # the same person
+        {"conf": 0.6, "x": 300, "y": 50, "w": 40, "h": 90}])  # someone else
+    check("a box that claims a region a stronger box already has is dropped",
+          len(dup) == 2 and dup[0]["conf"] == 0.9 and dup[1]["x"] == 300,
+          "%d of 3 kept" % len(dup))
+
+    # --- what each switch stops. The engines are fakes; the wiring is real.
+    pipe = live.Pipeline(Args())
+    state = {}
+    th = _FakeStudent([{"x": 10, "y": 10, "w": 10, "h": 20, "conf": 0.8}])
+    rd = _FakeStudent([{"x": 40, "y": 40, "w": 40, "h": 80, "conf": 0.7}])
+    students = {"thermal": th, "radar": rd, "th2vis": _FakeLut(),
+                "c_per_lsb": 60 / 255.0, "tmin": 0.0}
+    r = live.Renderer(pipe, state, live.Latest(), None, radar=_FakeRadar(),
+                      students=students)
+    blank = np.zeros((live.OUT_H, live.OUT_W, 3), np.uint8)
+
+    def draw():
+        rgb = blank.copy()
+        r._run_students(thermal, rgb)
+        return rgb
+
+    def has(rgb, col):
+        return bool((rgb == np.array(col, np.uint8)).all(axis=2).any())
+
+    pipe.ai_thermal = pipe.ai_radar = pipe.ai_fusion = False
+    rgb = draw()
+    check("a channel switched off does not reach its engine",
+          th.calls == 0 and rd.calls == 0 and not rgb.any(),
+          "%d thermal, %d radar inferences" % (th.calls, rd.calls))
+
+    pipe.ai_fusion = True
+    rgb = draw()
+    check("fusion runs both engines even with both channels hidden",
+          th.calls == 1 and rd.calls == 1)
+    check("only the agreement is drawn when only fusion is on",
+          has(rgb, live.Renderer.STUDENT_FU_COL)
+          and not has(rgb, live.Renderer.STUDENT_TH_COL)
+          and not has(rgb, live.Renderer.STUDENT_RD_COL))
+    check("the fused box is reported alongside its components",
+          len(state["student_fused"]) == 1
+          and len(state["student_thermal"]) == 1
+          and len(state["student_radar"]) == 1)
+    check("both components are marked as spoken for by the pair",
+          state["student_thermal"][0].get("fused") is True
+          and state["student_radar"][0].get("fused") is True)
+
+    pipe.ai_fusion, pipe.ai_thermal = False, True
+    rgb = draw()
+    check("the thermal channel alone leaves the radar engine idle",
+          rd.calls == 1 and th.calls == 2, "%d radar inferences" % rd.calls)
+    check("the thermal channel draws its own boxes and no agreement",
+          has(rgb, live.Renderer.STUDENT_TH_COL)
+          and not has(rgb, live.Renderer.STUDENT_FU_COL)
+          and state["student_fused"] == [])
+
+    # The floor hides boxes; it must never hide the fact that it hid them.
+    th.dets = [{"x": 10, "y": 10, "w": 10, "h": 20, "conf": 0.81},
+               {"x": 60, "y": 10, "w": 10, "h": 20, "conf": 0.55}]
+    pipe.ai_thermal, pipe.ai_fusion, pipe.ai_radar = True, False, False
+    pipe.ai_conf_thermal = 0.5
+    draw()
+    check("both boxes are drawn while the floor is at the engine threshold",
+          len(state["student_thermal"]) == 2)
+    pipe.ai_conf_thermal = 0.7
+    draw()
+    check("raising the floor hides the weaker box",
+          len(state["student_thermal"]) == 1
+          and state["student_thermal"][0]["conf"] == 0.81)
+    check("what was hidden is still counted, so a quiet scene and a high "
+          "slider do not look alike",
+          state["student_seen"]["thermal"] == 2)
+    pipe.ai_conf_thermal = 0.5
+    th.dets = [{"x": 10, "y": 10, "w": 10, "h": 20, "conf": 0.8}]
+
+    # An engine that has not seen enough frames to build its temporal chain
+    # answers confidently about cold structure; those frames are dropped.
+    th.primed = False
+    draw()
+    check("boxes from an unprimed temporal chain are dropped, not drawn",
+          state["student_thermal"] == [] and state["student_seen"]["thermal"] == 1,
+          "found %d, shown %d" % (state["student_seen"]["thermal"],
+                                  len(state["student_thermal"])))
+    th.primed = True
+    draw()
+    check("once the chain is primed the boxes come back",
+          len(state["student_thermal"]) == 1)
+
+    # --- the person outline. The locator and the shape come from different
+    # sensors, so the failure that matters is drawing a shape when there is no
+    # way to know where the thermal frame maps to.
+    check("no warp LUT means no outline callback at all, not one that says no",
+          r._person_outline(thermal, blank.copy()) is None)
+
+    drew = []
+
+    def fake_outline(d, col):
+        drew.append(d["cls"])
+        return True
+
+    img = np.zeros((live.OUT_H, live.OUT_W, 3), np.uint8)
+    detect.annotate(img, [{"cls": "person", "conf": 0.9, "x": 100, "y": 40,
+                           "w": 60, "h": 200, "body_heat": True}],
+                    True, outline=fake_outline)
+    # The label is still drawn, so the frame is not blank - what must be gone
+    # is the rectangle: no full-height vertical run of the person colour.
+    col = np.array(detect.PERSON_COL, np.uint8)
+    side = (img[40:240, 100] == col).all(axis=1).mean()
+    check("a drawn shape replaces the box rather than being drawn over it",
+          drew == ["person"] and side < 0.5, "%.0f%% of the left edge painted"
+          % (100 * side))
+
+    lut_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "..", "calib-artifacts", "warp.lut")
+    if os.path.isfile(lut_path):
+        import trt_students
+        t2v = trt_students.ThermalToVisible(lut_path)
+        hot = np.full((120, 160), 40, np.uint8)
+        hot[40:80, 60:100] = 200                  # one warm rectangle
+        # Queried through a box wider than the warm patch: a box whose every
+        # thermal sample is the person has no shape to find that is not the
+        # box itself, and shape_in() says so by returning None.
+        box = t2v.box(50, 30, 60, 60)
+        m = t2v.shape_in(hot, *box)
+        ys, xs = np.nonzero(m)
+        check("the outline is the warm shape inside the box, in visible pixels",
+              m is not None and m.shape == (live.OUT_H, live.OUT_W)
+              and box[0] - 4 <= xs.min() and xs.max() <= box[0] + box[2] + 4
+              and box[1] - 4 <= ys.min() and ys.max() <= box[1] + box[3] + 4
+              and (xs.max() - xs.min()) < box[2],
+              "box %s -> shape x %d..%d y %d..%d"
+              % (box, xs.min(), xs.max(), ys.min(), ys.max()))
+        check("a box with nothing to split reports no shape rather than a blob",
+              t2v.shape_in(np.full((120, 160), 40, np.uint8), *box) is None)
+    else:
+        check("warp.lut is present for the outline check", False, lut_path)
+
+    # No warp LUT is the state every session before B2 was solved in: the boxes
+    # are found, they simply have nowhere to go. They must still be reported.
+    students["th2vis"] = None
+    pipe.ai_fusion = True
+    rgb = draw()
+    check("without a warp LUT the thermal boxes are reported but not drawn",
+          len(state["student_thermal"]) == 1
+          and state["student_thermal"][0]["vis"] is None
+          and state["student_fused"] == []
+          and not has(rgb, live.Renderer.STUDENT_TH_COL))
+    r.stop.set()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -700,6 +931,53 @@ def main():
         check("/set can turn the overlay off", pipe.show_detections is False)
         get("/set?boxes=1")
 
+        # The AI channels are three switches and not a mode: any combination has
+        # to be reachable, including fusion with both components hidden.
+        get("/set?ai_thermal=0&ai_radar=1&ai_fusion=0")
+        check("/set switches the AI channels independently",
+              pipe.ai_thermal is False and pipe.ai_radar is True
+              and pipe.ai_fusion is False,
+              "T %s R %s TR %s" % (pipe.ai_thermal, pipe.ai_radar, pipe.ai_fusion))
+        code, body = get("/ai")
+        d = json.loads(body)
+        check("/ai answers with no students loaded rather than 404",
+              code == 200 and d["available"] is False
+              and set(d["channels"]) == {"thermal", "radar", "fusion"},
+              "available=%s" % d["available"])
+        check("a session with no students offers no AI card",
+              json.loads(get("/ui")[1])["cfg"]["ai"] is None)
+
+        # Loaded students with neither a radar engine nor a LUT: the switches
+        # exist, and the page has to say they cannot draw rather than showing a
+        # zero that reads as an empty scene.
+        good["students"] = {"thermal": object(), "radar": None, "th2vis": None}
+        try:
+            aicfg = json.loads(get("/ui")[1])["cfg"]["ai"]
+            check("the AI card appears once the students are loaded",
+                  aicfg is not None and aicfg["radar"]["on"] is True)
+            check("a channel that cannot draw reads as unready, not as empty",
+                  aicfg["fusion"]["ready"] is False
+                  and aicfg["radar"]["ready"] is False)
+            get("/set?ai_fusion=1")
+            names = {c["name"]: c for c in json.loads(get("/health")[1])["checks"]}
+            check("health says why a switched-on fusion channel draws nothing",
+                  names.get("ai", {}).get("level") == "warn"
+                  and "cannot pair" in names.get("ai", {}).get("text", ""),
+                  names.get("ai", {}).get("text", "no ai check at all"))
+        finally:
+            good.pop("students", None)
+        get("/set?conf_thermal=0.8&conf_radar=0.75")
+        check("/set carries a per-channel confidence floor",
+              abs(pipe.ai_conf_thermal - 0.8) < 1e-6
+              and abs(pipe.ai_conf_radar - 0.75) < 1e-6,
+              "T %.2f R %.2f" % (pipe.ai_conf_thermal, pipe.ai_conf_radar))
+        get("/set?conf_thermal=0.1")
+        check("a floor below the engine's own threshold is clamped, not obeyed",
+              pipe.ai_conf_thermal == pipe.ai_conf_floor,
+              "%.2f (engine floor %.2f)" % (pipe.ai_conf_thermal,
+                                            pipe.ai_conf_floor))
+        get("/set?ai_thermal=1&ai_radar=1&ai_fusion=1")
+
         # /ui is the page's only poll, so a field it stops carrying is a panel
         # that silently goes blank rather than an error anyone sees.
         code, body = get("/ui")
@@ -782,6 +1060,7 @@ def main():
     host_soc()
     failure_reporting()
     threading_and_detection(y, thermal)
+    ai_channels(thermal)
 
     print()
     if FAILS:
