@@ -209,7 +209,11 @@ else
     echo "students   none - $STUDENT_ENGINE is missing (build it with trtexec)" >&2
 fi
 
-LOG="${LOG:-/tmp/live_radar.log}"
+# Per-user by default: two accounts share this Jetson, and a log left behind by
+# one is not writable by the other - the redirect then fails and live.py dies
+# before it starts, which reads as "the board is broken" rather than "someone
+# else ran this last".
+LOG="${LOG:-/tmp/live_radar.$(id -un).log}"
 nohup setsid python3 "$HERE/live.py" "${ARGS[@]}" "$@" >"$LOG" 2>&1 </dev/null &
 NEW_PID=$!
 echo "log         $LOG"

@@ -88,6 +88,7 @@ needs it, which still runs it and simply does not draw it.
 import argparse
 import ctypes
 import glob
+import math
 import json
 import os
 import sys
@@ -1018,6 +1019,30 @@ def health(pipe, state, now):
             add("recording", "ok", "%d frames -> %s"
                 % (state.get("video_frames", 0), os.path.basename(rec)))
 
+    # --- the map layer (Yael's mapinit, via perception.map_api). Only present
+    #     when --map was given. A failed stage is reported with its name because
+    #     "map failed" has two unrelated fixes: install the EGM2008 grid, or
+    #     fetch the priors for this operating area.
+    m = state.get("map")
+    if m is not None:
+        if m.get("pending"):
+            add("map", "warn", "initialising at %.4f,%.4f" % (
+                m["location"]["latitude_deg"], m["location"]["longitude_deg"]))
+        elif m.get("ok"):
+            alt = m.get("ego_altitude_prior") or {}
+            add("map", "ok", "geoid %.2f m, ground %.0f m, %s" % (
+                (m.get("geoid") or {}).get("undulation_m", float("nan")),
+                alt.get("orthometric_m", float("nan")),
+                "+".join(s["name"] for s in m.get("stages", [])
+                         if s["status"] == "ok") or "no stage"))
+        elif m.get("error"):
+            add("map", "fail", ("deployment: " if m.get("deployment") else "")
+                + m["error"].splitlines()[0])
+        else:
+            failed = [s["name"] for s in m.get("stages", []) if s["status"] == "failed"]
+            add("map", "fail", "stage%s failed: %s" % (
+                "" if len(failed) == 1 else "s", ", ".join(failed) or "unknown"))
+
     # --- VoSPI tearing. Unlike the dead rows this really is random, and a torn
     #     frame is stale data in part of the image, not a marked defect.
     #
@@ -1792,6 +1817,10 @@ class Renderer(threading.Thread):
                     self.state["radar_offscreen"] = off
                     self.state["radar_aliased"] = al
                     self.state["radar_frame"] = fr["frame_number"]
+                    # The map layer reads the returns from here: (x fwd, y
+                    # left, z up, v, snr) per point, and the wall clock.
+                    self.state["radar_points"] = fr["points"]
+                    self.state["radar_points_t"] = time.time()
                     if getattr(self, "radar_ai", False):
                         # radar AI layer (Noa 2026-08-18): green PERSON rings
                         self.state["radar_persons"] = radar_overlay.annotate_ai(
@@ -2487,6 +2516,12 @@ def ui_payload(pipe, state, now):
         # Cached inside Soc for 0.4s, so health() above and this share one sample
         # rather than each taking a delta over a near-zero interval.
         "soc": state["soc"].read() if state.get("soc") else None,
+        # Yael's map layer (perception.map_api contract). None without --map;
+        # the page hides the card. Small and already JSON-safe, so sent whole.
+        "map": state.get("map"),
+        "map_fix": state.get("map_fix"),
+        "map_prior": state.get("map_prior"),
+        "nav": nav_horizon(state) if state.get("map_prior") is not None else None,
         "cfg": {
             "gain": c.detail_gain, "eps": c.gf_eps, "radius": c.gf_radius,
             "agc": c.agc_permille, "palette": pipe.palette_name, "view": pipe.view,
@@ -2685,6 +2720,9 @@ width:22px;height:20px;border-radius:4px;cursor:pointer;font:12px var(--mono);li
 padding:10px 14px;display:flex;align-items:flex-start;gap:14px 20px;flex-wrap:wrap}
 .tag{font:10px/1.3 var(--mono);letter-spacing:.1em;color:var(--dimmer);border:1px solid var(--line);
 border-radius:4px;padding:3px 6px;align-self:center;white-space:pre}
+.btn{background:var(--panel2);color:inherit;border:1px solid var(--line);border-radius:6px;padding:4px 10px;font:inherit;cursor:pointer}
+.btn:disabled{opacity:.5;cursor:wait}
+.kvrow{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;margin-bottom:6px}
 .kv{display:flex;flex-direction:column;gap:1px;font-family:var(--mono)}
 .kv em{font-style:normal;font-size:10px;letter-spacing:.07em;color:var(--dim);text-transform:uppercase}
 .kv b{font-size:14px;font-weight:600}
@@ -2861,6 +2899,46 @@ SOC</div>
       </div>
     </div>
 
+    <div class=card id=mapcard style=display:none>
+      <h4>map <span class=k>yael / mapinit</span></h4>
+      <div class=body>
+        <div class=kvrow>
+          <div class=kv><em>geoid</em><b id=m_geoid>&ndash;</b></div>
+          <div class=kv><em>ground</em><b id=m_ground>&ndash;</b></div>
+          <div class=kv><em>surface</em><b id=m_surface>&ndash;</b></div>
+          <div class=kv><em>ego alt &sigma;</em><b id=m_sigma>&ndash;</b></div>
+        </div>
+        <div class=hintline id=m_stages></div>
+        <div class=hintline id=m_text></div>
+        <div class=kvrow style="margin-top:8px">
+          <div class=kv><em>fix</em><b id=m_fix>&ndash;</b></div>
+          <div class=kv><em>heading</em><b id=m_head>&ndash;</b></div>
+          <div class=kv><em>nav horizon</em><b id=m_nav>&ndash;</b></div>
+          <div class=kv><em>ego speed</em><b id=m_speed>&ndash;</b></div>
+        </div>
+        <div class=hintline id=m_fixtext></div>
+        <div class=hintline id=m_navtext></div>
+        <div class=sl><label>heading prior</label><output id=o_heading>&ndash;</output>
+          <input type=range id=heading min=0 max=359 value=0></div>
+        <div style="display:flex;gap:8px;align-items:center;margin:6px 0">
+          <button id=btn_fix class=btn>fix from walls</button>
+          <span class=sub id=m_fixage></span>
+        </div>
+        <canvas id=topdown width=300 height=300
+          style="width:100%;aspect-ratio:1;background:#0a0c0e;border:1px solid var(--line);border-radius:6px"></canvas>
+        <div class=hintline>top-down, north up, 60 m: <b style=color:#9aa>map walls</b>,
+          <b style=color:var(--warn)>returns at the prior</b>,
+          <b style=color:#5cf>returns at the fix</b>. If the amber dots are not on
+          grey lines, the prior is wrong; if the blue ones are not, the fix is.</div>
+        <div class=hintline>orthometric heights against EGM2008 for the
+          <b>--map</b> position. <i>calibration</i> is skipped without
+          constraints; <i>pose_init</i> at startup is skipped because the
+          radar has not reported yet &mdash; <b>fix from walls</b> below runs
+          it on the live returns. Full JSON on
+          <a href=/map target=_blank>/map</a>.</div>
+      </div>
+    </div>
+
     <div class=card id=aicard>
       <h4>ai <span class=k>t r c s l</span></h4>
       <div class=body>
@@ -2981,6 +3059,13 @@ SOC</div>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
 const set = (q) => fetch('/set?' + q);
+$('heading').oninput = (e) => { $('o_heading').textContent = e.target.value + '\u00b0'; };
+$('heading').onchange = (e) => set('heading=' + e.target.value);
+$('btn_fix').onclick = async () => {
+  $('btn_fix').disabled = true; $('m_fixage').textContent = 'solving\u2026';
+  try { await fetch('/mapfix'); } catch (e) {}
+  $('btn_fix').disabled = false; drawTopdown();
+};
 
 // The pose stamp. Deliberately NOT optimistic: the readout only changes after
 // the server answers, because the whole point of the control is to tell an
@@ -3219,6 +3304,7 @@ const GROUPS = [
   ['measurement', ['registration','coverage','range','clipping','agc','emissivity']],
   ['perception', ['detect','radar','ai','recording']],
   ['host', ['host cpu','host memory','host thermal','host power']],
+  ['map', ['map']],
 ];
 const RANK = {ok: 0, warn: 1, fail: 2}, LVL = ['ok','warn','fail'];
 // Which groups the operator has opened by hand. Rebuilding the panel every
@@ -3300,6 +3386,91 @@ function initControls(cfg) {
   inited = true;
 }
 
+function drawMap(m) {
+  const card = $('mapcard');
+  if (!m) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const num = (v, u, f) => (v === null || v === undefined) ? '\u2013'
+      : v.toFixed(f) + '<span class=u> ' + u + '</span>';
+  const loc = m.location ? m.location.latitude_deg.toFixed(5) + ', '
+      + m.location.longitude_deg.toFixed(5) : '';
+  if (m.pending) {
+    $('m_stages').textContent = 'initialising at ' + loc + ' \u2026';
+    $('m_text').textContent = '';
+    return;
+  }
+  const g = m.geoid || {}, pr = m.priors || {}, alt = m.ego_altitude_prior || {};
+  $('m_geoid').innerHTML = num(g.undulation_m, 'm', 2);
+  $('m_ground').innerHTML = num(pr.ground_elevation_m, 'm', 1);
+  $('m_surface').innerHTML = num(pr.surface_elevation_m, 'm', 1);
+  $('m_sigma').innerHTML = num(alt.sigma_m, 'm', 1);
+  const st = (m.stages || []).map(s => s.name + ': ' + s.status).join(' \u00b7 ');
+  $('m_stages').innerHTML = (m.ok ? '<b>ok</b> ' : '<b style=color:var(--warn)>FAILED</b> ')
+      + esc(loc) + (st ? ' \u2014 ' + esc(st) : '');
+  $('m_text').textContent = m.error ? m.error
+      : (pr.overture_path ? 'buildings: ' + pr.overture_path.split('/').pop() : '');
+}
+let topdownTimer = null;
+function drawFix(d) {
+  const prior = d.map_prior, fx = d.map_fix, nav = d.nav;
+  if (!prior) return;
+  if (document.activeElement !== $('heading') && prior.heading_deg !== null) {
+    $('heading').value = Math.round(prior.heading_deg);
+    $('o_heading').textContent = Math.round(prior.heading_deg) + '\u00b0';
+  }
+  const p = fx && fx.pose;
+  if (!fx) { $('m_fix').textContent = '\u2013'; $('m_fixtext').textContent =
+      prior.heading_deg === null ? 'set a heading prior, then fix from walls' : 'not solved yet'; }
+  else if (!p) { $('m_fix').innerHTML = '<span style=color:var(--warn)>none</span>';
+      $('m_fixtext').textContent = fx.error || ''; }
+  else {
+    $('m_fix').innerHTML = (p.accepted ? '<span style=color:#5cf>ok</span>'
+        : '<span style=color:var(--warn)>rejected</span>')
+        + '<span class=u> \u0394 ' + p.dx_m.toFixed(1) + ' E ' + p.dy_m.toFixed(1) + ' N</span>';
+    $('m_head').innerHTML = p.heading_deg.toFixed(1) + '<span class=u>\u00b0 \u00b1' + p.sigma_heading_deg.toFixed(1) + '</span>';
+    const bad = (fx.checks || []).filter(c => !c.passed).map(c => c.name.replace(/^walls\./, '') + ': ' + c.detail);
+    $('m_fixtext').textContent = (p.accepted ? '' : bad.join(' \u00b7 ') + ' \u2014 ')
+        + 'inliers ' + Math.round(100 * p.inlier_fraction) + '% of ' + p.n_returns
+        + ', \u03c3 ' + p.sigma_horizontal_m.toFixed(1) + ' m, ' + fx.solve_s + ' s';
+  }
+  if (fx && fx.t) $('m_fixage').textContent = Math.round((Date.now() / 1000) - fx.t) + ' s ago';
+  if (nav && !nav.error) {
+    $('m_nav').innerHTML = nav.horizon_1m_s + '<span class=u> s to 1 m</span>';
+    $('m_speed').innerHTML = nav.speed_mps.toFixed(2) + '<span class=u> m/s</span>';
+    $('m_navtext').textContent = nav.regime + ', heading \u03c3 ' + nav.heading_sigma_deg
+        + '\u00b0: ' + nav.error_60s_m + ' m after 60 s'
+        + (nav.dominant ? ', mostly ' + nav.dominant : '')
+        + (nav.rests_on_assumption ? ' (rests on an ASSUMED constant)' : '')
+        + '; inertial-only would hold ' + nav.horizon_1m_inertial_s + ' s';
+  } else if (nav) { $('m_navtext').textContent = nav.error; }
+}
+async function drawTopdown() {
+  let td;
+  try { td = await (await fetch('/topdown')).json(); } catch (e) { return; }
+  const c = $('topdown'), g = c.getContext('2d'), W = c.width, H = c.height;
+  g.clearRect(0, 0, W, H);
+  if (!td || td.error || !td.edges) { g.fillStyle = '#667'; g.font = '12px sans-serif';
+      g.fillText(td && td.error ? td.error.slice(0, 40) : 'no map', 8, 16); return; }
+  const R = td.radius_m, k = (W / 2) / R;
+  const X = x => W / 2 + x * k, Y = y => H / 2 - y * k;
+  g.strokeStyle = '#1e2429'; g.lineWidth = 1;
+  for (let r = 10; r <= R; r += 10) { g.beginPath(); g.arc(W/2, H/2, r * k, 0, 2 * Math.PI); g.stroke(); }
+  g.strokeStyle = '#9aa'; g.lineWidth = 1.5;
+  for (const [x0, y0, x1, y1] of td.edges) { g.beginPath(); g.moveTo(X(x0), Y(y0)); g.lineTo(X(x1), Y(y1)); g.stroke(); }
+  const rig = (p, col) => {
+    if (!p || p.heading_deg === null || p.heading_deg === undefined) return;
+    const h = p.heading_deg * Math.PI / 180;
+    g.strokeStyle = col; g.lineWidth = 2; g.beginPath();
+    g.moveTo(X(p.x), Y(p.y)); g.lineTo(X(p.x + 6 * Math.sin(h)), Y(p.y + 6 * Math.cos(h))); g.stroke();
+    g.beginPath(); g.arc(X(p.x), Y(p.y), 3, 0, 2 * Math.PI); g.fillStyle = col; g.fill();
+    if (p.sigma_m) { g.setLineDash([3, 3]); g.beginPath(); g.arc(X(p.x), Y(p.y), p.sigma_m * k, 0, 2 * Math.PI); g.stroke(); g.setLineDash([]); }
+  };
+  const dots = (pts, col) => { g.fillStyle = col; for (const [x, y] of pts) { g.beginPath(); g.arc(X(x), Y(y), 2.5, 0, 2 * Math.PI); g.fill(); } };
+  dots(td.returns_at_prior, '#e0a030'); rig(td.prior, '#e0a030');
+  if (td.fix) { dots(td.returns_at_fix, '#5cf'); rig(td.fix, td.fix.accepted ? '#5cf' : '#c55'); }
+  g.fillStyle = '#667'; g.font = '11px sans-serif';
+  g.fillText('N', W / 2 - 4, 12); g.fillText(td.n_walls + ' returns', 8, H - 8);
+}
 async function poll() {
   let d;
   try {
@@ -3338,6 +3509,9 @@ async function poll() {
   if (document.activeElement !== $('poseid')) applyPose(d.pose);
 
   drawHealth(d.checks);
+  drawMap(d.map);
+  drawFix(d);
+  if (d.map && !topdownTimer) { topdownTimer = setInterval(drawTopdown, 1000); drawTopdown(); }
 
   // --- the clock and the traces
   const t = d.timing;
@@ -3492,6 +3666,218 @@ setInterval(poll, 1000);
 """
 
 
+def start_map_init(state, latlon, geoid_range=None, mapinit_dir=None):
+    """Run Yael's map initialisation off the main thread, into state["map"].
+
+    The result is Moshe's JSON contract (perception.map_api, schema 1.0), so
+    what /map serves is exactly what the CLI prints.  Three shapes land in
+    state["map"]:  {"pending": True} while it runs; the contract dict once it
+    returns (ok may be false - that is a MAP finding, e.g. no EGM grid); and
+    {"ok": False, "error": ...} when the boundary itself failed (package or a
+    dependency missing) - a DEPLOYMENT finding, named so in the text.
+    """
+    try:
+        lat, lon = (float(v) for v in latlon.split(","))
+    except ValueError:
+        raise SystemExit("--map wants LAT,LON in decimal degrees, got %r" % latlon)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    from perception import map_api
+    request = map_api.MapInitRequest(
+        latitude=lat, longitude=lon,
+        expected_geoid_range_m=tuple(geoid_range) if geoid_range else None)
+    state["map"] = {"pending": True, "location": {"latitude_deg": lat,
+                                                   "longitude_deg": lon}}
+
+    def run():
+        try:
+            api = map_api.MapInitializationAPI(mapinit_dir=mapinit_dir)
+            # fail_fast=False: the health line should name every failed stage,
+            # not only the first, because the fixes differ (grid vs priors).
+            result = api.initialize(request, fail_fast=False)
+        except map_api.MapAPIError as e:
+            result = {"ok": False, "error": "%s: %s" % (type(e).__name__, e),
+                      "deployment": True, "location": state["map"]["location"]}
+        except Exception as e:  # never take the viewer down for the map
+            result = {"ok": False, "error": "%s: %s" % (type(e).__name__, e),
+                      "location": state["map"]["location"]}
+        state["map"] = result
+        if result.get("ok"):
+            alt = result.get("ego_altitude_prior") or {}
+            print("map: initialised at %.5f,%.5f - geoid %.2f m, ground %.1f m "
+                  "orthometric (sigma %.1f m), %s"
+                  % (lat, lon, (result.get("geoid") or {}).get("undulation_m", float("nan")),
+                     alt.get("orthometric_m", float("nan")), alt.get("sigma_m", float("nan")),
+                     os.path.basename((result.get("priors") or {}).get("overture_path", "?"))),
+                  file=sys.stderr)
+        else:
+            print("map: FAILED - %s" % (result.get("error") or result.get("summary", "")),
+                  file=sys.stderr)
+
+    threading.Thread(target=run, name="map-init", daemon=True).start()
+
+
+def static_wall_returns(points, max_speed=0.25, min_range=0.5, max_range=40.0):
+    """live.py's radar points (x fwd, y left, z, v, snr) -> (range, azimuth) walls.
+
+    Azimuth positive to the RIGHT, as the rig reports it to the map layer:
+    y is left in the radar frame, so azimuth = atan2(-y, x).
+    """
+    out = []
+    for p in points or []:
+        x, y = float(p["x"]), float(p["y"])
+        rng = math.hypot(x, y)
+        if not (min_range <= rng <= max_range):
+            continue
+        if abs(float(p.get("v") or 0.0)) > max_speed:
+            continue
+        out.append((rng, math.degrees(math.atan2(-y, x))))
+    return out
+
+
+def run_map_fix(state):
+    """Solve position+heading from the current static returns, into state["map_fix"].
+
+    Synchronous and a few seconds long (a 3-sigma grid at 5 m / 5 deg): the
+    HTTP handler runs it on its own thread, so the stream never waits. The
+    result is the map_api contract's "pose" block, or an error the operator
+    can act on. It never touches state["map"], the startup layer.
+    """
+    prior = state.get("map_prior")
+    if prior is None:
+        return {"ok": False, "error": "no map layer; start live.py with --map LAT,LON"}
+    if prior.get("heading_deg") is None:
+        return {"ok": False, "error": "no heading prior; give --map-heading DEG or /set?heading=DEG"}
+    pts = state.get("radar_points")
+    age = time.time() - state.get("radar_points_t", 0) if pts is not None else None
+    if pts is None or age > 2.0:
+        return {"ok": False, "error": "no fresh radar frame (age %s s)" % (
+            None if age is None else round(age, 1))}
+    walls = static_wall_returns(pts)
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    from perception import map_api
+    t0 = time.time()
+    try:
+        req = map_api.MapInitRequest(
+            latitude=prior["latitude_deg"], longitude=prior["longitude_deg"],
+            expected_geoid_range_m=state.get("map_geoid_range"),
+            heading_prior_deg=prior["heading_deg"],
+            sigma_position_m=prior["sigma_position_m"],
+            sigma_heading_deg=prior["sigma_heading_deg"],
+            wall_returns=tuple(walls) or None)
+        if not req.has_pose_observations:
+            return {"ok": False, "error": "no static returns in range 0.5-40 m (%d points)" % len(pts),
+                    "walls": walls}
+        res = map_api.MapInitializationAPI(mapinit_dir=state.get("mapinit_dir")).initialize(
+            req, fail_fast=False)
+    except map_api.MapAPIError as e:
+        return {"ok": False, "error": "deployment: %s: %s" % (type(e).__name__, e)}
+    except Exception as e:                        # noqa: BLE001
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, e)}
+    pose = res.get("pose")
+    stage = next((s for s in res.get("stages", []) if s["name"] == "pose_init"), None)
+    out = {"ok": bool(pose and pose.get("accepted")), "pose": pose,
+           "prior": prior, "walls": walls, "n_walls": len(walls),
+           "checks": (stage or {}).get("checks", []),
+           "stage_status": (stage or {}).get("status"),
+           "error": ((stage or {}).get("error") or {}).get("message"),
+           "solve_s": round(time.time() - t0, 2), "t": time.time()}
+    return out
+
+
+def topdown_view(state, radius_m=60.0):
+    """Footprint edges and radar returns in metres east/north of the prior.
+
+    What the page draws so an operator can SEE whether the walls the radar
+    reports sit on the map's walls - the check that no number replaces.
+    Returns None without a map layer or before its priors loaded.
+    """
+    prior = state.get("map_prior")
+    m = state.get("map") or {}
+    pr = m.get("priors") or {}
+    if prior is None or not pr.get("overture_path"):
+        return None
+    cache = state.get("_topdown_cache")
+    if cache is None or cache["path"] != pr["overture_path"]:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        from perception import map_api
+        map_api.locate_mapinit(state.get("mapinit_dir"))
+        from mapinit import BuildingLayer
+        from mapinit.nav.walls import footprint_edges, PosePrior, local_scales
+        layer = BuildingLayer.from_geojson(pr["overture_path"])
+        pp = PosePrior(prior["latitude_deg"], prior["longitude_deg"], 0.0, 1.0, 1.0)
+        segs = footprint_edges(layer, pp, radius_m=radius_m)
+        cache = {"path": pr["overture_path"], "edges": [[round(v, 2) for v in s] for s in segs.tolist()],
+                 "scales": local_scales(prior["latitude_deg"])}
+        state["_topdown_cache"] = cache
+    heading = prior.get("heading_deg")
+    walls = static_wall_returns(state.get("radar_points"))
+    fix = (state.get("map_fix") or {}).get("pose") or {}
+
+    def place(h, dx, dy):
+        if h is None:
+            return []
+        return [[round(dx + r * math.sin(math.radians(h + a)), 2),
+                 round(dy + r * math.cos(math.radians(h + a)), 2)] for r, a in walls]
+
+    lon_scale, lat_scale = cache["scales"]
+    fx = fy = None
+    if fix.get("latitude_deg") is not None:
+        fx = (fix["longitude_deg"] - prior["longitude_deg"]) * lon_scale
+        fy = (fix["latitude_deg"] - prior["latitude_deg"]) * lat_scale
+    return {"radius_m": radius_m, "edges": cache["edges"],
+            "prior": {"x": 0.0, "y": 0.0, "heading_deg": heading,
+                      "sigma_m": prior["sigma_position_m"]},
+            "returns_at_prior": place(heading, 0.0, 0.0),
+            "fix": None if fx is None else {
+                "x": round(fx, 2), "y": round(fy, 2), "heading_deg": fix.get("heading_deg"),
+                "accepted": fix.get("accepted"), "ambiguous": fix.get("ambiguous"),
+                "sigma_m": fix.get("sigma_horizontal_m")},
+            "returns_at_fix": [] if fx is None else place(fix.get("heading_deg"), fx, fy),
+            "n_walls": len(walls)}
+
+
+def nav_horizon(state):
+    """How long a fix survives, from the map package's DeadReckoner.
+
+    Speed aiding comes from the radar: with the rig still, the static
+    returns say speed 0 and the regime is speed-aided at zero speed, which
+    is the honest reading for a parked rig. The IMU constants are the
+    package's RIG_ERROR_MODEL (some measured, some assumed - the budget says
+    which). Cheap: pure arithmetic, no I/O.
+    """
+    if state.get("map_prior") is None:
+        return None
+    try:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        from perception import map_api
+        map_api.locate_mapinit(state.get("mapinit_dir"))
+        from mapinit import DeadReckoner, SpeedAiding
+    except Exception as e:                        # noqa: BLE001
+        return {"error": "%s: %s" % (type(e).__name__, e)}
+    pts = state.get("radar_points") or []
+    statics = [p for p in pts if abs(float(p.get("v") or 0.0)) <= 0.25 and math.hypot(p["x"], p["y"]) >= 0.5]
+    # Ego speed from the static returns' radial velocities (a still rig: 0).
+    speed = 0.0
+    if statics:
+        speed = float(sum(abs(float(p.get("v") or 0.0)) for p in statics) / len(statics))
+    fix = (state.get("map_fix") or {}).get("pose") or {}
+    heading_sigma = fix.get("sigma_heading_deg") if fix.get("accepted") else         (state.get("map_prior") or {}).get("sigma_heading_deg") or 5.0
+    aided = DeadReckoner(aiding=SpeedAiding(speed_mps=speed, sigma_speed_mps=0.05),
+                         initial_heading_sigma_deg=float(heading_sigma))
+    inertial = DeadReckoner(initial_heading_sigma_deg=float(heading_sigma))
+    b = aided.budget_at(60.0)
+    dom = b.dominant
+    dom = dom() if callable(dom) else dom
+    return {"regime": aided.regime, "speed_mps": round(speed, 2),
+            "heading_sigma_deg": round(float(heading_sigma), 2),
+            "horizon_1m_s": round(aided.horizon_for(1.0), 1),
+            "horizon_1m_inertial_s": round(inertial.horizon_for(1.0), 1),
+            "error_60s_m": round(b.total_m, 1),
+            "dominant": None if dom is None else str(dom),
+            "rests_on_assumption": bool(b.rests_on_assumption() if callable(b.rests_on_assumption)
+                                        else b.rests_on_assumption)}
+
+
 def make_handler(state, pipe):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -3550,6 +3936,8 @@ def make_handler(state, pipe):
                     for i, k in enumerate(("tx", "ty", "tz")):
                         if k in q:      # millimetres in the URL, metres inside
                             rp.t[i] = float(q.pop(k)) / 1000.0
+                if "heading" in q and state.get("map_prior") is not None:
+                    state["map_prior"]["heading_deg"] = float(q.pop("heading")) % 360.0
                 if "emissivity" in q or "reflected" in q:
                     eps = float(q.pop("emissivity", pipe.eps))
                     refl = float(q.pop("reflected", pipe.refl))
@@ -3606,6 +3994,40 @@ def make_handler(state, pipe):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(body.encode())
+            elif u.path == "/mapfix":
+                # Solve now, on this handler thread, and remember the answer.
+                res = run_map_fix(state)
+                state["map_fix"] = res
+                self.send_response(200 if res.get("ok") else 409)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(res, allow_nan=False, default=str).encode())
+            elif u.path == "/topdown":
+                try:
+                    td = topdown_view(state)
+                except Exception as e:            # noqa: BLE001
+                    td = {"error": "%s: %s" % (type(e).__name__, e)}
+                self.send_response(200 if td else 404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps(td or {"error": "no map layer or priors not loaded"}).encode())
+            elif u.path == "/map":
+                # Yael's map layer as the schema-1.0 contract, or the reason
+                # there is none. 404 only when live.py was started without
+                # --map: then "no map" is configuration, not a failure.
+                m = state.get("map")
+                if m is None:
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps({
+                        "error": "no map layer; start live.py with --map LAT,LON",
+                    }).encode())
+                else:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(json.dumps(m).encode())
             elif u.path == "/health":
                 checks = health(pipe, state, time.time())
                 body = json.dumps({"worst": worst_level(checks), "checks": checks})
@@ -3957,6 +4379,26 @@ def main():
                          "switchable live from the page and over "
                          "/set?ai_thermal=0&ai_radar=1&ai_fusion=1, so this only "
                          "picks what the first frame shows")
+    ap.add_argument("--map", metavar="LAT,LON", default=None,
+                    help="initialise Yael's map layer (mapinit) at this WGS84 "
+                         "position: geoid undulation, ground/surface height, "
+                         "building priors. Served on /map, graded in /health. "
+                         "Runs in the background; the viewer never waits on it")
+    ap.add_argument("--map-geoid", type=float, nargs=2, metavar=("LOW", "HIGH"),
+                    default=None, help="assert the geoid undulation is in this "
+                                       "range (m) - Jerusalem is 19..20.5")
+    ap.add_argument("--map-heading", type=float, default=None, metavar="DEG",
+                    help="compass heading prior for the map fix (0 = north); "
+                         "changeable live with /set?heading=. Without it /mapfix "
+                         "cannot run: heading has no other source on this rig")
+    ap.add_argument("--map-sigma", type=float, nargs=2, default=(5.0, 5.0),
+                    metavar=("M", "DEG"), help="how good the --map position and "
+                    "--map-heading are believed to be (1 sigma). Be honest: the "
+                    "fix searches 3 sigma and no further")
+    ap.add_argument("--mapinit-dir", default=None, metavar="DIR",
+                    help="directory holding Yael's mapinit/ package (default: "
+                         "$VALISIGHT_MAPINIT, then a ValiSight_yael checkout "
+                         "beside this repo)")
     ap.add_argument("--seconds", type=int, default=0, help="exit after N seconds (for tests)")
     args = ap.parse_args()
 
@@ -4125,6 +4567,16 @@ def main():
     # card when this is None, and health() asks it whether a channel that is
     # switched on can actually draw.
     state["students"] = students
+
+    if args.map:
+        start_map_init(state, args.map, args.map_geoid, args.mapinit_dir)
+        lat, lon = (float(v) for v in args.map.split(","))
+        state["map_prior"] = {"latitude_deg": lat, "longitude_deg": lon,
+                              "heading_deg": args.map_heading,
+                              "sigma_position_m": float(args.map_sigma[0]),
+                              "sigma_heading_deg": float(args.map_sigma[1])}
+        state["map_geoid_range"] = tuple(args.map_geoid) if args.map_geoid else None
+        state["mapinit_dir"] = args.mapinit_dir
 
     render = Renderer(pipe, state, work, detector, radar=radar,
                       radar_proj=radar_proj, video=video, students=students,

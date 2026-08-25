@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from perception import map_api
 from perception.map_api import (
     MapAPIContractError,
     MapAPIUnavailable,
@@ -163,3 +164,118 @@ def test_missing_yael_runtime_dependency_is_actionable():
 
     with pytest.raises(MapAPIUnavailable, match="rasterio"):
         MapInitializationAPI(MissingDependency).initialize(MapInitRequest(31.7, 35.2))
+
+
+# --- finding Yael's package. It is never merged, so the adapter has to locate
+#     the checkout; a wrong pointer must fail with the path it tried.
+
+def _fake_mapinit(root: Path) -> Path:
+    (root / "mapinit").mkdir(parents=True)
+    (root / "mapinit" / "__init__.py").write_text("")
+    return root
+
+
+def test_locate_prefers_explicit_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", ())
+    root = _fake_mapinit(tmp_path / "yael")
+    assert map_api.locate_mapinit(root) == root
+    assert str(root) in map_api.sys.path
+
+
+def test_locate_reads_env_var(tmp_path, monkeypatch):
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", ())
+    root = _fake_mapinit(tmp_path / "elsewhere")
+    monkeypatch.setenv(map_api.MAPINIT_ENV, str(root))
+    assert map_api.locate_mapinit() == root
+
+
+def test_locate_falls_back_to_known_layouts(tmp_path, monkeypatch):
+    monkeypatch.delenv(map_api.MAPINIT_ENV, raising=False)
+    root = _fake_mapinit(tmp_path / "beside")
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", (tmp_path / "missing", root))
+    assert map_api.locate_mapinit() == root
+
+
+def test_locate_names_a_bad_pointer(tmp_path, monkeypatch):
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", ())
+    monkeypatch.setenv(map_api.MAPINIT_ENV, str(tmp_path / "nope"))
+    with pytest.raises(MapAPIUnavailable) as err:
+        map_api.locate_mapinit()
+    assert "nope" in str(err.value) and map_api.MAPINIT_ENV in str(err.value)
+
+
+def test_locate_returns_none_when_nothing_found(tmp_path, monkeypatch):
+    monkeypatch.delenv(map_api.MAPINIT_ENV, raising=False)
+    monkeypatch.setattr(map_api, "MAPINIT_CANDIDATES", (tmp_path / "a", tmp_path / "b"))
+    assert map_api.locate_mapinit() is None
+
+
+# --- the pose block: observations in, a pose with its trust flags out.
+
+@dataclass
+class Pose:
+    latitude: float = 31.76831
+    longitude: float = 35.21372
+    height_m: float = 779.7
+    yaw_deg: float = 38.5
+    sigma_horizontal_m: float = 0.6
+    sigma_vertical_m: float = 5.4
+    sigma_yaw_deg: float = 2.3
+
+
+@dataclass
+class Fix:
+    accepted: bool = True
+    ambiguous: bool = False
+    ambiguity_axis: str | None = None
+    on_boundary: bool = False
+    dx_m: float = 1.0
+    dy_m: float = -2.0
+    dyaw_deg: float = -1.5
+    score: float = 0.9
+    inlier_fraction: float = 0.88
+    n_returns: int = 9
+    n_edges: int = 65
+
+
+class FakeInitializerWithPose(FakeInitializer):
+    def run(self, fail_fast=True):
+        report = super().run(fail_fast)
+        obs = self.kwargs.get("pose_observations")
+        if obs is not None:
+            report.results.append(Stage("pose_init", Status.OK, [
+                Check("pose_init.accepted", True, "fixed")], {"pose": Pose(), "fix": Fix()}))
+        else:
+            report.results.append(Stage("pose_init", Status.SKIPPED, [
+                Check("pose_init.configured", True, "skipped: no observations")]))
+        return report
+
+
+def test_request_without_walls_has_no_pose_observations():
+    req = MapInitRequest(latitude=31.7683, longitude=35.2137, heading_prior_deg=40.0)
+    assert not req.has_pose_observations
+    res = MapInitializationAPI(initializer_factory=FakeInitializerWithPose).initialize(req)
+    assert res["pose"] is None
+    assert [s["status"] for s in res["stages"] if s["name"] == "pose_init"] == ["skipped"]
+
+
+def test_request_with_walls_runs_the_pose_stage_and_returns_primitives():
+    req = MapInitRequest(latitude=31.7683, longitude=35.2137, heading_prior_deg=40.0,
+                         sigma_position_m=5.0, sigma_heading_deg=5.0,
+                         wall_returns=((5.0, 10.0), (7.5, -20.0), (12.0, 33.0)))
+    assert req.has_pose_observations
+    res = MapInitializationAPI(initializer_factory=FakeInitializerWithPose).initialize(req)
+    pose = res["pose"]
+    assert pose["accepted"] is True and pose["ambiguous"] is False
+    assert pose["heading_deg"] == 38.5 and pose["sigma_heading_deg"] == 2.3
+    assert pose["dx_m"] == 1.0 and pose["n_returns"] == 9
+    json.dumps(res, allow_nan=False)
+
+
+def test_bad_wall_returns_are_rejected_at_the_boundary():
+    with pytest.raises(ValueError):
+        MapInitRequest(latitude=31.7683, longitude=35.2137, heading_prior_deg=40.0,
+                       wall_returns=((5.0,),))
+    with pytest.raises(ValueError):
+        MapInitRequest(latitude=31.7683, longitude=35.2137, heading_prior_deg=40.0,
+                       sigma_position_m=0.0, wall_returns=((5.0, 1.0),))
