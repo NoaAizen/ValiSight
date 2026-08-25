@@ -2758,8 +2758,10 @@ SOC</div>
           <b style=color:#5cf>returns at the fix</b>. If the amber dots are not on
           grey lines, the prior is wrong; if the blue ones are not, the fix is.</div>
         <div class=hintline>orthometric heights against EGM2008 for the
-          <b>--map</b> position. <i>skipped</i> stages are not implemented on
-          Yael's side yet (pose_init = position from the map). Full JSON on
+          <b>--map</b> position. <i>calibration</i> is skipped without
+          constraints; <i>pose_init</i> at startup is skipped because the
+          radar has not reported yet &mdash; <b>fix from walls</b> below runs
+          it on the live returns. Full JSON on
           <a href=/map target=_blank>/map</a>.</div>
       </div>
     </div>
