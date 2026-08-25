@@ -106,6 +106,7 @@ import capture  # noqa: E402  - reuse the bring-up that is known to survive
 import detect   # noqa: E402
 import radar_overlay
 import tracker as tracking  # noqa: E402
+import egomotion  # noqa: E402
 import recorder  # noqa: E402
 import soc as hostsoc  # noqa: E402
 
@@ -1281,6 +1282,10 @@ class Renderer(threading.Thread):
         # rendered frame, including the frames nothing was found in - a miss is
         # information and the tracker has to be told about it.
         self.lock = tracking.Tracker()
+        # What the rig itself did between frames. The tracker cannot tell a
+        # person crossing the frame from the frame moving under a person, and
+        # the difference decides whether a warm door gets drawn as somebody.
+        self.ego = egomotion.GlobalShift()
         # The detector runs on its own thread at its own rate, so the same
         # detection list is visible for several rendered frames. Feeding it
         # more than once would inflate the hit count and, worse, hold a lock
@@ -1720,6 +1725,9 @@ class Renderer(threading.Thread):
                 # on the wire. Count it: without this the frame simply vanishes
                 # and the link looks healthier than it is.
                 self.state["bad_jpeg"] = self.state.get("bad_jpeg", 0) + 1
+                # The next good frame is not the successor of the last one, but
+                # the shift across the gap is still the shift the tracker's own
+                # dt covers, so the reference is kept rather than dropped.
                 continue
 
             p = self.pipe
@@ -1793,7 +1801,13 @@ class Renderer(threading.Thread):
             # skipping it would make a coast last as long as the scene is quiet.
             if p.ai_lock:
                 now = time.time()
-                tracks = self.lock.update(self._lock_observations(thermal), now)
+                # Measured on the plain luma, before anything was drawn on the
+                # frame: a box annotated onto the picture moves with its target
+                # and would correlate as if the camera had moved.
+                ego = self.ego.measure(y)
+                self.state["ego"] = self.ego.as_dict()
+                tracks = self.lock.update(self._lock_observations(thermal), now,
+                                          ego=ego)
                 if p.show_detections:
                     self._draw_tracks(rgb, tracks, thermal, now)
                 self.state["tracks"] = [t.as_dict(now) for t in tracks]
@@ -2499,6 +2513,10 @@ def ui_payload(pipe, state, now):
         # up quoted as a measurement.
         "tracks": state.get("tracks") or [],
         "tracks_static": state.get("tracks_static") or [],
+        # What the rig did between frames, and whether it could be read at all.
+        # The lock silently assumes a still rig whenever this is refused, and
+        # an assumption nobody can see is one nobody thinks to doubt.
+        "ego": state.get("ego"),
         "heap_free": state.get("heap_free"),
         "restarts": state.get("restarts", 0),
         "coverage": round(float(pipe.cover_grid().mean()), 4) if pipe.f.have_frame else None,
@@ -3718,6 +3736,15 @@ async function poll() {
     : (d.tracks.length ? held + ' locked' : 'none')
       + (coast ? ' \u00b7 ' + coast + ' coasting' : '')
       + (stat ? ' \u00b7 ' + stat + ' static' : '');
+  // What the rig is doing under the lock. Silent while it is still, because
+  // that is the ordinary case; explicit when it is turning, and explicit when
+  // the frame was too busy to read - then the lock is back to assuming still.
+  const eg = d.ego;
+  if (eg) {
+    const mag = Math.sqrt(eg.du * eg.du + eg.dv * eg.dv);
+    $('s_lock').textContent += eg.response < 0.7 ? ' \u00b7 rig unread'
+      : mag >= 1.5 ? ' \u00b7 rig ' + mag.toFixed(0) + ' px/f' : '';
+  }
   $('s_lock').style.color = !cfg.lock ? '' : coast && !held ? '#f0c060'
     : held ? '#7fd39b' : '';
 
@@ -4432,6 +4459,11 @@ def main():
                          "--ai-channels, or live from the page")
     ap.add_argument("--student-conf", type=float, default=0.5, metavar="C",
                     help="confidence threshold for both students")
+    ap.add_argument("--students-dir", metavar="DIR",
+                    help="load the student engines from this directory "
+                         "instead of perception/out/gexport/v2/models. The "
+                         "engines belong to the export that trained them; the "
+                         "session meta records which ones actually loaded")
     ap.add_argument("--no-lock", action="store_true",
                     help="start with the person lock off, so every frame's "
                          "boxes stand on that frame alone. The lock is on by "
@@ -4482,6 +4514,11 @@ def main():
                                 " (found %s, pass --port)" % ", ".join(found)))
     if not os.path.exists(LIB):
         raise SystemExit("%s missing - run 'make libfusion.so' in host/" % LIB)
+
+    # Set before anything imports trt_students: the module reads it at import
+    # time, and a later assignment would silently load the default engines.
+    if args.students_dir:
+        os.environ["STUDENT_ENGINES"] = os.path.abspath(args.students_dir)
 
     pipe = Pipeline(args)
     pipe.view = args.view

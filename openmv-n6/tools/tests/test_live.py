@@ -727,6 +727,67 @@ def lock_mode():
           len(two) == 2, "%d group(s)" % len(two))
 
 
+def ego_motion(d):
+    """Where the whole picture went - measured on real frames, not mocked.
+
+    The interesting number is not the accuracy, which phase correlation gives
+    away for free. It is the failure: this reports the DOMINANT translation, so
+    a big enough mover is a lie waiting to happen, and what saves the tracker is
+    that the lie is small and announces itself in the response.
+    """
+    print("\nego motion")
+    import egomotion
+
+    fs = sorted(glob.glob(os.path.join(d, "*_rgb0.raw")))
+    if len(fs) < 3:
+        check("frames to measure ego motion on", False, "only %d in %s" % (len(fs), d))
+        return
+    ys = [np.frombuffer(open(f, "rb").read(), np.uint8).reshape(400, 640) for f in fs]
+
+    g = egomotion.GlobalShift()
+    check("the first frame of a stream has nothing to be a shift from",
+          g.measure(ys[0]) is None)
+
+    worst = 0.0
+    for y in ys[1:]:
+        e = g.measure(y)
+        if e is not None:
+            worst = max(worst, abs(e[0]), abs(e[1]))
+    # captures/handwave3 is a bolted rig with a hand waving through it: the
+    # true answer is zero, and a hand is not allowed to make it anything else.
+    check("a bolted rig reads as a bolted rig, hand or no hand",
+          worst < 1.0, "worst %.2f px" % worst)
+
+    def shifted(a, dx, dy=0):
+        return cv2.warpAffine(a, np.float32([[1, 0, dx], [0, 1, dy]]),
+                              (640, 400), borderMode=cv2.BORDER_REFLECT)
+
+    errs = []
+    for px in (2, 10, 40):
+        g2 = egomotion.GlobalShift()
+        g2.measure(ys[0])
+        e = g2.measure(shifted(ys[0], px))
+        errs.append(1e3 if e is None else abs(e[0] - px))
+    check("a known sweep comes back as itself", max(errs) < 0.5,
+          "worst error %.2f px" % max(errs))
+
+    # A mover over half the frame, rig still. It must not hand back the
+    # mover's own displacement as if the camera had moved.
+    a, b = ys[0].copy(), ys[0].copy()
+    w = 320
+    blob = cv2.GaussianBlur(np.full((400, w), 200, np.uint8), (31, 31), 0)
+    a[:, 50:50 + w] = blob
+    b[:, 75:75 + w] = blob
+    g3 = egomotion.GlobalShift()
+    g3.measure(a)
+    e = g3.measure(b)
+    check("a mover filling half the frame does not become a camera pan",
+          e is None, "reported %s, response %.2f"
+          % ("nothing" if e is None else "%+.1f px" % e[0], g3.response))
+    check("and the frame it refused is counted, not silently dropped",
+          g3.as_dict()["rejected"] == 1)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1262,6 +1323,7 @@ def main():
     threading_and_detection(y, thermal)
     ai_channels(thermal)
     lock_mode()
+    ego_motion(HANDWAVE3)
 
     print()
     if FAILS:
