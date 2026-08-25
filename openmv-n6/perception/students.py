@@ -20,7 +20,8 @@ from scipy.optimize import linear_sum_assignment
 from torch.utils.data import DataLoader, Dataset
 
 from perception.student_data import (
-    LABEL_POSITIVE, LoadedSplit, detection_target, estimate_scalar_stats,
+    LABEL_NEGATIVE, LABEL_POSITIVE, LoadedSplit, detection_target,
+    estimate_scalar_stats,
 )
 
 EPS = 1e-6
