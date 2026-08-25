@@ -8,6 +8,11 @@
 #   ./run_live.sh --ai-channels none     # students loaded, nothing drawn
 #   ./run_live.sh --range 20:45          # override the students' training range
 #   NO_STUDENTS=1 ./run_live.sh          # do not load the students at all
+#   STUDENT_ENGINES=$ROOT/perception/out/gexport/v4/models ./run_live.sh
+#       # run a different export's student engines (build them first: trtexec)
+#   MAP=none ./run_live.sh               # launch without the map layer
+#   MAP=31.7712,35.2043 ./run_live.sh    # a different site (see MAP_GEOID below)
+#   MAP_HEADING=215 ./run_live.sh        # compass heading of the camera, if known
 #   ./run_live.sh --stop              # stop the viewer and park the radar
 #   SKIP_CFG=1 ./run_live.sh          # leave the radar's chirp config alone
 #   KEEP_RADAR=1 ./run_live.sh --stop # stop the viewer, leave the radar chirping
@@ -187,7 +192,11 @@ fi
 #
 # Everything past that is live: the three channels switch from the page (keys
 # t, r, c) or over /set?ai_thermal=0&ai_radar=1&ai_fusion=1.
-STUDENT_ENGINE="$ROOT/perception/out/gexport/v2/models/thermal_student.engine"
+# STUDENT_ENGINES picks the export whose engines the viewer loads; the default
+# is v2, the only one with engines built on this rig. Point it at another
+# export's models/ directory after building its engines with trtexec.
+STUDENT_DIR="${STUDENT_ENGINES:-$ROOT/perception/out/gexport/v2/models}"
+STUDENT_ENGINE="$STUDENT_DIR/thermal_student.engine"
 HAS_RANGE=0
 for a in "$@"; do
     case "$a" in --range|--range=*) HAS_RANGE=1;; esac
@@ -195,7 +204,7 @@ done
 if [ "${NO_STUDENTS:-0}" = "1" ]; then
     echo "students   off (NO_STUDENTS=1)"
 elif [ -f "$STUDENT_ENGINE" ]; then
-    ARGS+=(--students)
+    ARGS+=(--students --students-dir "$STUDENT_DIR")
     if [ "$HAS_RANGE" = 0 ]; then
         ARGS+=(--range 0:60)
         echo "students   thermal + radar + fusion, range pinned 0:60 (training scale)"
@@ -207,6 +216,64 @@ elif [ -f "$STUDENT_ENGINE" ]; then
     [ -f "$WARP" ] || echo "  no warp LUT: the thermal channel cannot be drawn and fusion cannot pair" >&2
 else
     echo "students   none - $STUDENT_ENGINE is missing (build it with trtexec)" >&2
+fi
+
+# --- the map layer ---------------------------------------------------------
+# Part of a normal launch rather than something to remember: without --map
+# live.py has no position at all, so the map card and the top-down beside the
+# picture are hidden and /map answers 404. There is no other source - this rig
+# carries no GNSS, and nothing in the code invents one.
+#
+# The default is the MEASURED position of the rig's site (Givat Ram), not an
+# example. A rig that has been carried somewhere else must say so, because
+# every number the layer produces is a lookup at this point: the geoid
+# undulation, the ground and surface elevation off a 30 m DEM posting, and the
+# building footprints the top-down draws. Being 20 m out moved the ground
+# elevation by 5.5 m when it was measured on 2026-08-25.
+MAP="${MAP:-31.764559,35.191150}"
+MAP_DEFAULT="31.764559,35.191150"
+# The geoid assertion belongs to the position, not to the script: 19..20.5 m is
+# Jerusalem, and asserting it over a site in another country fails the stage
+# for the right reason but the wrong reading. So it rides only with the default
+# position unless someone states their own.
+MAP_GEOID="${MAP_GEOID:-}"
+if [ -z "$MAP_GEOID" ] && [ "$MAP" = "$MAP_DEFAULT" ]; then
+    MAP_GEOID="19 20.5"
+fi
+HAS_MAP=0
+for a in "$@"; do
+    case "$a" in --map|--map=*) HAS_MAP=1;; esac
+done
+if [ "$HAS_MAP" = 1 ]; then
+    echo "map        YOUR --map (this script's MAP=$MAP ignored)"
+elif [ "$MAP" = "none" ] || [ -z "$MAP" ]; then
+    echo "map        off (MAP=none) - no map card, no top-down, /map is 404"
+else
+    ARGS+=(--map "$MAP")
+    # An `if` and not `[ ... ] && ...`: under `set -e` a bare test that fails
+    # as the whole statement is exactly the kind of thing that kills a launcher
+    # silently at the one site where somebody set MAP without MAP_GEOID.
+    if [ -n "$MAP_GEOID" ]; then
+        ARGS+=(--map-geoid $MAP_GEOID)      # unquoted on purpose: LOW HIGH
+    fi
+    # Heading has no source on this rig either, and unlike the position there
+    # is no defensible default: a guess here is a guess the wall fix would
+    # search three sigma around and never announce. Left out unless stated,
+    # and said out loud, because /mapfix cannot run without it.
+    if [ -n "${MAP_HEADING:-}" ]; then
+        ARGS+=(--map-heading "$MAP_HEADING")
+        echo "map        $MAP, heading $MAP_HEADING deg${MAP_GEOID:+, geoid $MAP_GEOID m}"
+    else
+        echo "map        $MAP${MAP_GEOID:+, geoid $MAP_GEOID m} - no heading given, so"
+        echo "           the numbers are live but 'fix from walls' cannot run"
+        echo "           (MAP_HEADING=DEG, or /set?heading=DEG while it runs)"
+    fi
+    # Yael's package is not in this repo; map_api looks for it beside us. Say
+    # so here rather than letting the stage fail into the card with a stack
+    # trace nobody reads.
+    [ -f "$ROOT/mapinit/__init__.py" ] || [ -f "$HOME/ValiSight_yael/mapinit/__init__.py" ] \
+        || echo "  no mapinit package (looked in $ROOT and $HOME/ValiSight_yael):" \
+                "the map layer will report DEPLOYMENT and stay empty" >&2
 fi
 
 # Per-user by default: two accounts share this Jetson, and a log left behind by
@@ -275,6 +342,10 @@ grep -m1 -E 'RUNNING WITHOUT DETECTION|falling back to yolov4-tiny' "$LOG" >&2 |
 # running and prints one line. Unrepeated here, that line is three minutes of
 # scrollback away by the time anyone notices the boxes are missing.
 grep -m3 -E '^students: ' "$LOG" >&2 || true
+# Same reasoning for the map: it initialises on its own thread and never takes
+# the viewer down, so a failed layer is one line far up the log and an empty
+# card on the page.
+grep -m1 -E '^map: ' "$LOG" >&2 || true
 curl -s --max-time 5 "http://localhost:$HTTP/health" 2>/dev/null | python3 -c '
 import json, sys
 raw = sys.stdin.read()
