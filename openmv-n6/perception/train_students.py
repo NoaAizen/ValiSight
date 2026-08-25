@@ -126,6 +126,31 @@ def main():
 
     manifest, train, val = load_train_val(args.data, args.max_dt_ms)
 
+    def check_val_is_measurable(plane):
+        """A val split without BOTH classes cannot score the thing it claims.
+
+        Measured the hard way: v3's first split held only empty sessions for
+        the thermal plane, so precision and recall were 0/0, the false-positive
+        rate read 0.999, and - worse - model selection ranks checkpoints by an
+        F1 that was identically zero, which makes the saved "best" arbitrary.
+        The mirror failure came first: a val where every frame holds a person
+        gives F1 1.000 to a model that answers "person" always.
+        """
+        key = ("thermal_label_state" if plane == "thermal"
+               else "radar_label_state")
+        state = val.arrays[key]
+        n_pos = int((state == 1).sum())
+        n_neg = int((state == 0).sum())
+        print(f"[{plane}] val: {n_pos} frames with a person, "
+              f"{n_neg} verified empty")
+        if n_pos == 0 or n_neg == 0:
+            raise SystemExit(
+                f"{plane}: the val split has "
+                f"{'no frames with a person' if n_pos == 0 else 'no empty frames'}"
+                f" - every metric it produces would be meaningless, and the "
+                f"best-checkpoint choice with it. Fix manifest.json's split "
+                f"so val holds both, then rerun.")
+
     def negative_weight_for(plane):
         """Balance verified-empty frames against positives, or take the flag."""
         if args.negative_weight != "auto":
@@ -160,6 +185,7 @@ def main():
         disabled = [x.strip() for x in args.disable_thermal.split(",")
                     if x.strip()]
         model.derived.disable_channels(disabled)
+        check_val_is_measurable("thermal")
         train_loader, val_loader = build_loaders(
             train, val, "thermal", args.max_objects,
             args.batch_size, args.workers, augment=not args.no_augment)
@@ -204,6 +230,7 @@ def main():
                     f"cannot disable channels in absent radar family {family}")
             model.disable_channels(family, channels)
 
+        check_val_is_measurable("radar")
         train_loader, val_loader = build_loaders(
             train, val, "radar", args.max_objects,
             args.batch_size, args.workers, augment=not args.no_augment)
