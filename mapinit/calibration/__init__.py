@@ -2,6 +2,7 @@
 
 from .constraints import CalibrationConstraint, Observation
 from .imu import (
+    CalibrationDependencyMissing,
     ImuCalibrationFailed,
     ImuCameraConstraint,
     ImuCameraSolution,
@@ -12,6 +13,7 @@ from .targets import SurveyedTarget, SurveyedTargetConstraint
 
 __all__ = [
     "CalibrationConstraint",
+    "CalibrationDependencyMissing",
     "ImuCalibrationFailed",
     "ImuCameraConstraint",
     "ImuCameraSolution",

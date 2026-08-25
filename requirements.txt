@@ -1,5 +1,15 @@
 pyproj==3.7.1
+rasterio==1.4.4
+numpy==2.2.6
+
 pytest==9.1.1
+
+# rasterio backs DemSampler, so every priors run needs it, not only the
+# terrain helpers. numpy is needed by the bulk DEM sampler behind the skyline
+# march and by the IMU calibration solver. Both were reaching the environment
+# as transitive installs; a consumer installing from this file alone got
+# neither, and the stage failed at the point where the map looks at fault
+# rather than the install.
 
 # Data dependency, not installable via pip.
 #

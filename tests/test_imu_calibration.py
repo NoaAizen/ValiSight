@@ -304,3 +304,18 @@ def test_summary_names_the_numbers_that_qualify_the_answer():
 
 def test_minimum_separation_threshold_is_stated_in_degrees():
     assert MIN_TILT_SEPARATION_DEG == pytest.approx(15.0)
+
+
+def test_a_missing_package_is_a_bad_install_not_a_bad_capture():
+    """The exception type is what a consumer branches on, and it decides who is called.
+
+    Every other ImuCalibrationFailed says the captured orientations were not
+    enough. This one says the capture was never read. Reporting it as the
+    former sends someone back out to the rig to repeat a session that was fine.
+    """
+    from mapinit.calibration.imu import CalibrationDependencyMissing, ImuCalibrationFailed
+
+    failure = CalibrationDependencyMissing("numpy", "solve the IMU rotation")
+    assert isinstance(failure, ImuCalibrationFailed)
+    assert failure.name == "numpy"
+    assert "pip install numpy" in str(failure)

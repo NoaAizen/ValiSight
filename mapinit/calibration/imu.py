@@ -81,11 +81,31 @@ class ImuCalibrationFailed(RuntimeError):
     """Raised when the orientations cannot determine the rotation."""
 
 
+class CalibrationDependencyMissing(ImuCalibrationFailed):
+    """Raised when a package the solver needs is not installed.
+
+    A subclass rather than a sibling, so code catching ImuCalibrationFailed
+    keeps catching this. The distinction is what matters to a consumer: every
+    other ImuCalibrationFailed says something about the captured orientations
+    -- too few, too alike, contaminated by motion -- while this one says the
+    install is wrong and the capture was never read. Collapsing the two sends
+    someone back out to the rig to repeat a session that was fine.
+
+    Same reasoning as DependencyMissing in geo.dem, kept local rather than
+    imported so the calibration path does not pull in the raster module to
+    raise an exception.
+    """
+
+    def __init__(self, name: str, purpose: str) -> None:
+        super().__init__(f"{name} is required to {purpose}. Install it with: pip install {name}")
+        self.name = name
+
+
 def _require_numpy():
     try:
         import numpy as np
-    except ImportError as exc:  # pragma: no cover
-        raise ImuCalibrationFailed("numpy is required to solve the IMU rotation") from exc
+    except ImportError as exc:  # pragma: no cover - numpy ships with rasterio
+        raise CalibrationDependencyMissing("numpy", "solve the IMU rotation") from exc
     return np
 
 

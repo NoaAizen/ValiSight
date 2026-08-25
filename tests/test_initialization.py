@@ -749,6 +749,49 @@ def test_unimplemented_pose_stage_reports_skipped_rather_than_missing(tiled_prio
     assert report.ok, "a skipped stage does not fail the run"
 
 
+def test_a_missing_package_is_distinguishable_from_a_missing_tile():
+    """Deployment fault and map fault must not arrive as the same thing.
+
+    The consumer contract reports a missing Python package as an install
+    problem and everything else as a map result. Both used to raise a bare
+    DemUnavailable, so telling them apart meant reading the message or the
+    __cause__ chain -- either of which breaks silently the first time someone
+    raises without ``from``.
+    """
+    import builtins
+    import sys
+
+    from mapinit import DependencyMissing
+    from mapinit.geo.dem import DemSampler, DemUnavailable
+
+    # A missing tile: still DemUnavailable, and deliberately not this subclass.
+    with pytest.raises(DemUnavailable) as missing_tile:
+        DemSampler("/nonexistent/tile.tif")
+    assert not isinstance(missing_tile.value, DependencyMissing)
+
+    # A missing package: the subclass, naming what to install.
+    real_import = builtins.__import__
+
+    def without_rasterio(name, *args, **kwargs):
+        if name.split(".")[0] == "rasterio":
+            raise ModuleNotFoundError("No module named 'rasterio'", name="rasterio")
+        return real_import(name, *args, **kwargs)
+
+    cached = {k: v for k, v in sys.modules.items() if k.startswith("rasterio")}
+    for key in cached:
+        del sys.modules[key]
+    builtins.__import__ = without_rasterio
+    try:
+        with pytest.raises(DependencyMissing) as absent:
+            DemSampler("/nonexistent/tile.tif")
+    finally:
+        builtins.__import__ = real_import
+        sys.modules.update(cached)
+
+    assert absent.value.name == "rasterio"
+    assert isinstance(absent.value, DemUnavailable), "must stay catchable as before"
+
+
 def test_geo_failure_types_are_reachable_from_the_package_root():
     """A consumer catches these, so it must be able to name them.
 
@@ -758,8 +801,9 @@ def test_geo_failure_types_are_reachable_from_the_package_root():
     """
     import mapinit
 
-    for name in ("GeoidGridUnavailable", "TileNotFound", "PriorPaths",
-                 "GroundEstimate", "EgoAltitudePrior", "BasePriorDataProvider"):
+    for name in ("GeoidGridUnavailable", "TileNotFound", "DependencyMissing",
+                 "PriorPaths", "GroundEstimate", "EgoAltitudePrior",
+                 "BasePriorDataProvider"):
         assert name in mapinit.__all__, f"{name} missing from __all__"
         assert isinstance(getattr(mapinit, name), type)
 

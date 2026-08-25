@@ -46,6 +46,23 @@ class DemUnavailable(RuntimeError):
     """Raised when the DEM cannot answer for the requested point."""
 
 
+class DependencyMissing(DemUnavailable):
+    """Raised when a Python package the DEM path needs is not installed.
+
+    A subclass rather than a sibling so that code catching DemUnavailable keeps
+    catching this. The distinction matters to a consumer: a missing package is
+    a deployment fault, while every other DemUnavailable says something about
+    the map or the point. Collapsing the two sends whoever is on call to look
+    at tiles when the install is what is wrong.
+
+    ``name`` is the importable package name, so a caller can report which one.
+    """
+
+    def __init__(self, name: str, purpose: str) -> None:
+        super().__init__(f"{name} is required to {purpose}. Install it with: pip install {name}")
+        self.name = name
+
+
 class ScaleNotSupported(ValueError):
     """Raised when a caller asks the DEM for detail finer than its posting."""
 
@@ -109,9 +126,7 @@ class DemSampler:
         try:
             import rasterio
         except ImportError as exc:
-            raise DemUnavailable(
-                "rasterio is required to sample the DEM. Install it with: pip install rasterio"
-            ) from exc
+            raise DependencyMissing("rasterio", "sample the DEM") from exc
 
         self.dem_path = Path(dem_path)
         if not self.dem_path.is_file():
@@ -214,8 +229,13 @@ class DemSampler:
 
         Returns a float array with NaN wherever the DEM has no data.
         """
-        import numpy as np
-        import rasterio.windows
+        try:
+            import numpy as np
+            import rasterio.windows
+        except ImportError as exc:
+            raise DependencyMissing(
+                getattr(exc, "name", "numpy"), "sample the DEM in bulk"
+            ) from exc
 
         latitudes = np.asarray(latitudes, dtype=float)
         longitudes = np.asarray(longitudes, dtype=float)
