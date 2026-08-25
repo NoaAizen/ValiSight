@@ -186,6 +186,27 @@ for edge in view.visible_edges:
 `sweep_headings()` עושה את העבודה היקרה פעם אחת למעגל שלם — זה מה שהופך חיפוש
 כיוון על כל 360 המעלות לזול.
 
+### navigation — מיקום וכיוון מקירות (רדאר מול המפה)
+
+```python
+from mapinit import WallMatcher, PosePrior, static_returns, BuildingLayer
+
+walls = static_returns(rig.radar_detections_all())      # סטטיים, 0.5–40 מ'
+prior = PosePrior(31.7683, 35.2137, heading_deg=40.0,
+                  sigma_position_m=5.0, sigma_heading_deg=5.0, source="manual_pin")
+fix = WallMatcher().match(walls, BuildingLayer.from_geojson(paths.overture_path), prior)
+if fix.accepted:
+    use(fix.latitude, fix.longitude, fix.heading_deg, fix.sigma_east_m, fix.sigma_heading_deg)
+```
+
+**לקרוא `accepted`, ואז `ambiguous`.** קיר ישר אחד קובע את המרחק ממנו ואת
+הכיוון, ולא כלום לאורכו — הפיקס אז מסומן `ambiguous` עם שם הציר, ולא מצוטט
+כאילו נמדד. `on_boundary` אומר שה-prior גרוע מהסיגמה שהוצהרה: החיפוש הוא 3σ
+ולא יותר, **בכוונה**, כדי שרחוב דומה במרחק 40 מ' לא ינצח.
+
+דרך הצינור: `MapInitializer(lat, lon, pose_observations=PoseObservations(prior, walls))`
+ושלב `pose_init` רץ ומפרסם `InitialPose` (גובה מה-DEM, לא מהרדאר).
+
 ### map — אתחול מיקום מול המפה
 
 ```python
