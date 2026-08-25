@@ -410,6 +410,42 @@ PUBLIC_API: Tuple[Export, ...] = (
         "sets the unaided horizon.",
     ),
     Export(
+        "WallMatcher", ".nav.walls", "navigation",
+        "Solves position and heading by matching radar wall returns to building footprints.",
+        "The map-relative fix: a prior (GNSS, manual pin, dead reckoning) plus the static "
+        "returns from radar_detections_all(). Read `accepted` and `ambiguous`, not just the pose.",
+    ),
+    Export(
+        "WallReturn", ".nav.walls", "navigation",
+        "One static radar return: range and azimuth (positive = right of boresight).",
+        "Build these from radar_detections_all() records with static_returns().",
+    ),
+    Export(
+        "PosePrior", ".nav.walls", "navigation",
+        "Where the rig believes it is before the walls are consulted, with sigmas.",
+        "Bounds the search; a rival street outside 3 sigma cannot win. Sigmas must be honest.",
+    ),
+    Export(
+        "WallFix", ".nav.walls", "navigation",
+        "The pose that best explains the returns, its sigmas, and whether to trust it.",
+        "`ambiguous` names the axis a single wall cannot pin; `on_boundary` says the prior lied.",
+    ),
+    Export(
+        "static_returns", ".nav.walls", "navigation",
+        "Filters radar_detections_all() records to wall returns: static, 0.5-40 m.",
+        "Feed the result to WallMatcher or PoseObservations.",
+    ),
+    Export(
+        "PoseObservations", ".stages.pose", "map",
+        "The pose stage's input: a PosePrior and the static wall returns.",
+        "Pass to MapInitializer(pose_observations=...) to make the pose_init stage run.",
+    ),
+    Export(
+        "InitialPose", ".stages.pose", "map",
+        "A map-relative pose with the sigmas that qualify it, as the pose stage publishes it.",
+        "Read from report.stage('pose_init').data['pose'].",
+    ),
+    Export(
         "HeadingMatcher", ".nav.heading", "navigation",
         "Recovers heading by matching observed edge bearings against the map.",
         "The only correction heading has. A prior narrows the search and, more "

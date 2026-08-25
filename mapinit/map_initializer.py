@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from .geo.dem import DemSampler, EgoAltitudePrior, GroundEstimate
     from .geo.geoid import GeoidModel
     from .geo.providers import BasePriorDataProvider, PriorPaths
+    from .stages.pose import PoseObservations
 
 
 class MapInitializer:
@@ -39,6 +40,7 @@ class MapInitializer:
         expected_geoid_range: Optional[Tuple[float, float]] = None,
         prior_provider: Optional["BasePriorDataProvider"] = None,
         constraints: "Optional[list[CalibrationConstraint]]" = None,
+        pose_observations: "Optional[PoseObservations]" = None,
     ) -> None:
         self.context = InitContext(
             latitude=latitude,
@@ -48,6 +50,7 @@ class MapInitializer:
             **({"repo_dir": repo_dir} if repo_dir is not None else {}),
         )
         self._constraints = list(constraints or [])
+        self._pose_observations = pose_observations
         self._geoid: Optional["GeoidModel"] = None
 
     # -- geoid ------------------------------------------------------------
@@ -157,14 +160,14 @@ class MapInitializer:
         from .stages.pose import PoseInitStage
         from .stages.priors import PriorsStage
 
-        # PoseInitStage is unimplemented and reports itself skipped. It is
+        # PoseInitStage reports itself skipped without observations. It is
         # registered rather than omitted so a consumer asking for it gets that
-        # answer instead of a KeyError, which reads as a broken report rather
-        # than as work that has not been done yet. Appended last: the relative
-        # order of geoid, priors and calibration is fixed by the interface
-        # contract, and appending leaves it untouched.
+        # answer instead of a KeyError. Appended last: it consumes what priors
+        # published, and the relative order of geoid, priors and calibration is
+        # fixed by the interface contract.
         return InitializationPipeline(
-            [GeoidStage(), PriorsStage(), CalibrationStage(self._constraints), PoseInitStage()]
+            [GeoidStage(), PriorsStage(), CalibrationStage(self._constraints),
+             PoseInitStage(self._pose_observations)]
         )
 
     def run(self, fail_fast: bool = True) -> InitReport:

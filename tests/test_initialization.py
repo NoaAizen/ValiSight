@@ -441,9 +441,9 @@ def test_skipped_stages_do_not_fail_the_run():
     assert report.stage("pose_init").status is StageStatus.SKIPPED
 
 
-def test_pose_solve_is_explicit_about_being_unimplemented():
-    with pytest.raises(NotImplementedError, match="not been designed"):
-        PoseInitStage().solve(InitContext(*JERUSALEM))
+def test_pose_stage_without_observations_skips_and_names_what_it_needs():
+    reason = PoseInitStage().skip_reason(InitContext(*JERUSALEM))
+    assert reason is not None and "PoseObservations" in reason
 
 
 def test_report_summary_names_the_failure():
