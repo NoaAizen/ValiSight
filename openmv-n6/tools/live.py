@@ -2648,6 +2648,22 @@ body.field aside,body.field #notes{display:none}
    is 55vh of height at this 1.6 aspect. */
 #wrap{position:relative;line-height:0;align-self:start;border:1px solid var(--line);
 border-radius:8px;overflow:hidden;background:#000;width:min(100%,1024px,88vh)}
+/* The picture and the map, side by side. The picture says what is out there;
+   the map says where the rig was standing while it said it, and reading one
+   against the other is the whole point of the map layer - it cannot be done
+   with the map in the sidebar under four scrolls of numbers. The map keeps a
+   fixed column rather than matching the picture's height: square at 55vh it
+   would be wider than the picture it sits beside. It wraps under on a narrow
+   window, where a 250px map is worse than no map. */
+#viewrow{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;min-width:0}
+#wrap{flex:0 1 auto}
+#mapside{display:none;flex:0 1 320px;min-width:250px;flex-direction:column;gap:8px;
+background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}
+#mapside.on{display:flex}
+#mapside h5{margin:0;font-size:10.5px;font-weight:650;letter-spacing:.11em;
+color:var(--dim);text-transform:uppercase}
+#mapside canvas{width:100%;aspect-ratio:1;background:#0a0c0e;
+border:1px solid var(--line);border-radius:6px}
 img{display:block;width:100%;height:auto}
 #ovl{position:absolute;inset:0;pointer-events:none}
 #read{position:absolute;padding:4px 8px;background:#000000d9;border:1px solid #5a636b;
@@ -2798,11 +2814,25 @@ padding:1px 5px;color:var(--dim);background:var(--panel2)}
 
 <div id=main>
   <div id=stage>
-    <div id=wrap>
-      <img id=im src="/stream">
-      <svg id=ovl viewBox="0 0 640 400" preserveAspectRatio=none></svg>
-      <div id=read></div>
-      <div id=probes></div>
+    <div id=viewrow>
+      <div id=wrap>
+        <img id=im src="/stream">
+        <svg id=ovl viewBox="0 0 640 400" preserveAspectRatio=none></svg>
+        <div id=read></div>
+        <div id=probes></div>
+      </div>
+
+      <!-- Shown only when live.py was started with --map: without the layer the
+           canvas has nothing to draw and an empty square beside the picture
+           reads as a broken map rather than an absent one. -->
+      <div id=mapside>
+        <h5>map &middot; top-down</h5>
+        <canvas id=topdown width=420 height=420></canvas>
+        <div class=hintline>north up, 60 m: <b style=color:#9aa>map walls</b>,
+          <b style=color:var(--warn)>returns at the prior</b>,
+          <b style=color:#5cf>returns at the fix</b>. If the amber dots are not on
+          grey lines, the prior is wrong; if the blue ones are not, the fix is.</div>
+      </div>
     </div>
     <div class=detrow id=dets></div>
     <div id=clock>
@@ -2924,17 +2954,12 @@ SOC</div>
           <button id=btn_fix class=btn>fix from walls</button>
           <span class=sub id=m_fixage></span>
         </div>
-        <canvas id=topdown width=300 height=300
-          style="width:100%;aspect-ratio:1;background:#0a0c0e;border:1px solid var(--line);border-radius:6px"></canvas>
-        <div class=hintline>top-down, north up, 60 m: <b style=color:#9aa>map walls</b>,
-          <b style=color:var(--warn)>returns at the prior</b>,
-          <b style=color:#5cf>returns at the fix</b>. If the amber dots are not on
-          grey lines, the prior is wrong; if the blue ones are not, the fix is.</div>
         <div class=hintline>orthometric heights against EGM2008 for the
           <b>--map</b> position. <i>calibration</i> is skipped without
           constraints; <i>pose_init</i> at startup is skipped because the
-          radar has not reported yet &mdash; <b>fix from walls</b> below runs
-          it on the live returns. Full JSON on
+          radar has not reported yet &mdash; <b>fix from walls</b> runs
+          it on the live returns, and the top-down beside the picture is
+          where you check the answer. Full JSON on
           <a href=/map target=_blank>/map</a>.</div>
       </div>
     </div>
@@ -3387,9 +3412,10 @@ function initControls(cfg) {
 }
 
 function drawMap(m) {
-  const card = $('mapcard');
-  if (!m) { card.style.display = 'none'; return; }
+  const card = $('mapcard'), side = $('mapside');
+  if (!m) { card.style.display = 'none'; side.className = ''; return; }
   card.style.display = '';
+  side.className = 'on';
   const num = (v, u, f) => (v === null || v === undefined) ? '\u2013'
       : v.toFixed(f) + '<span class=u> ' + u + '</span>';
   const loc = m.location ? m.location.latitude_deg.toFixed(5) + ', '
