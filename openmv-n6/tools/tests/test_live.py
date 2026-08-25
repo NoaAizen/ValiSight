@@ -670,6 +670,46 @@ def lock_mode():
           len(tk.confirmed(end)) == 1 and tk.suppressed(end) == [],
           "moved %.0f px" % tk.all()[0].moved)
 
+    # --- the rig turns. Every box in the picture moves; none of it is news
+    # about anybody. Without the ego term a slow sweep past the same warm door
+    # accumulates displacement and vouches for it as a person - the vouched
+    # rule inverted by a pan.
+    PAN = 9.0                       # px per frame, ~80 px/s: an unhurried sweep
+    tk_blind, tk_told = tracking.Tracker(), tracking.Tracker()
+    now = 7000.0
+    for i in range(40):
+        t = now + i * 0.114
+        door = {"x": 300 + i * PAN, "y": 120, "w": 90, "h": 200,
+                "conf": 0.95, "src": "thermal"}
+        tk_blind.update([dict(door)], t)
+        tk_told.update([dict(door)], t, ego=(PAN, 0.0))
+    end = now + 40 * 0.114
+    check("a rig sweeping past a warm door used to invent a person out of it",
+          len(tk_blind.confirmed(end)) == 1,
+          "%d drawn" % len(tk_blind.confirmed(end)))
+    check("told what the rig did, the door is still a door",
+          tk_told.confirmed(end) == [] and len(tk_told.suppressed(end)) == 1,
+          "%d drawn, moved %.1f px" % (len(tk_told.confirmed(end)),
+              tk_told.suppressed(end)[0].as_dict(end)["moved_px"]
+              if tk_told.suppressed(end) else -1))
+
+    # ...and a real walker seen from a turning rig is still one person, with
+    # the pan taken out of their velocity rather than added to it.
+    tk = tracking.Tracker()
+    for i in range(12):
+        # 12 px of walking on top of 9 px of pan: what the camera sees is 21.
+        tk.update([{"x": 100 + i * 21.0, "y": 120, "w": 60, "h": 180,
+                    "conf": 0.9, "src": "det"}], now + i * 0.114, ego=(PAN, 0.0))
+    held = tk.confirmed(now + 12 * 0.114)
+    check("a walker seen from a turning rig stays one track",
+          len(held) == 1 and held[0].hits == 12,
+          "%d track(s)" % len(held))
+    check("their velocity is their own walking, not the sweep",
+          held and abs(held[0].vx - 12.0 / 0.114) < 0.35 * (12.0 / 0.114),
+          "vx %.0f px/s, walking is %.0f" % (held[0].vx if held else 0,
+                                             12.0 / 0.114))
+
+
     # The detector is trusted on sight: it knows a door from a person, and a
     # person standing still must not need to walk to be believed.
     tk = tracking.Tracker()

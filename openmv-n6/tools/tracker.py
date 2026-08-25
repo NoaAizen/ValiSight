@@ -183,14 +183,41 @@ class Track:
         return "det" in self.ever or self.moved >= max(STATIC_PX,
                                                        STATIC_FRAC * self.w)
 
-    def predict(self, now):
-        """Carry the box forward on its own velocity. Cheap and bounded."""
+    def predict(self, now, du=0.0, dv=0.0):
+        """Carry the box forward on its own velocity, then on the rig's.
+
+        Two motions land on the same pixels and mean opposite things. A person
+        crossing the frame is the thing this exists to follow; the rig panning
+        moves that person, the doorway behind them and every other pixel by the
+        same amount, and is not evidence about anybody.
+
+        Applying the rig's share to the STATE rather than to the measurement is
+        what keeps the rest of the class honest for free: the residual in
+        correct() is then already target-relative, so velocity never learns the
+        pan and cannot coast a track off-screen when the pan stops. The birth
+        centre travels with it for the same reason - `moved` asks whether this
+        thing has gone anywhere, and under a pan everything in the picture
+        "goes" somewhere. Without this a slow sweep past a warm door vouches
+        for the door as a person, which is precisely the failure the vouched
+        rule was written to prevent.
+
+        (du, dv) is where a pixel that is standing still in the world lands
+        between the previous cycle and this one. Zero, the default, is the
+        rig-is-bolted-down assumption this ran on before there was anything to
+        measure it with.
+        """
         dt = now - self.last_move
         self.last_move = now
-        if dt <= 0 or dt > MAX_COAST_S:
-            return
-        self.x += self.vx * dt
-        self.y += self.vy * dt
+        if 0.0 < dt <= MAX_COAST_S:
+            self.x += self.vx * dt
+            self.y += self.vy * dt
+        # Outside that window the velocity carry is refused but the rig's
+        # motion still happened, so this is not part of the same guard.
+        if du or dv:
+            self.x += du
+            self.y += dv
+            self.cx0 += du
+            self.cy0 += dv
 
     def correct(self, obs, now):
         dt = max(1e-3, now - self.last_seen)
@@ -248,16 +275,22 @@ class Tracker:
         self._tracks = []
         self._next_id = 1
 
-    def update(self, obs, now):
+    def update(self, obs, now, ego=None):
         """Fold one cycle's observations in. Returns the confirmed tracks.
 
         `obs` is a list of {x, y, w, h, conf, src} - src naming the sensor, and
         optionally radar_m / max_c to carry along. An empty list is a normal
         call and not a no-op: it is how a track learns it was missed.
+
+        `ego` is (du, dv): the pixels a point standing still in the world moved
+        between the last cycle and this one, because the rig turned. None means
+        nobody measured it, which is not the same as "it was zero" - it is the
+        assumption this ran on before, and the caller that can do better should.
         """
         obs = merge(obs)
+        du, dv = ego or (0.0, 0.0)
         for t in self._tracks:
-            t.predict(now)
+            t.predict(now, du, dv)
             t.sources = set()
 
         pairs = []
