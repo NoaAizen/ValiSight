@@ -26,14 +26,62 @@ from perception.student_data import (
 EPS = 1e-6
 
 
+def augment_thermal_seq(seq, rng, max_offset_c=10.0,
+                        gain_range=(0.92, 1.08)):
+    """Make the student invariant to AMBIENT temperature, not to people.
+
+    The absolute-Celsius channels are normalised by one global mean/std taken
+    from the training set, whose backgrounds all sit in 25-32 C. A 22 C dark
+    room and 32.5 C sun-warmed ground both land outside everything the model
+    ever saw, and it answers with its prior instead of with the picture -
+    measured: full-frame boxes at conf 1.00 in both. A random offset and a
+    mild contrast gain, drawn ONCE for the whole three-frame history because
+    ambient shift is a property of the scene rather than of a frame, teach
+    that the offset carries no information. A person stays warmer than what
+    is behind them either way, and that difference is what should decide.
+    """
+    seq = np.asarray(seq, np.float32)
+    centre = float(seq.mean())
+    return ((seq - centre) * float(rng.uniform(*gain_range)) + centre
+            + float(rng.uniform(-max_offset_c, max_offset_c)))
+
+
+def augment_radar_points(points, n_points, rng, drop_p=0.15, min_keep=3,
+                         pos_sigma_m=0.05, db_sigma=1.0):
+    """Point-level jitter: the same person yields a different point set on
+    every pass, so the student must not key on an exact constellation.
+
+    Points are dropped and compacted rather than zeroed - n_radar is what
+    marks a row valid downstream, and a zeroed row left inside the count is
+    a phantom detection at the origin. Velocity is never jittered: doppler is
+    the one channel that separates a person from furniture.
+    """
+    pts = np.array(points, np.float32, copy=True)
+    n = int(n_points)
+    if n > min_keep and rng.random() < 0.5:
+        keep = rng.random(n) >= drop_p
+        if int(keep.sum()) >= min_keep:
+            kept = pts[:n][keep]
+            pts[:] = 0.0
+            pts[:len(kept)] = kept
+            n = int(len(kept))
+    if n:
+        pts[:n, 0:3] += rng.normal(0.0, pos_sigma_m, (n, 3))
+        pts[:n, 4] += rng.normal(0.0, db_sigma, n)
+        pts[:n, 5] += rng.normal(0.0, db_sigma, n)
+    return pts, n
+
+
 class StudentDataset(Dataset):
     """Lazy three-frame histories over an in-memory exported split."""
 
     def __init__(self, split: LoadedSplit, plane: str, max_objects: int = 8,
-                 supervised_only: bool = True):
+                 supervised_only: bool = True, augment: bool = False):
         self.split = split
         self.plane = plane
         self.max_objects = int(max_objects)
+        self.augment = bool(augment)
+        self._worker_rng = None
         state_key = ("thermal_label_state" if plane == "thermal"
                      else "radar_label_state")
         state = split.arrays[state_key]
@@ -61,6 +109,14 @@ class StudentDataset(Dataset):
     def __len__(self):
         return len(self.indices)
 
+    @property
+    def rng(self):
+        # Built on first use so each DataLoader worker draws its own stream;
+        # a shared seed would hand every worker identical "random" offsets.
+        if self._worker_rng is None:
+            self._worker_rng = np.random.default_rng()
+        return self._worker_rng
+
     @staticmethod
     def _tensor(x, dtype=None):
         t = torch.from_numpy(np.ascontiguousarray(x)) if isinstance(x, np.ndarray) \
@@ -84,6 +140,8 @@ class StudentDataset(Dataset):
 
         if self.plane == "thermal":
             seq, valid = s.sequence("thermal", i)
+            if self.augment:
+                seq = augment_thermal_seq(seq, self.rng)
             item.update({
                 "thermal_seq": self._tensor(seq, torch.float32),
                 "valid_prev1": torch.tensor(valid[1], dtype=torch.float32),
@@ -93,9 +151,12 @@ class StudentDataset(Dataset):
             })
             return item
 
+        pts, n_pts = a["radar"][i], int(a["n_radar"][i])
+        if self.augment:
+            pts, n_pts = augment_radar_points(pts, n_pts, self.rng)
         item.update({
-            "radar_points": self._tensor(a["radar"][i], torch.float32),
-            "n_radar": torch.tensor(int(a["n_radar"][i]), dtype=torch.long),
+            "radar_points": self._tensor(pts, torch.float32),
+            "n_radar": torch.tensor(n_pts, dtype=torch.long),
         })
         for key, prefix, valid_key in (
             ("range_angle", "ra", "ra_valid"),
@@ -756,9 +817,12 @@ def train_model(model, train_loader, val_loader, image_width, image_height,
 
 
 def build_loaders(train_split, val_split, plane, max_objects=8,
-                  batch_size=32, num_workers=2):
+                  batch_size=32, num_workers=2, augment=True):
+    # Augmentation is a training-set property: the val split has to stay the
+    # same measurement run after run, or "it improved" means nothing.
     train_ds = StudentDataset(
-        train_split, plane, max_objects, supervised_only=True)
+        train_split, plane, max_objects, supervised_only=True,
+        augment=augment)
     val_ds = StudentDataset(
         val_split, plane, max_objects, supervised_only=True)
     kwargs = dict(batch_size=batch_size, num_workers=num_workers,

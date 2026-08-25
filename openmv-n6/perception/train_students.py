@@ -87,6 +87,11 @@ def main():
     ap.add_argument("--device", default="auto",
                     help="auto, cpu, cuda or a torch device such as cuda:0")
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--no-augment", action="store_true",
+                    help="train on the frames exactly as exported. The default "
+                         "jitters ambient temperature and the radar point set, "
+                         "which is what stops a 10 C change of scene from "
+                         "collapsing the thermal student")
     ap.add_argument("--negative-weight", default="auto",
                     help="loss weight for verified-empty frames: 'auto' "
                          "balances them against positives (capped at 20), a "
@@ -157,7 +162,7 @@ def main():
         model.derived.disable_channels(disabled)
         train_loader, val_loader = build_loaders(
             train, val, "thermal", args.max_objects,
-            args.batch_size, args.workers)
+            args.batch_size, args.workers, augment=not args.no_augment)
         resume = os.path.join(out_dir, "thermal_resume.pt")
         model, metrics = train_model(
             model, train_loader, val_loader, 160, 120, device,
@@ -201,7 +206,7 @@ def main():
 
         train_loader, val_loader = build_loaders(
             train, val, "radar", args.max_objects,
-            args.batch_size, args.workers)
+            args.batch_size, args.workers, augment=not args.no_augment)
         resume = os.path.join(out_dir, "radar_resume.pt")
         model, metrics = train_model(
             model, train_loader, val_loader, 640, 400, device,
