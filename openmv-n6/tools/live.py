@@ -2339,6 +2339,9 @@ def ui_payload(pipe, state, now):
         # Cached inside Soc for 0.4s, so health() above and this share one sample
         # rather than each taking a delta over a near-zero interval.
         "soc": state["soc"].read() if state.get("soc") else None,
+        # Yael's map layer (perception.map_api contract). None without --map;
+        # the page hides the card. Small and already JSON-safe, so sent whole.
+        "map": state.get("map"),
         "cfg": {
             "gain": c.detail_gain, "eps": c.gf_eps, "radius": c.gf_radius,
             "agc": c.agc_permille, "palette": pipe.palette_name, "view": pipe.view,
@@ -2536,6 +2539,7 @@ width:22px;height:20px;border-radius:4px;cursor:pointer;font:12px var(--mono);li
 padding:10px 14px;display:flex;align-items:flex-start;gap:14px 20px;flex-wrap:wrap}
 .tag{font:10px/1.3 var(--mono);letter-spacing:.1em;color:var(--dimmer);border:1px solid var(--line);
 border-radius:4px;padding:3px 6px;align-self:center;white-space:pre}
+.kvrow{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;margin-bottom:6px}
 .kv{display:flex;flex-direction:column;gap:1px;font-family:var(--mono)}
 .kv em{font-style:normal;font-size:10px;letter-spacing:.07em;color:var(--dim);text-transform:uppercase}
 .kv b{font-size:14px;font-weight:600}
@@ -2709,6 +2713,24 @@ SOC</div>
         <div class=nudge id=nudge></div>
         <div class=hintline>the whisker is the honest width of the elevation
           uncertainty &mdash; the bare dot flatters a two-element aperture</div>
+      </div>
+    </div>
+
+    <div class=card id=mapcard style=display:none>
+      <h4>map <span class=k>yael / mapinit</span></h4>
+      <div class=body>
+        <div class=kvrow>
+          <div class=kv><em>geoid</em><b id=m_geoid>&ndash;</b></div>
+          <div class=kv><em>ground</em><b id=m_ground>&ndash;</b></div>
+          <div class=kv><em>surface</em><b id=m_surface>&ndash;</b></div>
+          <div class=kv><em>ego alt &sigma;</em><b id=m_sigma>&ndash;</b></div>
+        </div>
+        <div class=hintline id=m_stages></div>
+        <div class=hintline id=m_text></div>
+        <div class=hintline>orthometric heights against EGM2008 for the
+          <b>--map</b> position. <i>skipped</i> stages are not implemented on
+          Yael's side yet (pose_init = position from the map). Full JSON on
+          <a href=/map target=_blank>/map</a>.</div>
       </div>
     </div>
 
@@ -3048,6 +3070,7 @@ const GROUPS = [
   ['measurement', ['registration','coverage','range','clipping','agc','emissivity']],
   ['perception', ['detect','radar','ai','recording']],
   ['host', ['host cpu','host memory','host thermal','host power']],
+  ['map', ['map']],
 ];
 const RANK = {ok: 0, warn: 1, fail: 2}, LVL = ['ok','warn','fail'];
 // Which groups the operator has opened by hand. Rebuilding the panel every
@@ -3128,6 +3151,30 @@ function initControls(cfg) {
   inited = true;
 }
 
+function drawMap(m) {
+  const card = $('mapcard');
+  if (!m) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const num = (v, u, f) => (v === null || v === undefined) ? '\u2013'
+      : v.toFixed(f) + '<span class=u> ' + u + '</span>';
+  const loc = m.location ? m.location.latitude_deg.toFixed(5) + ', '
+      + m.location.longitude_deg.toFixed(5) : '';
+  if (m.pending) {
+    $('m_stages').textContent = 'initialising at ' + loc + ' \u2026';
+    $('m_text').textContent = '';
+    return;
+  }
+  const g = m.geoid || {}, pr = m.priors || {}, alt = m.ego_altitude_prior || {};
+  $('m_geoid').innerHTML = num(g.undulation_m, 'm', 2);
+  $('m_ground').innerHTML = num(pr.ground_elevation_m, 'm', 1);
+  $('m_surface').innerHTML = num(pr.surface_elevation_m, 'm', 1);
+  $('m_sigma').innerHTML = num(alt.sigma_m, 'm', 1);
+  const st = (m.stages || []).map(s => s.name + ': ' + s.status).join(' \u00b7 ');
+  $('m_stages').innerHTML = (m.ok ? '<b>ok</b> ' : '<b style=color:var(--warn)>FAILED</b> ')
+      + esc(loc) + (st ? ' \u2014 ' + esc(st) : '');
+  $('m_text').textContent = m.error ? m.error
+      : (pr.overture_path ? 'buildings: ' + pr.overture_path.split('/').pop() : '');
+}
 async function poll() {
   let d;
   try {
@@ -3166,6 +3213,7 @@ async function poll() {
   if (document.activeElement !== $('poseid')) applyPose(d.pose);
 
   drawHealth(d.checks);
+  drawMap(d.map);
 
   // --- the clock and the traces
   const t = d.timing;
