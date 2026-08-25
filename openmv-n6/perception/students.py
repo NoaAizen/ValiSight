@@ -539,7 +539,7 @@ class RadarStudent(nn.Module):
 
 
 def detection_loss(output, batch, lambda_center=3.0, lambda_box=1.0,
-                   lambda_object=1.0):
+                   lambda_object=1.0, negative_weight=1.0):
     pred_obj, pred_boxes = output["object_logits"], output["boxes"]
     presence = batch["gt_presence"]
     gt_boxes = batch["gt_boxes"]
@@ -549,6 +549,14 @@ def detection_loss(output, batch, lambda_center=3.0, lambda_box=1.0,
 
     object_targets = torch.zeros_like(pred_obj)
     object_weights = (states >= 0).float().view(-1, 1).expand_as(pred_obj).clone()
+    # Verified-empty frames are rare (v3: 17 positive frames per negative), and
+    # an unweighted loss is minimised by calling "person" always - measured on
+    # v3's first radar run: recall .99 but a 88% false-positive rate on the
+    # held-out empty session. Scale the only frames that carry "there is nobody
+    # here" so the two classes contribute comparably.
+    if negative_weight != 1.0:
+        neg = (states == LABEL_NEGATIVE).float().view(-1, 1)
+        object_weights = object_weights * (1.0 + (negative_weight - 1.0) * neg)
     total_center = pred_obj.new_tensor(0.0)
     total_box = pred_obj.new_tensor(0.0)
     box_weight_sum = pred_obj.new_tensor(0.0)
@@ -647,7 +655,7 @@ def evaluate_model(model, loader, image_width, image_height, device,
 def train_model(model, train_loader, val_loader, image_width, image_height,
                 device, epochs=50, learning_rate=1e-3,
                 weight_decay=1e-4, use_amp=True, tag="student",
-                resume_path=None):
+                resume_path=None, negative_weight=1.0):
     model = model.to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -684,7 +692,8 @@ def train_model(model, train_loader, val_loader, image_width, image_height,
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 output = model(batch)
-                losses = detection_loss(output, batch)
+                losses = detection_loss(output, batch,
+                                        negative_weight=negative_weight)
             scaler.scale(losses["total"]).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)

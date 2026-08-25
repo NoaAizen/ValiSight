@@ -87,6 +87,11 @@ def main():
     ap.add_argument("--device", default="auto",
                     help="auto, cpu, cuda or a torch device such as cuda:0")
     ap.add_argument("--no-amp", action="store_true")
+    ap.add_argument("--negative-weight", default="auto",
+                    help="loss weight for verified-empty frames: 'auto' "
+                         "balances them against positives (capped at 20), a "
+                         "number sets it outright, 1 restores the unweighted "
+                         "loss that learns to always answer 'person'")
     ap.add_argument("--disable-thermal", default="",
                     help="comma-separated derived thermal channels")
     ap.add_argument("--disable-radar-family", action="append", default=[],
@@ -115,6 +120,24 @@ def main():
         raise SystemExit("CUDA requested but torch.cuda.is_available() is false")
 
     manifest, train, val = load_train_val(args.data, args.max_dt_ms)
+
+    def negative_weight_for(plane):
+        """Balance verified-empty frames against positives, or take the flag."""
+        if args.negative_weight != "auto":
+            return float(args.negative_weight)
+        state = train.arrays["thermal_label_state" if plane == "thermal"
+                             else "radar_label_state"]
+        n_pos = int((state == 1).sum())
+        n_neg = int((state == 0).sum())
+        if n_neg == 0:
+            print(f"[{plane}] no verified-negative frames - negative weight 1.0 "
+                  f"(the model cannot be taught what empty looks like; record "
+                  f"an empty session and export it with --verified-negative)")
+            return 1.0
+        w = min(n_pos / n_neg, 20.0)
+        print(f"[{plane}] {n_pos} positive vs {n_neg} verified-empty frames "
+              f"-> negative weight {w:.1f}")
+        return w
     out_dir = args.out or os.path.join(args.data, "models")
     os.makedirs(out_dir, exist_ok=True)
     print(f"device: {device}")
@@ -140,7 +163,8 @@ def main():
             model, train_loader, val_loader, 160, 120, device,
             epochs=args.epochs, learning_rate=args.learning_rate,
             weight_decay=args.weight_decay, use_amp=not args.no_amp,
-            tag="THERMAL", resume_path=resume)
+            tag="THERMAL", resume_path=resume,
+            negative_weight=negative_weight_for("thermal"))
         path = os.path.join(out_dir, "thermal_student.pt")
         torch.save(checkpoint_payload(
             model, metrics, manifest, args, {
@@ -183,7 +207,8 @@ def main():
             model, train_loader, val_loader, 640, 400, device,
             epochs=args.epochs, learning_rate=args.learning_rate,
             weight_decay=args.weight_decay, use_amp=not args.no_amp,
-            tag="RADAR", resume_path=resume)
+            tag="RADAR", resume_path=resume,
+            negative_weight=negative_weight_for("radar"))
         path = os.path.join(out_dir, "radar_student.pt")
         torch.save(checkpoint_payload(
             model, metrics, manifest, args, {
