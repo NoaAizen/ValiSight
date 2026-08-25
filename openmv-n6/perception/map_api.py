@@ -75,6 +75,15 @@ class MapInitRequest:
     longitude: float
     expected_geoid_range_m: Optional[Tuple[float, float]] = None
     repo_dir: Optional[Path] = None
+    #: Pose observations, optional. When both are given the pose_init stage
+    #: runs: a heading prior (compass degrees) with the prior's sigmas, and
+    #: the static radar returns as (range_m, azimuth_deg) pairs, azimuth
+    #: positive to the right of boresight, as radar_detections_all() reports.
+    heading_prior_deg: Optional[float] = None
+    sigma_position_m: float = 5.0
+    sigma_heading_deg: float = 5.0
+    wall_returns: Optional[Tuple[Tuple[float, float], ...]] = None
+    prior_source: str = "manual_pin"
 
     def __post_init__(self) -> None:
         latitude = float(self.latitude)
@@ -91,6 +100,18 @@ class MapInitRequest:
             low, high = (float(expected[0]), float(expected[1]))
             if not math.isfinite(low) or not math.isfinite(high) or low > high:
                 raise ValueError("expected_geoid_range_m must be finite with low <= high")
+        if self.heading_prior_deg is not None and not math.isfinite(float(self.heading_prior_deg)):
+            raise ValueError("heading_prior_deg must be finite")
+        if not (self.sigma_position_m > 0 and self.sigma_heading_deg > 0):
+            raise ValueError("prior sigmas must be positive")
+        if self.wall_returns is not None:
+            for pair in self.wall_returns:
+                if len(pair) != 2 or not all(math.isfinite(float(v)) for v in pair):
+                    raise ValueError("wall_returns must be finite (range_m, azimuth_deg) pairs")
+
+    @property
+    def has_pose_observations(self) -> bool:
+        return self.heading_prior_deg is not None and bool(self.wall_returns)
 
 
 def locate_mapinit(explicit: Optional[Path] = None) -> Optional[Path]:
@@ -128,7 +149,11 @@ def _prepend_path(root: Path) -> None:
 
 
 def _public_map_initializer(mapinit_dir: Optional[Path] = None) -> Callable[..., Any]:
-    """Load only the public object promised by Yael's branch."""
+    """Load only the public object promised by the map package."""
+    return _public_name("MapInitializer", mapinit_dir)
+
+
+def _public_name(name: str, mapinit_dir: Optional[Path] = None) -> Callable[..., Any]:
     located = locate_mapinit(mapinit_dir)
     try:
         module = importlib.import_module("mapinit")
@@ -143,10 +168,59 @@ def _public_map_initializer(mapinit_dir: Optional[Path] = None) -> Callable[...,
             + ("" if located is None else f" (found {located} but import failed)")
         ) from exc
 
-    initializer = getattr(module, "MapInitializer", None)
-    if initializer is None or not callable(initializer):
-        raise MapAPIContractError("mapinit must export callable MapInitializer")
-    return initializer
+    obj = getattr(module, name, None)
+    if obj is None or not callable(obj):
+        raise MapAPIContractError(f"mapinit must export callable {name}")
+    return obj
+
+
+def pose_observations(request: MapInitRequest, mapinit_dir: Optional[Path] = None) -> Any:
+    """Build mapinit's PoseObservations from a request, or None without observations."""
+    if not request.has_pose_observations:
+        return None
+    PoseObservations = _public_name("PoseObservations", mapinit_dir)
+    PosePrior = _public_name("PosePrior", mapinit_dir)
+    WallReturn = _public_name("WallReturn", mapinit_dir)
+    prior = PosePrior(
+        latitude=float(request.latitude), longitude=float(request.longitude),
+        heading_deg=float(request.heading_prior_deg) % 360.0,
+        sigma_position_m=float(request.sigma_position_m),
+        sigma_heading_deg=float(request.sigma_heading_deg),
+        source=str(request.prior_source),
+    )
+    returns = tuple(WallReturn(float(r), float(a)) for r, a in request.wall_returns)
+    return PoseObservations(prior=prior, wall_returns=returns)
+
+
+def _pose_json(pose_data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """The pose stage's output as primitives: the pose, and whether to trust it."""
+    if not pose_data or pose_data.get("pose") is None:
+        return None
+    pose, fix = pose_data["pose"], pose_data.get("fix")
+    out: Dict[str, Any] = {
+        "latitude_deg": _finite(_require(pose, "latitude", "InitialPose")),
+        "longitude_deg": _finite(_require(pose, "longitude", "InitialPose")),
+        "height_m": _finite(getattr(pose, "height_m", None)),
+        "heading_deg": _finite(_require(pose, "yaw_deg", "InitialPose")),
+        "sigma_horizontal_m": _finite(getattr(pose, "sigma_horizontal_m", None)),
+        "sigma_vertical_m": _finite(getattr(pose, "sigma_vertical_m", None)),
+        "sigma_heading_deg": _finite(getattr(pose, "sigma_yaw_deg", None)),
+    }
+    if fix is not None:
+        out.update({
+            "accepted": bool(_require(fix, "accepted", "WallFix")),
+            "ambiguous": bool(getattr(fix, "ambiguous", False)),
+            "ambiguity_axis": getattr(fix, "ambiguity_axis", None),
+            "on_boundary": bool(getattr(fix, "on_boundary", False)),
+            "dx_m": _finite(getattr(fix, "dx_m", None)),
+            "dy_m": _finite(getattr(fix, "dy_m", None)),
+            "dyaw_deg": _finite(getattr(fix, "dyaw_deg", None)),
+            "score": _finite(getattr(fix, "score", None)),
+            "inlier_fraction": _finite(getattr(fix, "inlier_fraction", None)),
+            "n_returns": int(getattr(fix, "n_returns", 0)),
+            "n_edges": int(getattr(fix, "n_edges", 0)),
+        })
+    return out
 
 
 def _require(value: Any, attribute: str, owner: str) -> Any:
@@ -251,6 +325,12 @@ class MapInitializationAPI:
             kwargs["expected_geoid_range"] = tuple(request.expected_geoid_range_m)
         if request.repo_dir is not None:
             kwargs["repo_dir"] = Path(request.repo_dir)
+        if request.has_pose_observations:
+            kwargs["pose_observations"] = (
+                pose_observations(request, self._mapinit_dir)
+                if self._initializer_factory is None else
+                {"heading_prior_deg": request.heading_prior_deg,
+                 "wall_returns": list(request.wall_returns)})
 
         initializer = factory(**kwargs)
         run = _require(initializer, "run", "MapInitializer")
@@ -275,6 +355,7 @@ class MapInitializationAPI:
 
         geoid_data = _stage_data(results, "geoid")
         priors_data = _stage_data(results, "priors")
+        pose_data = _stage_data(results, "pose_init")
         response: Dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "ok": ok,
@@ -305,6 +386,7 @@ class MapInitializationAPI:
             "ego_altitude_prior": _altitude_json(
                 priors_data.get("ego_altitude_prior") if priors_data else None
             ),
+            "pose": _pose_json(pose_data),
             "stages": [_stage_json(stage) for stage in results],
             "summary": str(summary_method()),
         }
@@ -322,15 +404,33 @@ def main() -> None:
     parser.add_argument("--expect-geoid", nargs=2, type=float, metavar=("LOW", "HIGH"))
     parser.add_argument("--repo-dir", type=Path, default=None, help="Yael package data root")
     parser.add_argument("--diagnose", action="store_true", help="run all stages after a failure")
+    parser.add_argument("--heading", type=float, default=None, metavar="DEG",
+                        help="heading prior (compass); with --walls runs the pose_init stage")
+    parser.add_argument("--sigma-pos", type=float, default=5.0, metavar="M")
+    parser.add_argument("--sigma-heading", type=float, default=5.0, metavar="DEG")
+    parser.add_argument("--walls", type=Path, default=None, metavar="JSONL",
+                        help="radar.jsonl from record_radar_all.py; the static returns of "
+                             "the frame given by --frame become the wall observations")
+    parser.add_argument("--frame", type=int, default=-1, help="which frame of --walls (default last)")
     parser.add_argument("--mapinit-dir", type=Path, default=None,
                         help=f"directory containing Yael's mapinit/ (else ${MAPINIT_ENV} or the known layouts)")
     args = parser.parse_args()
 
+    walls = None
+    if args.walls is not None:
+        frames = [json.loads(line) for line in open(args.walls) if line.strip()]
+        dets = frames[args.frame]["detections"]
+        walls = tuple((d["range_m"], d["azimuth_deg"]) for d in dets
+                      if d.get("is_static", abs(d.get("velocity_mps", 0.0)) <= 0.25)
+                      and 0.5 <= d["range_m"] <= 40.0)
     request = MapInitRequest(
         latitude=args.lat,
         longitude=args.lon,
         expected_geoid_range_m=tuple(args.expect_geoid) if args.expect_geoid else None,
         repo_dir=args.repo_dir,
+        heading_prior_deg=args.heading,
+        sigma_position_m=args.sigma_pos, sigma_heading_deg=args.sigma_heading,
+        wall_returns=walls,
     )
     result = MapInitializationAPI(mapinit_dir=args.mapinit_dir).initialize(
         request, fail_fast=not args.diagnose)
