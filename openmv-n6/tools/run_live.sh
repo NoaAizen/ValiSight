@@ -4,7 +4,7 @@
 #   ./run_live.sh                     # operator view, person detection, radar on
 #   ./run_live.sh --view fused        # anything here is passed through to live.py
 #   ./run_live.sh --record captures/session1   # ...including recording
-#   ./run_live.sh --ai-channels fusion   # start with only the agreement channel
+#   ./run_live.sh --ai-channels thermal,radar,fusion  # show diagnostic evidence too
 #   ./run_live.sh --ai-channels none     # students loaded, nothing drawn
 #   ./run_live.sh --range 20:45          # override the students' training range
 #   NO_STUDENTS=1 ./run_live.sh          # do not load the students at all
@@ -55,6 +55,27 @@ find_port() {
 BOARD="$(find_port MicroPython '' || true)"
 RADAR_CLI="$(find_port Texas_Instruments 00 || true)"
 RADAR_DATA="$(find_port Texas_Instruments 03 || true)"
+
+# A cold N6 and the XDS110 hub do not enumerate atomically. A launcher that
+# samples /dev once makes an ordinary USB startup race look like unplugged
+# hardware, so wait a bounded time for all three identities. PORT_WAIT_S=0 is
+# available for diagnostics that want an immediate answer.
+PORT_WAIT_S="${PORT_WAIT_S:-20}"
+if { [ -z "$BOARD" ] || [ -z "$RADAR_CLI" ] || [ -z "$RADAR_DATA" ]; } \
+        && [ "$PORT_WAIT_S" -gt 0 ]; then
+    echo -n "waiting for N6 + radar USB"
+    for _ in $(seq "$PORT_WAIT_S"); do
+        sleep 1
+        BOARD="$(find_port MicroPython '' || true)"
+        RADAR_CLI="$(find_port Texas_Instruments 00 || true)"
+        RADAR_DATA="$(find_port Texas_Instruments 03 || true)"
+        if [ -n "$BOARD" ] && [ -n "$RADAR_CLI" ] && [ -n "$RADAR_DATA" ]; then
+            break
+        fi
+        echo -n .
+    done
+    echo
+fi
 
 [ -n "$BOARD" ]      || { echo "no MicroPython CDC port - is the N6 plugged in and out of DFU?" >&2; exit 1; }
 [ -n "$RADAR_DATA" ] || { echo "no XDS110 data port (interface 03) - is the IWR1843 powered?" >&2; exit 1; }
@@ -126,8 +147,13 @@ stop_viewer
 # The IWR1843 emits nothing at all until it is configured, so skipping this
 # makes a healthy radar look like a dead link.
 if [ "${SKIP_CFG:-0}" != "1" ]; then
-    echo "sending chirp config${RADAR_CFG:+ ($RADAR_CFG)}..."
-    python3 "$HERE/send_radar_cfg.py" ${RADAR_CFG:+"$RADAR_CFG"} --port "$RADAR_CLI" >/dev/null \
+    # Runtime/training data uses Mode P.  Do not inherit send_radar_cfg.py's
+    # standalone calibration default (radar_10hz.cfg): mixing those two chirp
+    # configurations changes the Doppler/range measurement and is rejected by
+    # the training provenance gate.
+    RADAR_CFG_PATH="${RADAR_CFG:-$ROOT/radar/configs/radar_people.cfg}"
+    echo "sending chirp config ($RADAR_CFG_PATH)..."
+    python3 "$HERE/send_radar_cfg.py" "$RADAR_CFG_PATH" --port "$RADAR_CLI" >/dev/null \
         || { echo "chirp config failed - rerun send_radar_cfg.py by hand to see why" >&2; exit 1; }
 fi
 
@@ -146,12 +172,35 @@ for a in "$@"; do
             exit 1;;
     esac
 done
+# Product profiles share one acquisition but deliberately do not share one
+# presentation:
+#   thermal         registered ironbow, bilinear display, 16-frame thermal IIR
+#   rgb_radar       honest PAG luma + raw radar (no thermal colour/detail)
+#   thermal_radar   the same smooth thermogram + raw radar
+#   fusion          operator fusion + radar; visible detail gets its own 8-frame
+#                   motion-adaptive filter so dark-camera noise is not sharpened
+#   ai              honest PAG luma + final tracks, with raw evidence hidden
+# compose_channel()/live_channels.py enforce the bases and overlays. The launch
+# arguments below supply the quality knobs shared by the profiles. Scene AGC
+# defaults to 56 permille (5.6% clipped at each end), measured by the operator
+# to make both ironbow and black-hot body structure substantially clearer. It
+# affects display tone only: student input, 16-bit shape splitting and reported
+# temperatures remain radiometric and therefore stable across scene changes.
+#
 # --radar-hfov 62.7 overrides live.py's 70 deg default with the measured value
 # (f = 525 px at 640 wide, caliper checkerboard against a tape measure).
 # It only matters as a fallback: when the solved calib below exists, its K
 # (and R,t and distortion) replace the guess entirely.
+ALLOW_DEGRADED="${ALLOW_DEGRADED:-0}"
+DETECT_ENGINE="$HOME/archive/radar/models/yolov10n_fp16.engine"
+if [ "$ALLOW_DEGRADED" != "1" ] && [ ! -s "$DETECT_ENGINE" ]; then
+    echo "missing RGB detector engine: $DETECT_ENGINE" >&2
+    echo "set ALLOW_DEGRADED=1 only if running intentionally without the full stack" >&2
+    exit 1
+fi
 ARGS=(-p "$BOARD" --radar "$RADAR_DATA" --radar-hfov 62.7
-      --detect person --view operator --http "$HTTP")
+      --detect person --channel fusion --view operator --agc 56 --thermal-frames 16
+      --y-knee 4 --y-frames 8 --http "$HTTP")
 
 # The solved radar<->RGB extrinsic of 2026-08-18 (full R with pitch, t from
 # caliper, K + distortion). Bootstrap._load() understands this schema and
@@ -160,6 +209,9 @@ CAL_SOLVED="$ROOT/calib-artifacts/radar_rgb_2026-08-18.json"
 if [ -f "$CAL_SOLVED" ]; then
     ARGS+=(--radar-calib "$CAL_SOLVED")
     echo "extrinsic   $CAL_SOLVED (solved R,t via --radar-calib)"
+elif [ "$ALLOW_DEGRADED" != "1" ]; then
+    echo "missing solved radar calibration: $CAL_SOLVED" >&2
+    exit 1
 fi
 
 # The thermal layer is stretched, not registered, until B2 is shot and solved;
@@ -170,18 +222,22 @@ if [ -f "$WARP" ]; then
     ARGS+=(--warp "$WARP")
     echo "warp        $WARP"
 else
-    echo "warp        none yet - thermal is stretched, temperatures read (unreg)"
+    if [ "$ALLOW_DEGRADED" != "1" ]; then
+        echo "missing calibrated thermal warp: $WARP" >&2
+        exit 1
+    fi
+    echo "warp        none - degraded mode, thermal is unregistered" >&2
 fi
 
 # --- the AI channels -------------------------------------------------------
-# The three student channels - thermal, radar, and the agreement between them -
-# are part of a normal launch, not something to remember to switch on. Two
+# The agreement channel is the normal launch; the raw thermal and radar student
+# channels remain one-click diagnostics. Two
 # things have to be true for them to mean anything, and neither can be decided
 # inside live.py:
 #
 #   --range 0:60  the thermal student was trained on Celsius at exactly this
-#                 scale - gexport v2's manifest carries c_per_lsb 60/255 and
-#                 tmin 0 for every one of its seven sessions. Auto-range hands
+#                 scale - gexport v6's manifest carries c_per_lsb 60/255 and
+#                 tmin 0 for every calibrated session. Auto-range hands
 #                 the model a scene-relative unit instead, which does not fail,
 #                 it just quietly detects worse. Pinning also puts c_per_lsb in
 #                 meta.json, which is what makes a recording exportable at all.
@@ -193,17 +249,18 @@ fi
 # Everything past that is live: the three channels switch from the page (keys
 # t, r, c) or over /set?ai_thermal=0&ai_radar=1&ai_fusion=1.
 # STUDENT_ENGINES picks the export whose engines the viewer loads; the default
-# is v2, the only one with engines built on this rig. Point it at another
-# export's models/ directory after building its engines with trtexec.
-STUDENT_DIR="${STUDENT_ENGINES:-$ROOT/perception/out/gexport/v2/models}"
-STUDENT_ENGINE="$STUDENT_DIR/thermal_student.engine"
+# is the currently deployed V6. Point it at another export's models/ directory
+# after building its engines with trtexec.
+STUDENT_DIR="${STUDENT_ENGINES:-$ROOT/perception/out/gexport/v6/models}"
+THERMAL_ENGINE="$STUDENT_DIR/thermal_student.engine"
+RADAR_ENGINE="$STUDENT_DIR/radar_student.engine"
 HAS_RANGE=0
 for a in "$@"; do
     case "$a" in --range|--range=*) HAS_RANGE=1;; esac
 done
 if [ "${NO_STUDENTS:-0}" = "1" ]; then
     echo "students   off (NO_STUDENTS=1)"
-elif [ -f "$STUDENT_ENGINE" ]; then
+elif [ -s "$THERMAL_ENGINE" ] && [ -s "$RADAR_ENGINE" ]; then
     ARGS+=(--students --students-dir "$STUDENT_DIR")
     if [ "$HAS_RANGE" = 0 ]; then
         ARGS+=(--range 0:60)
@@ -215,7 +272,13 @@ elif [ -f "$STUDENT_ENGINE" ]; then
     fi
     [ -f "$WARP" ] || echo "  no warp LUT: the thermal channel cannot be drawn and fusion cannot pair" >&2
 else
-    echo "students   none - $STUDENT_ENGINE is missing (build it with trtexec)" >&2
+    if [ "$ALLOW_DEGRADED" != "1" ]; then
+        echo "missing V6 student engine(s):" >&2
+        [ -s "$THERMAL_ENGINE" ] || echo "  $THERMAL_ENGINE" >&2
+        [ -s "$RADAR_ENGINE" ] || echo "  $RADAR_ENGINE" >&2
+        exit 1
+    fi
+    echo "students   unavailable - degraded mode" >&2
 fi
 
 # --- the map layer ---------------------------------------------------------
@@ -284,6 +347,14 @@ LOG="${LOG:-/tmp/live_radar.$(id -un).log}"
 nohup setsid python3 "$HERE/live.py" "${ARGS[@]}" "$@" >"$LOG" 2>&1 </dev/null &
 NEW_PID=$!
 echo "log         $LOG"
+LAUNCH_READY=0
+cleanup_failed_launch() {
+    if [ "$LAUNCH_READY" != "1" ] && kill -0 "$NEW_PID" 2>/dev/null; then
+        echo "stopping incomplete live.py launch (pid $NEW_PID)" >&2
+        kill -INT "$NEW_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup_failed_launch EXIT
 
 # Catch an immediate death - a bad flag, a missing weights file, a port still
 # held - before spending 45 s waiting for frames that will never come.
@@ -331,7 +402,103 @@ if [ "$UP" = 1 ]; then
     echo "live on http://localhost:$HTTP"
 else
     echo "stream did not come up in 70 s - check $LOG" >&2
+    tail -30 "$LOG" >&2
+    exit 1
 fi
+
+# "HTTP answered" is not the same as "the full system is ready". Verify the
+# components the default launcher promises, including inference actually
+# ticking and the map/top-down path that previously failed only after the page
+# was opened. Intentional reduced launches opt out through their existing env
+# switches rather than silently weakening the default contract.
+EXPECT_AI=1
+[ "${NO_STUDENTS:-0}" = "1" ] && EXPECT_AI=0
+EXPECT_MAP=1
+if [ "$MAP" = "none" ] || [ -z "$MAP" ]; then EXPECT_MAP=0; fi
+EXPECTED_AGC=56
+USER_ARGS=("$@")
+for ((i=0; i<${#USER_ARGS[@]}; i++)); do
+    case "${USER_ARGS[$i]}" in
+        --agc=*) EXPECTED_AGC="${USER_ARGS[$i]#--agc=}";;
+        --agc) if (( i + 1 < ${#USER_ARGS[@]} )); then EXPECTED_AGC="${USER_ARGS[$((i+1))]}"; fi;;
+    esac
+done
+python3 - "http://localhost:$HTTP" "$EXPECT_AI" "$EXPECT_MAP" "$EXPECTED_AGC" <<'PY'
+import json, sys, time
+from urllib.request import urlopen
+
+base = sys.argv[1]
+expect_ai, expect_map = bool(int(sys.argv[2])), bool(int(sys.argv[3]))
+expected_agc = int(sys.argv[4])
+deadline = time.time() + 30.0
+last = []
+while time.time() < deadline:
+    problems = []
+    try:
+        ui = json.load(urlopen(base + "/ui", timeout=3))
+        cfg = ui.get("cfg") or {}
+        checks = {c["name"]: c for c in ui.get("checks") or []}
+        if (checks.get("stream") or {}).get("level") != "ok":
+            problems.append("camera stream is not healthy")
+        for check in checks.values():
+            if check.get("level") == "fail":
+                problems.append("%s failed: %s" % (
+                    check.get("name", "unknown"), check.get("text", "")))
+        if not cfg.get("warped"):
+            problems.append("thermal warp is not calibrated")
+        if cfg.get("radar") is None:
+            problems.append("radar projection is unavailable")
+        if (ui.get("detections") or {}).get("age_s") is None:
+            problems.append("RGB detector has not produced a cycle")
+        if cfg.get("agc") != expected_agc:
+            problems.append("scene AGC is %r, expected %d" % (cfg.get("agc"), expected_agc))
+        if expect_ai:
+            ai = cfg.get("ai")
+            if ai is None:
+                problems.append("V6 student engines are unavailable")
+            else:
+                for name in ("thermal", "radar", "fusion"):
+                    if not (ai.get(name) or {}).get("ready"):
+                        problems.append("%s AI channel is not ready" % name)
+                if ai.get("age_s") is None:
+                    problems.append("student inference has not produced a cycle")
+                if ai.get("error"):
+                    problems.append("student inference error: %s" % ai["error"])
+                if not (ai.get("fusion") or {}).get("on"):
+                    problems.append("fusion AI channel is not enabled")
+            if not cfg.get("lock"):
+                problems.append("person lock is disabled")
+        if expect_map:
+            m = ui.get("map")
+            if m is None:
+                problems.append("map initialization has not answered")
+            elif not m.get("ok"):
+                problems.append("map initialization failed: %s" % m.get("summary", "unknown"))
+            else:
+                # The first call builds and caches footprint edges from the
+                # GeoJSON and takes ~4 s on this Jetson. A 3 s client timeout
+                # closed the socket while the server was still writing, which
+                # produced a scary but harmless BrokenPipe traceback during an
+                # otherwise successful launch.
+                td = json.load(urlopen(base + "/topdown", timeout=10))
+                if td.get("error"):
+                    problems.append("top-down failed: %s" % td["error"])
+                elif not td.get("edges"):
+                    problems.append("top-down has no building edges")
+    except Exception as exc:
+        problems = ["readiness query failed: %s: %s" % (type(exc).__name__, exc)]
+    if not problems:
+        print("ready       thermal + radar + RGB + V6 AI + lock + AGC %d" % expected_agc
+              + (" + map/top-down" if expect_map else ""))
+        break
+    last = problems
+    time.sleep(1)
+else:
+    print("full-stack readiness failed:", file=sys.stderr)
+    for problem in last:
+        print("  - " + problem, file=sys.stderr)
+    raise SystemExit(1)
+PY
 
 # A viewer that came up without its detector, or on the 10x-slower CPU
 # fallback, streams identically to a healthy one - say so here or it is
@@ -357,3 +524,5 @@ for c in d["checks"]:
     if c["level"] != "ok":
         print("  %-5s %-13s %s" % (c["level"].upper(), c["name"], c["text"][:100]))
 ' || true
+LAUNCH_READY=1
+trap - EXIT

@@ -26,9 +26,13 @@ import numpy as np
 
 import trt_detect  # reuse the ctypes cudart wrapper that already works here
 
-ENGINE_DIR = os.path.join(
+# Which export's engines to load. Overridable because the engines are tied to
+# a DATASET as much as to a GPU: exports are trained on different sessions and
+# splits. V6 is the current deployment model and its engines were built on
+# this rig; STUDENT_ENGINES still makes comparisons reproducible.
+ENGINE_DIR = os.environ.get("STUDENT_ENGINES") or os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..",
-    "perception", "out", "gexport", "v2", "models")
+    "perception", "out", "gexport", "v6", "models")
 MAX_DT_MS = 300.0            # training's temporal-chain window (student_data)
 MAX_POINTS = 64              # radar rows per frame in the export schema
 
@@ -138,6 +142,10 @@ class ThermalToVisible:
     def shape_in(self, thermal, x, y, w, h):
         """Warm shape inside a VISIBLE-plane box -> visible-plane bool mask.
 
+        `thermal` is the 120x160 thermal plane in whatever precision the session
+        has: the board's 8-bit codes, or the sensor's 16-bit centi-kelvin words
+        when --raw16 is streaming. Only the split below cares which.
+
         The locator and the shape come from different sensors on purpose: any
         box on the visible plane - a student's, or the COCO detector's, which
         is the one this rig trusts - names WHERE, and the thermal frame behind
@@ -167,14 +175,37 @@ class ThermalToVisible:
                        self.tu[r0:r1, c0:c1][sub_valid]]
         if vals.size < 16 or vals.max() == vals.min():
             return None
-        thr, _ = cv2.threshold(np.ascontiguousarray(vals.reshape(-1, 1)),
+
+        # Stretch this box's own range onto 0..255 before the split.
+        #
+        # Required, because OpenCV's Otsu is 8-bit only and `thermal` may be the
+        # sensor's 16-bit words. But it is not a workaround for that - it is the
+        # thing that makes the words worth reading. A person-sized box spans a
+        # few degrees while the session window spans sixty, so normalising
+        # locally hands Otsu 256 levels across the range that actually has to be
+        # separated, instead of the handful the global window left in it.
+        # Measured on this rig: a box holding 1-2 C of spread gives Otsu a median
+        # of 8 distinct levels off the 8-bit plane and 79 off the words, and the
+        # case this exists for - a person at 30.9 C against a lit glass door at
+        # 31.7 C - is 3.4 codes against 80 counts.
+        #
+        # Handing an 8-bit plane through here changes nothing: Otsu maximises
+        # between-class variance, which is invariant under an affine rescale, and
+        # a stretch cannot merge two levels that were already distinct. So the
+        # cut lands between the same two values it did before.
+        v = vals.astype(np.float32)
+        v -= v.min()
+        v *= 255.0 / float(v.max())
+        v8 = v.astype(np.uint8)
+
+        thr, _ = cv2.threshold(np.ascontiguousarray(v8.reshape(-1, 1)),
                                0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         low = np.zeros((self.LOW_H, self.LOW_W), dtype=np.uint8)
         piece = np.zeros(sub_valid.shape, dtype=np.uint8)
         # Strictly above: cv2's THRESH_BINARY is `> thr`, and on a box holding
         # exactly two levels Otsu returns the lower one - `>=` would then call
         # the whole box warm and outline the rectangle it was given.
-        piece[sub_valid] = (vals > thr).astype(np.uint8)
+        piece[sub_valid] = (v8 > thr).astype(np.uint8)
         low[r0:r1, c0:c1] = piece
         n, lab = cv2.connectedComponents(low)
         if n <= 1:

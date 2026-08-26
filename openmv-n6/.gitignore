@@ -24,10 +24,19 @@ __pycache__/
 /captures/*
 !/captures/handwave3/
 
+# Scratch captures made by the hardware probes use the same large binary
+# formats but live under tools/ while being diagnosed.
+/tools/captures/
+
 # Flashable images, ~4.5MB, rebuilt by `make TARGET=OPENMV_N6 firmware`.
 # FLASH.md is the procedure and is worth keeping; the binaries are not.
 /firmware-out/*.bin
 /firmware-out/SHA256SUMS
+/firmware-out/backup/
+
+# Operator recovery copies and process logs are local evidence, not source.
+/label_backups/
+/err*.log
 
 # What send_radar_cfg.py last put on the radar. Machine state, not source: it
 # describes THIS board at THIS moment, and a committed copy would assert a

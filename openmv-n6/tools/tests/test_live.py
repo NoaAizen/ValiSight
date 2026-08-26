@@ -30,6 +30,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 import live      # noqa: E402
+import thermal_io  # noqa: E402
 import detect    # noqa: E402
 import recorder  # noqa: E402
 
@@ -112,6 +113,9 @@ def board_clock():
 
     # the health panel's reading of the same numbers
     pipe = live.Pipeline(Args())
+    check("the thermal temporal defaults reach the C pipeline",
+          pipe.f.cfg.temporal_noise_mc == 148
+          and pipe.f.cfg.temporal_frames == 8)
     pipe.process(*load_pair(HANDWAVE3)[:2])
     names = lambda s: {c["name"]: c for c in live.health(pipe, s, now)}  # noqa: E731
 
@@ -164,7 +168,7 @@ def board_clock():
         for b in range(30))
     check("the heap is read every batch once the margin is thin",
           rate(live.HEAP_FLOOR) == 30 and rate(3 * live.HEAP_FLOOR) == 10
-          and rate(20 * live.HEAP_FLOOR) == 3,
+          and rate(20 * live.HEAP_FLOOR) == 1,
           "%d/30 near the floor, %d/30 mid, %d/30 with room"
           % (rate(live.HEAP_FLOOR), rate(3 * live.HEAP_FLOOR), rate(20 * live.HEAP_FLOOR)))
     check("a session with no reading yet takes one immediately",
@@ -262,6 +266,20 @@ def failure_reporting():
     check("an empty slot returns None rather than blocking forever",
           d.get(0.01) is None)
 
+    # A clean raw-REPL footer before the advertised payload length is not a
+    # dead board.  The reader must keep the prompt and abandon only this batch.
+    s = live.Streamer.__new__(live.Streamer)
+    s.buf = bytearray(b"x" * 501 + live._BATCH_FOOTERS[0])
+    try:
+        s._exact(19200, "thermal")
+        dropped = None
+    except live._DroppedBatch as e:
+        dropped = e
+    check("a board footer inside a short payload drops one batch immediately",
+          dropped is not None and dropped.received == 501
+          and s.buf == bytearray(b"\x04\x04>"),
+          str(dropped) if dropped else "no exception")
+
 
 def threading_and_detection(y, thermal):
     """Renderer + Detector driven off recorded frames, with no board attached.
@@ -272,6 +290,14 @@ def threading_and_detection(y, thermal):
     check is that the flag saying so is present, not that it is absent.
     """
     print("\nrender thread and detection")
+    check("a scene-sized landscape detector box cannot vouch for a person",
+          live.Renderer._reject_person_geometry(
+              {"cls": "person", "x": 8, "y": 2, "w": 613, "h": 392})
+          is not None)
+    check("a close portrait person remains admissible",
+          live.Renderer._reject_person_geometry(
+              {"cls": "person", "x": 180, "y": 0, "w": 260, "h": 400})
+          is None)
     pipe = live.Pipeline(Args())
     state, work = {}, live.Latest()
 
@@ -319,6 +345,74 @@ def threading_and_detection(y, thermal):
         if det is not None and hasattr(det, "close"):
             det.close()
 
+    class CountingDetector:
+        def __init__(self):
+            self.calls, self.ms = 0, 0.0
+
+        def __call__(self, _frame):
+            self.calls += 1
+            return [{"cls": "person", "conf": 0.99,
+                     "x": 0, "y": 0, "w": live.OUT_W, "h": live.OUT_H}]
+
+    # Darkness is not visual evidence. One full-frame false positive here used
+    # to set `ever det` on a track permanently, after which thermal/radar clutter
+    # inherited detector trust and filled the AI view with giant person boxes.
+    blind_det = CountingDetector()
+    blind_state, blind_work = {}, live.Latest()
+    blind_renderer = live.Renderer(live.Pipeline(Args()), blind_state,
+                                   blind_work, blind_det)
+    blind_renderer.start()
+    try:
+        dark = np.zeros((live.OUT_H, live.OUT_W), np.uint8)
+        dark_jpg = cv2.imencode(".jpg", dark)[1].tobytes()
+        for _ in range(3):
+            blind_work.put((dark_jpg, thermal))
+            time.sleep(0.08)
+        deadline = time.time() + 1.0
+        while blind_state.get("detect_t") is None and time.time() < deadline:
+            time.sleep(0.02)
+        check("a blind visible frame never grants detector trust",
+              blind_det.calls == 0
+              and blind_state.get("detect_suppressed") == "blind"
+              and blind_state.get("detections") == [],
+              "%d detector call(s), suppressed=%s" % (
+                  blind_det.calls, blind_state.get("detect_suppressed")))
+    finally:
+        blind_renderer.stop.set()
+        blind_renderer.join(timeout=2.0)
+
+    class CountingRadar:
+        def __init__(self):
+            self.calls, self.frames, self.dropped_bytes, self.error = 0, 1, 0, None
+
+        def get(self):
+            self.calls += 1
+            return {"frame_number": self.calls,
+                    "points": [{"x": 3.0, "y": 0.0, "z": 0.0, "v": 0.2,
+                                "snr": 20.0, "noise": 5.0}]}
+
+    radar = CountingRadar()
+    p3, s3, w3 = live.Pipeline(Args()), {}, live.Latest()
+    rr = live.Renderer(p3, s3, w3, radar=radar,
+                       radar_proj=live.radar_overlay.Bootstrap(
+                           live.OUT_W, live.OUT_H))
+    rr.start()
+    try:
+        jpg = cv2.imencode(".jpg", np.frombuffer(y, np.uint8).reshape(
+            live.OUT_H, live.OUT_W))[1].tobytes()
+        w3.put((jpg, thermal))
+        deadline = time.time() + 2
+        while s3.get("rendered", 0) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        check("one displayed frame samples radar exactly once for every consumer",
+              s3.get("rendered") == 1 and radar.calls == 1,
+              "%d render(s), %d radar get(s)" % (s3.get("rendered", 0), radar.calls))
+        check("map state and overlay carry that same radar frame number",
+              s3.get("radar_frame") == 1 and s3.get("radar_drawn") == 1)
+    finally:
+        rr.stop.set()
+        rr.join(timeout=2.0)
+
     # The visible temporal filter: live.py set cfg.y_temporal_knee and then never
     # called fusion_y_temporal(), so --y-knee reserved 256KB and filtered nothing.
     a = Args()
@@ -358,6 +452,37 @@ class _FakeLut:
     def box(self, x, y, w, h):
         return (4 * x, 4 * y, 4 * w, 4 * h)
 
+    def shape_in(self, thermal, x, y, w, h):
+        m = np.zeros((live.OUT_H, live.OUT_W), dtype=bool)
+        # A tall warm component inside the existing person box.
+        x0, x1 = max(0, x + w // 4), min(live.OUT_W, x + 3 * w // 4)
+        y0, y1 = max(0, y + h // 8), min(live.OUT_H, y + 7 * h // 8)
+        m[y0:y1, x0:x1] = True
+        return m
+
+
+class _HumanLut(_FakeLut):
+    """A connected warm head, tapered torso and two legs inside the box."""
+
+    def shape_in(self, thermal, x, y, w, h):
+        m = np.zeros((live.OUT_H, live.OUT_W), dtype=np.uint8)
+        cx = int(x + w / 2)
+        r = max(4, min(w // 5, h // 10))
+        cv2.circle(m, (cx, int(y + 0.13 * h)), r, 1, -1)
+        cv2.rectangle(m, (cx - max(2, r // 3), int(y + 0.13 * h)),
+                      (cx + max(2, r // 3), int(y + 0.25 * h)), 1, -1)
+        cv2.fillConvexPoly(m, np.array([
+            [int(x + 0.18 * w), int(y + 0.23 * h)],
+            [int(x + 0.82 * w), int(y + 0.23 * h)],
+            [int(x + 0.68 * w), int(y + 0.64 * h)],
+            [int(x + 0.32 * w), int(y + 0.64 * h)]], np.int32), 1)
+        leg = max(3, int(0.16 * w))
+        cv2.rectangle(m, (int(x + 0.32 * w), int(y + 0.60 * h)),
+                      (int(x + 0.32 * w) + leg, int(y + 0.96 * h)), 1, -1)
+        cv2.rectangle(m, (int(x + 0.68 * w) - leg, int(y + 0.60 * h)),
+                      (int(x + 0.68 * w), int(y + 0.96 * h)), 1, -1)
+        return m.astype(bool)
+
 
 class _FakeRadar:
     def __init__(self):
@@ -367,6 +492,13 @@ class _FakeRadar:
         return {"frame_number": 1,
                 "points": [{"x": 0.1, "y": 3.0, "z": 0.0, "v": 0.8,
                             "snr": 20.0, "noise": 5.0}]}
+
+
+class _FakeRadarProj:
+    """Place every synthetic moving return at the paired boxes' horizontal u."""
+
+    def project(self, points):
+        return [(60.0, 80.0, True) for _ in points]
 
 
 def ai_channels(thermal):
@@ -388,8 +520,8 @@ def ai_channels(thermal):
           "%d pair(s), du %s" % (len(f), [x["du"] for x in f]))
     check("the fused box keeps the thermal extent, not the radar's guess",
           (f[0]["x"], f[0]["y"], f[0]["w"], f[0]["h"]) == T[0]["vis"])
-    check("agreement scores above either channel on its own",
-          f[0]["conf"] > max(T[0]["conf"], R[0]["conf"])
+    check("agreement confidence is limited by the weaker correlated student",
+          f[0]["conf"] == min(T[0]["conf"], R[0]["conf"])
           and f[0]["conf_thermal"] == 0.8 and f[0]["conf_radar"] == 0.5,
           "%.2f from %.2f and %.2f" % (f[0]["conf"], f[0]["conf_thermal"],
                                        f[0]["conf_radar"]))
@@ -427,7 +559,7 @@ def ai_channels(thermal):
     students = {"thermal": th, "radar": rd, "th2vis": _FakeLut(),
                 "c_per_lsb": 60 / 255.0, "tmin": 0.0}
     r = live.Renderer(pipe, state, live.Latest(), None, radar=_FakeRadar(),
-                      students=students)
+                      radar_proj=_FakeRadarProj(), students=students)
     blank = np.zeros((live.OUT_H, live.OUT_W, 3), np.uint8)
 
     def draw():
@@ -459,11 +591,93 @@ def ai_channels(thermal):
     check("both components are marked as spoken for by the pair",
           state["student_thermal"][0].get("fused") is True
           and state["student_radar"][0].get("fused") is True)
+    lock_obs = r._lock_observations(thermal)
+    check("fusion-only lock exposes thermal only as hold-only evidence",
+          len(lock_obs) == 2
+          and any(d["src"] == "fusion" and not d.get("hold_only")
+                  for d in lock_obs)
+          and any(d["src"] == "thermal" and d.get("hold_only")
+                  for d in lock_obs)
+          and all(d["src"] != "radar" for d in lock_obs),
+          "sources %s" % [(d["src"], d.get("hold_only", False))
+                           for d in lock_obs])
+
+    # Selecting the thermal product is an explicit request to SEE the thermal
+    # result, but it is not permission to call every warm box a person. The
+    # already-running component is visible while the human-shape gate still
+    # owns whether it may establish a lock.
+    pipe.channel = "thermal"
+    rgb = draw()
+    thermal_obs = r._lock_observations(thermal)
+    check("the thermal product does not bypass the human-shape lock gate",
+          any(d["src"] == "thermal" and d.get("hold_only")
+              for d in thermal_obs))
+    check("the thermal product draws the detected body with fusion-only enabled",
+          has(rgb, live.Renderer.STUDENT_TH_COL))
+    pipe.channel = "fusion"
+
+    # Cold start with somebody already seated: there is no displacement and no
+    # Doppler to earn the ordinary thermal track. A strong thermal student plus
+    # an independently human-shaped CURRENT warm component may vouch at rest.
+    # A filled warm rectangle (the doorway failure this gate protects against)
+    # must still remain suppressed.
+    static_det = {"conf": 0.99, "x": 10, "y": 10, "w": 10, "h": 20,
+                  "vis": (180, 50, 160, 300)}
+    state["student_thermal"], state["student_fused"] = [static_det], []
+    r.th2vis = _HumanLut()
+    r.lock = live.tracking.Tracker()
+    early_static = []
+    for i in range(live.tracking.STATIC_SHAPE_HITS):
+        seated = r.lock.update(r._lock_observations(thermal), 900.0 + i * 0.114)
+        if i < live.tracking.STATIC_SHAPE_HITS - 1:
+            early_static.extend(seated)
+    check("one thermal-shape flicker cannot vouch for a static person",
+          early_static == [])
+    check("a human thermal shape locks a person already seated at startup",
+          len(seated) == 1 and seated[0].static_vouched
+          and seated[0].moved == 0 and seated[0].held_by == {"thermal"},
+          "tracks %s" % [t.as_dict(900.5) for t in seated])
+    check("the thermal cold-start verdict is explained in the AI result",
+          static_det.get("human_shape") is True
+          and static_det.get("shape_metrics", {}).get("reason")
+          == "human thermal shape")
+
+    doorway = dict(static_det)
+    state["student_thermal"] = [doorway]
+    r.th2vis = _FakeLut()
+    r.lock = live.tracking.Tracker()
+    for i in range(3):
+        rejected_static = r.lock.update(
+            r._lock_observations(thermal), 910.0 + i * 0.114)
+    check("a filled warm rectangle cannot cold-start a person lock",
+          rejected_static == [] and r.lock.all() == []
+          and doorway.get("human_shape") is False,
+          doorway.get("shape_metrics", {}).get("reason", "no verdict"))
+
+    # If both students drop while a proven person stands, the current thermal
+    # shape inside that existing track becomes hold-only evidence. It is not a
+    # detector and therefore cannot start a track of its own.
+    r.lock = live.tracking.Tracker()
+    for i in range(8):
+        r.lock.update([{"x": 100 + 12 * i, "y": 80, "w": 80, "h": 240,
+                        "conf": 0.9, "src": "fusion", "radar_m": 2.0}],
+                      1000.0 + i * 0.114)
+    r.th2vis = _FakeLut()
+    state["student_thermal"] = []
+    state["student_fused"] = []
+    held_obs = r._lock_observations(thermal)
+    check("a current thermal body shape can hold a proven standing person",
+          len(held_obs) == 1 and held_obs[0]["src"] == "thermal"
+          and held_obs[0]["hold_only"] is True,
+          "observations %s" % held_obs)
+    r.th2vis = None
 
     pipe.ai_fusion, pipe.ai_thermal = False, True
+    before_th, before_rd = th.calls, rd.calls
     rgb = draw()
     check("the thermal channel alone leaves the radar engine idle",
-          rd.calls == 1 and th.calls == 2, "%d radar inferences" % rd.calls)
+          rd.calls == before_rd and th.calls == before_th + 1,
+          "%d radar inferences" % rd.calls)
     check("the thermal channel draws its own boxes and no agreement",
           has(rgb, live.Renderer.STUDENT_TH_COL)
           and not has(rgb, live.Renderer.STUDENT_FU_COL)
@@ -504,6 +718,7 @@ def ai_channels(thermal):
     # --- the person outline. The locator and the shape come from different
     # sensors, so the failure that matters is drawing a shape when there is no
     # way to know where the thermal frame maps to.
+    pipe.ai_silhouette = True
     check("no warp LUT means no outline callback at all, not one that says no",
           r._person_outline(thermal, blank.copy()) is None)
 
@@ -547,6 +762,64 @@ def ai_channels(thermal):
               % (box, xs.min(), xs.max(), ys.min(), ys.max()))
         check("a box with nothing to split reports no shape rather than a blob",
               t2v.shape_in(np.full((120, 160), 40, np.uint8), *box) is None)
+
+        # The per-box stretch that lets 16-bit words through Otsu must not move
+        # what an 8-bit session already did. Otsu maximises between-class
+        # variance, which is invariant under an affine rescale, so the cut has
+        # to land between the same two values however the codes are shifted or
+        # spread - and if it did not, every silhouette drawn since the students
+        # shipped would quietly change shape.
+        same = True
+        for mul, add in ((1, 0), (2, 5), (4, 30)):
+            h2 = np.clip(hot.astype(np.int32) * mul + add, 0, 255).astype(np.uint8)
+            m2 = t2v.shape_in(h2, *box)
+            same &= m2 is not None and np.array_equal(m2, m)
+        check("rescaling the codes does not move the split", same)
+
+        # The case the words exist for, and it is contrast against NOISE
+        # rather than contrast alone. A person 0.8 C from the wall behind them
+        # is 3.4 codes at the 0:60 window - which survives quantisation on a
+        # clean frame, so a noiseless test proves nothing. The sensor's measured
+        # per-pixel temporal noise is ~0.18 C, i.e. 0.77 of a code: on the 8-bit
+        # plane the signal is a few codes wide and so is the noise, and Otsu is
+        # choosing a cut inside a histogram with almost no shape. In the words
+        # the same scene is 80 counts of signal against 18 of noise.
+        #
+        # Scored over repeated noise draws by how much of the recovered shape
+        # lands on the patch that is really there.
+        rng = np.random.RandomState(7)
+        window = thermal_io.window_ck({"tmin": 0, "tmax": 60})
+        truth = np.zeros((120, 160), bool)
+        truth[40:80, 60:100] = True
+        won = {16: 0.0, 8: 0.0}
+        for _ in range(12):
+            w16 = (30000 + rng.normal(0, 18, (120, 160))).astype(np.uint16)
+            w16[truth] += 80
+            for bits, plane in ((16, w16), (8, thermal_io.codes8(w16, window))):
+                m = t2v.shape_in(plane, *box)
+                if m is None:
+                    continue
+                t = np.repeat(np.repeat(truth, 4, 0), 4, 1)[:m.shape[0], :m.shape[1]]
+                union = float((m | t).sum())
+                won[bits] += float((m & t).sum()) / union if union else 0.0
+        iou16, iou8 = won[16] / 12, won[8] / 12
+        check("the words recover the warm shape through the sensor's own noise",
+              iou16 > 0.5, "IoU %.2f" % iou16)
+        # And the honest result, which is not the one this was wired for: at the
+        # 0:60 window the words are no BETTER. Counting histogram levels made
+        # 8-bit look starved - 8 against 79 - but levels are the wrong figure of
+        # merit. What a segmenter feels is added noise, and uniform quantisation
+        # contributes step/sqrt(12): 0.068 C against the sensor's own 0.18 C, so
+        # 8 bits inflate the total by 7% and Otsu cannot tell the difference. It
+        # would take a window wider than 159 C for quantisation to reach the
+        # sensor's noise, and nothing here uses one. The wiring stays because it
+        # costs nothing and is right when the window IS wide - not because it
+        # sharpens this rig's outline, which is bounded by geometry instead: one
+        # thermal pixel is 4x3.3 visible pixels and no precision changes that.
+        check("and at this window they are not worse, which is all that is claimed",
+              iou16 >= iou8 - 0.02,
+              "16-bit IoU %.2f vs 8-bit %.2f - quantisation adds 0.068 C to a "
+              "0.18 C noise floor" % (iou16, iou8))
     else:
         check("warp.lut is present for the outline check", False, lut_path)
 
@@ -572,6 +845,22 @@ def lock_mode():
     """
     print("\nlock on people")
     import tracker as tracking
+
+    class ViewTrack:
+        def __init__(self, box, coast):
+            self.box, self.coast = box, coast
+
+        def coasting_for(self, _now):
+            return self.coast
+
+    measured = ViewTrack((100, 50, 200, 300), 0.0)
+    replaced_coast = ViewTrack((110, 55, 190, 290), 0.7)
+    separate_coast = ViewTrack((400, 60, 80, 200), 0.7)
+    shown = live.Renderer._display_tracks(
+        [measured, replaced_coast, separate_coast], 0.0)
+    check("a measured track visually replaces an overlapping coast",
+          measured in shown and replaced_coast not in shown
+          and separate_coast in shown)
 
     def walk(t0, n, x0, step, src="det", tk=None, dt=0.114):
         tk = tk or tracking.Tracker()
@@ -607,6 +896,32 @@ def lock_mode():
           "coasting %.2fs" % (kept[0].coasting_for(now) if kept else -1))
     check("the coast is carried on their velocity, not frozen in place",
           kept[0].box[0] > 160, "x %d" % kept[0].box[0])
+
+    # In normal fusion-only deployment a stationary person loses Doppler, so
+    # fusion stops even though thermal still measures their body. Hidden
+    # thermal evidence may hold a person already proven by motion, but must not
+    # create or promote the warm doorway this rule exists to reject.
+    tk_hold = tracking.Tracker()
+    warm = {"x": 100, "y": 100, "w": 60, "h": 180, "conf": 0.95,
+            "src": "thermal", "hold_only": True}
+    for i in range(20):
+        tk_hold.update([dict(warm)], 3500.0 + i * 0.114)
+    check("hold-only thermal cannot create a person",
+          tk_hold.all() == [] and tk_hold.confirmed(3503.0) == [])
+
+    tk_hold = tracking.Tracker()
+    for i in range(8):
+        tk_hold.update([{"x": 100 + i * 12, "y": 100, "w": 60, "h": 180,
+                         "conf": 0.9, "src": "fusion", "radar_m": 2.0}],
+                       3600.0 + i * 0.114)
+    tid = tk_hold.confirmed(3601.0)[0].id
+    for i in range(30):
+        held = tk_hold.update([dict(warm, x=184)], 3601.0 + i * 0.114)
+    check("a person proven in motion stays while standing on thermal",
+          len(held) == 1 and held[0].id == tid
+          and held[0].held_by == {"thermal"},
+          "track %s held by %s" % (held[0].id if held else "lost",
+                                    sorted(held[0].held_by) if held else []))
 
     now += tracking.MAX_COAST_S
     check("a coast that outlives its budget is dropped, not kept forever",
@@ -660,6 +975,20 @@ def lock_mode():
           "nobody",
           tk.suppressed(end)[0].as_dict(end)["moved_px"] < tracking.STATIC_PX)
 
+    # v2's live false positive: almost the whole frame, with enough edge jitter
+    # over time to pass the ordinary motion gate.  Size makes Thermal alone
+    # insufficient; a physically-gated fusion observation may still vouch for a
+    # genuinely close person.
+    tk = tracking.Tracker()
+    now = 6100.0
+    for i in range(45):
+        tk.update([{"x": 20 + 3 * i, "y": 5, "w": 370, "h": 392,
+                    "conf": 0.999, "src": "thermal"}], now + i * 0.114)
+    end = now + 45 * 0.114
+    check("a scene-sized thermal box cannot jitter its way into becoming a person",
+          tk.confirmed(end) == [] and len(tk.suppressed(end)) == 1,
+          "moved %.0f px" % tk.suppressed(end)[0].moved)
+
     # ...and the same evidence, once it moves, is a person - which is what
     # keeps this safe in the dark, where the visible detector sees nothing.
     tk = tracking.Tracker()
@@ -669,6 +998,69 @@ def lock_mode():
     check("a walker the detector never saw is drawn once they have moved",
           len(tk.confirmed(end)) == 1 and tk.suppressed(end) == [],
           "moved %.0f px" % tk.all()[0].moved)
+
+    # --- the two phantoms from the lobby screenshot, by their labels.
+    #
+    # "P38 R": a radar-only track on a wall return that has wandered a long way.
+    # It passes the displacement test and always did; what stops it now is that
+    # radar's word alone does not vouch.
+    tk = tracking.Tracker()
+    for i in range(40):
+        tk.update([{"x": 60 + i * 12, "y": 90, "w": 90, "h": 300,
+                    "conf": 0.9, "src": "radar"}], now + i * 0.114)
+    end = now + 40 * 0.114
+    check("a radar-only track is not a person however far it has wandered",
+          not tk.confirmed(end) and len(tk.all()) == 1,
+          "moved %.0f px, still not drawn" % tk.all()[0].moved)
+
+    # ...and the same track, once the thermal student also finds it, is drawn.
+    # Radar is not distrusted, it is just not sufficient on its own.
+    tk = tracking.Tracker()
+    for i in range(40):
+        box = {"x": 60 + i * 12, "y": 90, "w": 90, "h": 300, "conf": 0.9}
+        tk.update([dict(box, src="radar"), dict(box, src="thermal")],
+                  now + i * 0.114)
+    check("the same evidence with a warm body behind it is",
+          len(tk.confirmed(end)) == 1)
+
+    # "P33 coast 4.8m": a box ~300 px tall quoting 4.8 m is claiming a person
+    # 2.7 m tall. A specular return off the glass wall arrives at roughly twice
+    # the distance to the glass, which is exactly how it gets there.
+    tk = tracking.Tracker()
+    for i in range(40):
+        tk.update([{"x": 60 + i * 12, "y": 40, "w": 120, "h": 300,
+                    "conf": 0.9, "src": "thermal", "radar_m": 4.8}],
+                  now + i * 0.114)
+    t = tk.all()[0]
+    check("a box whose range makes it 2.7 m tall is not drawn as a person",
+          not tk.confirmed(end),
+          "implied height %.2f m at %.1f m" % (t.implied_height_m, t.radar_m))
+
+    # Detector trust must not bypass the same physical contradiction. The
+    # detector can be right that a person exists while range association picks
+    # a different radar return; drawing both geometries produced duplicate
+    # full-frame people in the live AI view.
+    tk = tracking.Tracker()
+    for i in range(2):
+        tk.update([{"x": 60, "y": 40, "w": 120, "h": 300,
+                    "conf": 0.99, "src": "det", "radar_m": 4.8}],
+                  now + i * 0.114)
+    check("detector trust cannot override an impossible associated height",
+          not tk.confirmed(now + 0.228))
+
+    # The ceiling only. A person at 2 m is taller than the frame, so their box
+    # is clipped and UNDER-states their height - a floor would fire on exactly
+    # the close targets this rig exists for.
+    tk = tracking.Tracker()
+    for i in range(40):
+        tk.update([{"x": 60 + i * 12, "y": 0, "w": 120, "h": 400,
+                    "conf": 0.9, "src": "thermal", "radar_m": 2.0}],
+                  now + i * 0.114)
+    t = tk.all()[0]
+    check("a clipped box on a close person is not vetoed for being short",
+          len(tk.confirmed(end)) == 1,
+          "implied %.2f m - clipping can only shrink a box, never grow it"
+          % t.implied_height_m)
 
     # --- the rig turns. Every box in the picture moves; none of it is news
     # about anybody. Without the ego term a slow sweep past the same warm door
@@ -718,6 +1110,28 @@ def lock_mode():
                     "src": "det"}], now + i * 0.114)
     check("a motionless person the detector sees is drawn immediately",
           len(tk.confirmed(now + 0.7)) == 1)
+
+    # Live false positive measured on the fixed standing lamps: YOLO repeats a
+    # plausible person box at 0.35..0.75, and its thermal peak is also inside
+    # the body band.  Confidence below the instant-vouch floor therefore keeps
+    # the observation, but makes it earn person status through real motion.
+    tk = tracking.Tracker()
+    for i in range(20):
+        tk.update([{"x": 255 + (i % 2), "y": 180, "w": 42, "h": 121,
+                    "conf": 0.75, "src": "det_weak", "max_c": 33.7}],
+                  now + i * 0.114)
+    check("a weak detector box fixed on a lamp is not a person",
+          tk.confirmed(now + 2.2) == [] and len(tk.suppressed(now + 2.2)) == 1)
+
+    tk = tracking.Tracker()
+    for i in range(8):
+        moving = tk.update(
+            [{"x": 100 + 8 * i, "y": 120, "w": 50, "h": 160,
+              "conf": 0.55, "src": "det_weak", "max_c": 33.0}],
+            now + i * 0.114)
+    check("a weak visible detection becomes a person once it walks",
+          len(moving) == 1 and "det_weak" in moving[0].ever,
+          "moved %.1f px" % (moving[0].moved if moving else -1))
 
     # Two boxes from the SAME sensor are two people and must stay two.
     two = tracking.merge([
@@ -786,6 +1200,93 @@ def ego_motion(d):
           % ("nothing" if e is None else "%+.1f px" % e[0], g3.response))
     check("and the frame it refused is counted, not silently dropped",
           g3.as_dict()["rejected"] == 1)
+
+
+def raw16_channel(thermal, meta):
+    """The 16-bit radiometric channel, and the promise that it changes nothing.
+
+    --raw16 swaps what travels on the wire: the board sends the Lepton's own
+    words instead of the 8-bit plane it derives from them, and this host rebuilds
+    that plane. Everything downstream - the warp, fusion.c's thresholds, the
+    students, the detector - was tuned against the board's version, so the whole
+    design rests on the rebuild being identical rather than merely similar. That
+    is what is checked here, and it can be checked without a board: a recorded
+    8-bit frame says which code each pixel got, so the words that produced it are
+    known to within one code bin, and running them back through the conversion
+    must return the same codes.
+
+    The interesting failure is off-by-one at the bin edges, which no eyeball on a
+    picture would ever catch and which would move every threshold downstream by a
+    code.
+    """
+    print("\n16-bit thermal channel")
+    tmin, tmax = meta["tmin"], meta["tmax"]
+    window = thermal_io.window_ck({"tmin": tmin, "tmax": tmax})
+    lo, hi = window
+    step = (hi - lo) / 255.0
+    codes = np.frombuffer(thermal, np.uint8)
+
+    check("the window is the driver's own centi-kelvin conversion",
+          lo == round((tmin + 273.15) * 100) and hi == round((tmax + 273.15) * 100),
+          "%d..%d cK over %d..%dC" % (lo, hi, tmin, tmax))
+    check("a 16-bit code is far finer than the 8-bit plane it replaces",
+          abs(step / 100.0 - (tmax - tmin) / 255.0) < 1e-6,
+          "0.01C vs %.3fC per code" % (step / 100.0))
+
+    # The word at the centre of each code's bin. The conversion rounds rather
+    # than truncates - floor(v/step + 0.5) - so code c owns v/step in
+    # [c-0.5, c+0.5) and its centre is c*step, not (c+0.5)*step. Getting that
+    # backwards puts every representative word on a bin boundary, which is
+    # exactly where a half-code disagreement hides.
+    words = np.round(lo + codes.astype(np.float64) * step).astype(np.uint16)
+    check("every recorded code survives the round trip through 16-bit",
+          np.array_equal(thermal_io.codes8(words, window), codes),
+          "%d pixels, %d distinct codes" % (codes.size, len(np.unique(codes))))
+
+    # The boundaries themselves, which is where a rounding rule that disagreed
+    # with the firmware's would show up and nowhere else.
+    c = np.arange(255)
+    just_under = np.floor(lo + (c + 0.5) * step - 1e-9).astype(np.uint16)
+    just_over = np.ceil(lo + (c + 0.5) * step + 1e-9).astype(np.uint16)
+    check("a word just under a bin boundary stays on the lower code",
+          np.array_equal(thermal_io.codes8(just_under, window),
+                         c.astype(np.uint8)))
+    check("a word just over it moves to the upper code, by exactly one",
+          np.array_equal(thermal_io.codes8(just_over, window),
+                         (c + 1).astype(np.uint8)))
+
+    # Outside the window there is nothing to preserve - that clipping is the
+    # loss --raw16 exists to record around, so it must still be reproduced.
+    outside = np.array([0, lo - 1, hi + 1, 65535], np.uint16)
+    check("words outside the window clip exactly as the firmware clips them",
+          list(thermal_io.codes8(outside, window)) == [0, 0, 255, 255])
+
+    # agc8() is what the worker actually calls; it must agree with the module.
+    frame = words.reshape(live.TH_H, live.TH_W)
+    check("the live path and the offline readers use one conversion",
+          live.agc8(frame, (tmin, tmax)) == thermal_io.codes8(frame, window).tobytes())
+
+    check("celsius is absolute, with no window in it",
+          abs(float(thermal_io.celsius(np.array([27315], "<u2"))[0])) < 1e-3
+          and abs(float(thermal_io.celsius(np.array([31015], "<u2"))[0]) - 37.0) < 1e-3)
+
+    # A session declaring one thing and holding another must fail rather than
+    # produce twice as many mangled frames, which is what the old readers did.
+    check("a session whose dtype and frame size disagree is refused",
+          _raises(lambda: thermal_io.dtype_of({"thermal_dtype": "uint16_le",
+                                               "thermal_frame_bytes": 19200})))
+    check("a session that declares nothing at all is refused, not guessed",
+          _raises(lambda: thermal_io.dtype_of({"thermal_frame_bytes": 12345})))
+    check("a legacy session with no declaration still reads as uint8",
+          thermal_io.dtype_of({"thermal_frame_bytes": 19200}) == np.dtype("u1"))
+
+
+def _raises(fn):
+    try:
+        fn()
+    except ValueError:
+        return True
+    return False
 
 
 def main():
@@ -877,6 +1378,50 @@ def main():
           cover.shape == (pipe.f.cfg.low_h, pipe.f.cfg.low_w), str(cover.shape))
     check("registered thermal plane is not empty", treg.ptp() > 0,
           "range %d..%d" % (treg.min(), treg.max()))
+
+    thermogram = pipe.thermal_image()
+    check("the thermal product is a registered full-size colour frame",
+          thermogram.shape == (live.OUT_H, live.OUT_W, 3)
+          and thermogram.dtype == np.uint8)
+    cover_full = cv2.resize(cover, (live.OUT_W, live.OUT_H),
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+    smooth_codes = cv2.resize(treg, (live.OUT_W, live.OUT_H),
+                              interpolation=cv2.INTER_LINEAR)
+    palette = np.ctypeslib.as_array(pipe.palettes[pipe.palette_name]).reshape(256, 3)
+    expected_thermal = palette[smooth_codes].copy()
+    expected_thermal[~cover_full] = (24, 24, 24)
+    check("the thermal product uses smooth interpolation before the palette",
+          np.array_equal(thermogram, expected_thermal))
+    check("outside the thermal footprint is no-reading grey, not false cold",
+          not (~cover_full).any()
+          or np.all(thermogram[~cover_full] == np.array([24, 24, 24], np.uint8)))
+    inverted_y = (255 - np.frombuffer(y, np.uint8)).astype(np.uint8).tobytes()
+    pipe.process(inverted_y, thermal)
+    check("the pure thermal channel borrows no visible-camera detail",
+          np.array_equal(thermogram, pipe.thermal_image()))
+    pipe.process(y, thermal)
+    check("the five product channels have one explicit, stable contract",
+          live.CHANNELS == ("thermal", "rgb_radar", "thermal_radar", "fusion", "ai"))
+    pipe.outline = False
+    pipe.view = "fused"
+    channel_fused = pipe.process(y, thermal).copy()
+    products = {}
+    for channel_name in live.CHANNELS:
+        pipe.channel = channel_name
+        products[channel_name] = live.compose_channel(pipe, channel_fused, yarr)
+    check("thermal and thermal+radar share one clean thermogram base",
+          np.array_equal(products["thermal"], products["thermal_radar"]))
+    check("visible+radar and AI use the honest visible-luma base",
+          np.array_equal(products["rgb_radar"], products["ai"])
+          and np.array_equal(products["ai"][..., 0], yarr))
+    check("the fusion product keeps the configured fusion base",
+          np.array_equal(products["fusion"], channel_fused))
+    check("only sensor-fusion products request raw radar drawing",
+          [live.live_channels.get(c).raw_radar for c in live.CHANNELS]
+          == [False, True, True, True, False]
+          and [live.live_channels.get(c).ai_overlay for c in live.CHANNELS]
+          == [True, False, True, True, True])
+    pipe.channel = "fusion"
 
     vis = live.compose("visible", fused, yarr)
     check("the visible view is exactly the source luma, in grey",
@@ -1005,6 +1550,22 @@ def main():
     check("stream, tearing, coverage and range all report",
           {"stream", "tearing", "coverage", "range"} <= set(base),
           "got %s" % sorted(base))
+
+    pipe.channel = "thermal"
+    check("the thermal-only channel is healthy without radar",
+          levels(good)["channel"] == "ok")
+    pipe.channel = "fusion"
+    check("a radar product channel warns when radar is absent",
+          levels(good)["channel"] == "warn")
+    pipe.channel = "rgb_radar"
+    rgb_channel = {c["name"]: c for c in live.health(
+        pipe, dict(good, radar_proj=object()), now)}["channel"]
+    check("the visible channel says that this build transports luma",
+          rgb_channel["level"] == "warn" and "luma" in rgb_channel["text"])
+    pipe.channel = "ai"
+    check("the AI channel warns when no inference engine is available",
+          levels(good)["channel"] == "warn")
+    pipe.channel = "fusion"
 
     check("a stalled stream fails", levels(dict(good), now + 60.0)["stream"] == "fail")
     check("a reported stream error fails",
@@ -1151,6 +1712,14 @@ def main():
         check("/set ignores an unknown view rather than breaking the stream",
               pipe.view == "operator")
 
+        get("/set?channel=thermal_radar")
+        check("/set switches product channel independently of calibration view",
+              pipe.channel == "thermal_radar" and pipe.view == "operator")
+        get("/set?channel=nonsense")
+        check("/set ignores an unknown product channel",
+              pipe.channel == "thermal_radar")
+        get("/set?channel=fusion")
+
         get("/set?view=fused&outline=0")
 
         code, body = get("/health")
@@ -1185,6 +1754,13 @@ def main():
         check("/set can turn the overlay off", pipe.show_detections is False)
         get("/set?boxes=1")
 
+        check("the AI product defaults to silhouettes without debug evidence",
+              pipe.ai_evidence is False and pipe.ai_silhouette is True)
+        get("/set?evidence=1")
+        check("/set can reveal student evidence without changing the engines",
+              pipe.ai_evidence is True
+              and pipe.ai_thermal and pipe.ai_radar and pipe.ai_fusion)
+
         # The AI channels are three switches and not a mode: any combination has
         # to be reachable, including fusion with both components hidden.
         get("/set?ai_thermal=0&ai_radar=1&ai_fusion=0")
@@ -1209,6 +1785,8 @@ def main():
             aicfg = json.loads(get("/ui")[1])["cfg"]["ai"]
             check("the AI card appears once the students are loaded",
                   aicfg is not None and aicfg["radar"]["on"] is True)
+            check("/ui reports whether diagnostic student evidence is visible",
+                  aicfg["evidence"] is True)
             check("a channel that cannot draw reads as unready, not as empty",
                   aicfg["fusion"]["ready"] is False
                   and aicfg["radar"]["ready"] is False)
@@ -1238,6 +1816,7 @@ def main():
               "%.2f (engine floor %.2f)" % (pipe.ai_conf_thermal,
                                             pipe.ai_conf_floor))
         get("/set?ai_thermal=1&ai_radar=1&ai_fusion=1")
+        get("/set?evidence=0")
 
         # /ui is the page's only poll, so a field it stops carrying is a panel
         # that silently goes blank rather than an error anyone sees.
@@ -1250,6 +1829,9 @@ def main():
         check("/ui agrees with /health on the overall level",
               d["worst"] == json.loads(get("/health")[1])["worst"],
               d["worst"])
+        check("/ui publishes the product-channel contract from the backend",
+              d["cfg"]["channel"] == "fusion"
+              and [c["id"] for c in d["cfg"]["channels"]] == list(live.CHANNELS))
 
         # The controls are initialised from here rather than from the HTML. The
         # old page hardcoded its slider positions, so --gain 220 drew a handle at
@@ -1324,6 +1906,7 @@ def main():
     ai_channels(thermal)
     lock_mode()
     ego_motion(HANDWAVE3)
+    raw16_channel(thermal, meta)
 
     print()
     if FAILS:

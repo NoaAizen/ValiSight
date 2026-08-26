@@ -54,6 +54,39 @@ def manifest_sha256(data_dir):
         return hashlib.sha256(f.read()).hexdigest()
 
 
+def initialise_from(model, path, tag):
+    """Load pretrained weights into a fresh model, loudly.
+
+    Reports what transferred and refuses a checkpoint that matched nothing.
+    A silent no-op here looks exactly like pretraining that did not help, and
+    would be diagnosed by rerunning the training rather than by reading one
+    line of output.
+    """
+    import torch                      # lazy, like _imports() above
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    state = payload.get("model_state", payload)
+    own = model.state_dict()
+    usable = {k: v for k, v in state.items()
+              if k in own and own[k].shape == v.shape}
+    if not usable:
+        raise SystemExit(
+            f"--init-from {path}: nothing in it fits this model (checkpoint "
+            f"has {len(state)} tensors, none matching by name and shape). "
+            f"Wrong student, or a checkpoint from a different architecture.")
+    skipped = [k for k in own if k not in usable]
+    model.load_state_dict(usable, strict=False)
+    print(f"[{tag}] initialised {len(usable)}/{len(own)} tensors from "
+          f"{os.path.basename(path)}"
+          + (f" (from {payload.get('manifest_version')}, "
+             f"{payload.get('thermal_mode', 'n/a')} scale)"
+             if isinstance(payload, dict) else ""))
+    if skipped:
+        print(f"[{tag}] not in the checkpoint, staying random: "
+              f"{', '.join(skipped[:6])}"
+              + (f" (+{len(skipped) - 6} more)" if len(skipped) > 6 else ""))
+    return model
+
+
 def checkpoint_payload(model, metrics, manifest, args, extra):
     return {
         "format": "thermal-fusion-student-v1",
@@ -92,6 +125,15 @@ def main():
                          "jitters ambient temperature and the radar point set, "
                          "which is what stops a 10 C change of scene from "
                          "collapsing the thermal student")
+    ap.add_argument("--init-from", metavar="CKPT",
+                    help="start from the weights in this checkpoint instead "
+                         "of from scratch - the pretrain half of a "
+                         "pretrain-then-fine-tune run. Only the learned "
+                         "weights are taken; the thermal normalisation stats "
+                         "are floats recomputed from whichever dataset is "
+                         "being trained on, which is what lets a model "
+                         "pretrained on 8-bit public thermal be fine-tuned on "
+                         "our Celsius shards")
     ap.add_argument("--negative-weight", default="auto",
                     help="loss weight for verified-empty frames: 'auto' "
                          "balances them against positives (capped at 20), a "
@@ -182,6 +224,8 @@ def main():
     if args.student in ("thermal", "both"):
         mean, std = estimate_scalar_stats(train.arrays["thermal"])
         model = ThermalStudent(mean, std, args.max_objects)
+        if args.init_from:
+            initialise_from(model, args.init_from, "THERMAL")
         disabled = [x.strip() for x in args.disable_thermal.split(",")
                     if x.strip()]
         model.derived.disable_channels(disabled)

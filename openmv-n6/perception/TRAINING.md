@@ -91,11 +91,17 @@ shards לקנה מידה.)
 1. לפתוח ב-Colab את `train_students_colab.ipynb` **מאותה תיקיית Drive**
    (`gexport/v2/`) — המחברת מיוצאת יחד עם ה-shards.
 2. Runtime → Change runtime type → **GPU**.
-3. Run all.
+3. בתא ההגדרות לוודא ש-`EXPORT_NAME = 'v2'` (או שם ה-`--out-name`
+   שבחרתם), ואז Run all. המחברת מעתיקה את ה-shards לדיסק המקומי, מריצה
+   preflight של epoch אחד, ורק אחריו מתחילה את שני האימונים הארוכים.
 
 ה-checkpoints נכתבים ל-`gexport/v2/models/`:
 `thermal_student.pt` ו-`radar_student.pt`, כל אחד עם המטריקות, ה-config,
 ו-SHA256 של ה-manifest שאימן אותו.
+
+בסיום המחברת מייצאת ONNX ל-TensorRT. המודל התרמי נתמך תמיד; מודל רדאר
+שמשתמש גם ב-RA/RD/Range Profile נשמר כ-`.pt` אך אינו מומר אוטומטית ל-ONNX,
+כי ה-runtime הנוכחי על ה-Jetson מקבל עדיין ענן נקודות בלבד.
 
 ## 6. אימון מקומי (אלטרנטיבה)
 

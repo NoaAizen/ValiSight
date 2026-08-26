@@ -33,7 +33,9 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))          # openmv-n6/
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 from perception.project import RadarProjector          # noqa: E402
+import thermal_io                                      # noqa: E402
 
 TH_W, TH_H = 160, 120
 LOW_W, LOW_H = 160, 100
@@ -148,8 +150,12 @@ def main():
     frames = [json.loads(l) for l in open(os.path.join(args.session, "frames.jsonl"))]
     radar = [json.loads(l) for l in open(os.path.join(args.session, "radar.jsonl"))]
     rt = np.array([f["t_mono"] for f in radar])
-    thermal = np.memmap(os.path.join(args.session, "thermal.bin"), np.uint8,
-                        mode="r").reshape(-1, TH_H, TH_W)
+    # Never np.uint8 unconditionally. A 16-bit session read that way does not
+    # fail - it yields twice as many frames, each a mangled interleave of a real
+    # one - and every number below it would still look like a plausible result.
+    # WARM_MARGIN is in 8-bit codes, so a 16-bit recording is converted through
+    # the session's own window and the gate keeps meaning what it meant.
+    thermal, th_meta = thermal_io.open_session(args.session)
 
     # clusters per RADAR frame once; each thermal frame associates against the
     # clusters of the two radar frames bracketing its timestamp
@@ -160,7 +166,8 @@ def main():
         i = fr["i"]
         if i >= len(thermal):
             break
-        body = body_center(register(np.array(thermal[i]), su, sv, valid), valid)
+        codes = thermal_io.as_codes8(thermal[i], th_meta)
+        body = body_center(register(np.array(codes), su, sv, valid), valid)
         if body is None:
             n_noblob += 1
             continue

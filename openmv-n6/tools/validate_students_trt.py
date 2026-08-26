@@ -9,7 +9,7 @@ to what was trained, and live.py can trust it.
 
 Usage:
     python3 tools/validate_students_trt.py \
-        [--data perception/out/gexport/v2] [--student both]
+        [--data perception/out/gexport/v6] [--student both]
 """
 import argparse
 import os
@@ -98,16 +98,30 @@ def evaluate(run_frame, arrays, n_frames, plane, width, height,
 def main():
     ap = argparse.ArgumentParser()
     default_data = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                "..", "perception", "out", "gexport", "v2")
+                                "..", "perception", "out", "gexport", "v6")
     ap.add_argument("--data", default=default_data)
     ap.add_argument("--student", choices=("thermal", "radar", "both"),
                     default="both")
+    ap.add_argument("--split", choices=("train", "val"), default="val")
     ap.add_argument("--threshold", type=float, default=0.5)
+    ap.add_argument(
+        "--session", action="append", default=[],
+        help="evaluate only this session from --split (repeatable)")
     a = ap.parse_args()
 
     manifest = load_manifest(a.data)
-    print("loading val split:", manifest["split"]["val"], file=sys.stderr)
-    val = load_split(a.data, "val", manifest)
+    if a.session:
+        split_sessions = manifest["split"][a.split]
+        unknown = [s for s in a.session if s not in split_sessions]
+        if unknown:
+            ap.error("--session is not in the selected split: "
+                     + ", ".join(unknown))
+        manifest = dict(manifest)
+        manifest["split"] = dict(manifest["split"])
+        manifest["split"][a.split] = a.session
+    print(f"loading {a.split} split:", manifest["split"][a.split],
+          file=sys.stderr)
+    val = load_split(a.data, a.split, manifest)
     arrays, temporal = val.arrays, val.temporal
     n = len(val)
     print(f"{n} frames, thermal mode {val.thermal_mode}", file=sys.stderr)

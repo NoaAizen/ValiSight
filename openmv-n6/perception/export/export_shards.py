@@ -59,6 +59,9 @@ import numpy as np
 ROOT = os.path.join(os.path.dirname(__file__), '..', '..')
 sys.path.insert(0, ROOT)
 from perception.dataset import LiveSession, THERMAL_W, THERMAL_H, RGB_W, RGB_H  # noqa: E402
+from perception.student_data import LABEL_UNKNOWN  # noqa: E402
+from perception.export.negative_gate import (  # noqa: E402
+    NegativeGateError, occupied_frames)
 
 CAPTURES = os.path.join(ROOT, 'captures')
 AUTOLABEL = os.path.join(ROOT, 'perception', 'out', 'autolabel')
@@ -165,7 +168,8 @@ def load_heatmaps(sess):
 
 
 def export_session(sess, teacher, coco_boxes, keep_rgb,
-                   teacher_available=True, verified_negative=False):
+                   teacher_available=True, verified_negative=False,
+                   radar_unusable=False, occupied=()):
     """One session -> iterator of per-frame dicts, in time order.
 
     A generator rather than a list on purpose: multi5 alone is ~25k paired
@@ -245,11 +249,20 @@ def export_session(sess, teacher, coco_boxes, keep_rgb,
         row['th_boxes'], row['n_th_boxes'] = pad_boxes(th_rows, 5)
         # Tri-state supervision: +1 positive, 0 independently verified empty,
         # -1 unknown. In particular, "teacher emitted no box" is UNKNOWN.
+        #
+        # `occupied` is negative_gate's per-frame veto on the operator's
+        # session-level claim. It only ever moves NEGATIVE -> UNKNOWN, so a
+        # frame it is wrong about costs one negative and never teaches that a
+        # person is nobody. Measured on radar3-dark-negative1 before this
+        # existed: 320 of its 600 frames hold a person and every one of them
+        # was exported as "there is nobody here", into the val split.
         frame_negative = bool(
-            verified_negative or
-            meta_by_i.get(tr.i, {}).get('verified_negative', False))
+            (verified_negative or
+             meta_by_i.get(tr.i, {}).get('verified_negative', False))
+            and tr.i not in occupied)
         row['radar_label_state'] = np.int8(
-            label_state(bool(rgb_rows), frame_negative))
+            LABEL_UNKNOWN if radar_unusable
+            else label_state(bool(rgb_rows), frame_negative))
         row['thermal_label_state'] = np.int8(
             label_state(bool(th_rows), frame_negative))
         row['teacher_available'] = np.bool_(teacher_available)
@@ -273,7 +286,16 @@ def session_thermal_meta(sess, thermal_dtypes):
     if os.path.exists(path):
         with open(path) as f:
             meta = json.load(f)
-    dtypes = set(thermal_dtypes)
+    thermal_dtypes = tuple(thermal_dtypes)
+    if thermal_dtypes and isinstance(thermal_dtypes[0], dict):
+        # Backward-compatible convenience for callers/tests that still pass
+        # exported rows instead of write_shards()' compact dtype set.
+        dtypes = {
+            str(np.asarray(row['thermal']).dtype)
+            for row in thermal_dtypes
+        }
+    else:
+        dtypes = set(thermal_dtypes)
     if len(dtypes) != 1:
         raise ValueError(f'{sess}: mixed thermal dtypes in one session: {dtypes}')
     dtype = dtypes.pop()
@@ -292,8 +314,15 @@ def session_thermal_meta(sess, thermal_dtypes):
     }
 
 
-def session_provenance(sess):
-    """Source hashes needed to detect incompatible sessions before training."""
+def session_provenance(sess, radar_unusable=False):
+    """Source hashes needed to detect incompatible sessions before training.
+
+    A session whose radar is not being used contributes no radar hashes. The
+    compatibility check treats a missing hash as "says nothing" rather than as
+    a conflict, which is exactly right here: this session is not claiming its
+    radar is comparable to the others', it is withdrawing it. The config's
+    NAME stays, so a reader can still see what it was recorded under.
+    """
     path = os.path.join(CAPTURES, sess, "meta.json")
     meta = {}
     if os.path.exists(path):
@@ -304,8 +333,10 @@ def session_provenance(sess):
         "schema_version": meta.get("schema_version"),
         "lepton_gain": meta.get("lepton_gain"),
         "warp_lut_sha256": meta.get("warp_lut_sha256"),
-        "radar_calib_sha256": meta.get("radar_calib_sha256"),
-        "radar_cfg_sha256": stamp.get("sha256"),
+        "radar_calib_sha256": (None if radar_unusable
+                               else meta.get("radar_calib_sha256")),
+        "radar_cfg_sha256": None if radar_unusable else stamp.get("sha256"),
+        "radar_unusable": True if radar_unusable else None,
         "radar_cfg_name": stamp.get("name"),
         "radar_cfg_stamp_note": meta.get("radar_cfg_stamp_note"),
         "detector_model": meta.get("detector_model"),
@@ -348,10 +379,17 @@ TRAINING_CODE_FILES = (
     'perception/student_data.py',
     'perception/students.py',
     'perception/train_students.py',
+    'perception/export_students_onnx.py',
+    # The public-dataset converter travels with the bundle because the
+    # pretraining half of a run happens in Colab, where the datasets are, and
+    # a converter that lives only in the repo is a converter somebody
+    # reimplements from memory at 2am.
+    'perception/external/__init__.py',
+    'perception/external/public_thermal.py',
 )
 
 
-def write_training_bundle(out_dir):
+def write_training_bundle(out_dir, out_name):
     """Snapshot runnable training code beside the shards for reproducible Colab."""
     code_root = os.path.join(out_dir, 'code')
     os.makedirs(os.path.join(code_root, 'perception'), exist_ok=True)
@@ -364,11 +402,57 @@ def write_training_bundle(out_dir):
         with open(dst, 'rb') as f:
             hashes[rel] = hashlib.sha256(f.read()).hexdigest()
 
+    # The production Colab flow validates the GPU and
+    # class balance, copies shards off the Drive mount, runs a one-epoch
+    # preflight, trains the two students independently with resumable
+    # checkpoints, and exports ONNX.  Keep the stable exported filename so
+    # existing documentation and Drive layouts continue to work.
     notebook_name = 'train_students_colab.ipynb'
     notebook_src = os.path.join(ROOT, 'perception', 'export', notebook_name)
-    shutil.copy2(notebook_src, os.path.join(out_dir, notebook_name))
-    with open(notebook_src, 'rb') as f:
-        hashes[notebook_name] = hashlib.sha256(f.read()).hexdigest()
+    notebook_dst = os.path.join(out_dir, notebook_name)
+    # The notebook's DATA path is REWRITTEN to this export's name, not copied.
+    # It used to be copied verbatim, so v3's bundle shipped with
+    # DATA=.../gexport/v2: opening it beside the v3 shards and hitting Run all
+    # trained on v2 and wrote a checkpoint into v3/models. The two failures
+    # that costs - training on the wrong data, and a checkpoint whose name
+    # lies about its dataset - are both silent, and the only way anyone would
+    # notice is by hashing the manifest afterwards.
+    with open(notebook_src, encoding='utf-8') as f:
+        nb = json.load(f)
+    def _retarget(line):
+        # The notebook names its export in one place. Which line that is has
+        # moved once already (a hardcoded DATA path became EXPORT_NAME), so
+        # both are handled and a notebook carrying neither is refused below
+        # rather than shipped pointing somewhere else.
+        if line.startswith('EXPORT_NAME = '):
+            keep = line.split('#', 1)
+            comment = ('  #' + keep[1]) if len(keep) > 1 else '\n'
+            return "EXPORT_NAME = '%s'%s" % (out_name, comment)
+        if line.startswith('DATA = /'):
+            return line
+        if line.startswith("DATA = '/content/drive"):
+            return ("DATA = '/content/drive/MyDrive/thermal-fusion/gexport/%s'\n"
+                    % out_name)
+        return line
+
+    retargeted = 0
+    for cell in nb.get('cells', []):
+        out_lines = []
+        for line in cell.get('source', []):
+            new_line = _retarget(line)
+            retargeted += new_line != line
+            out_lines.append(new_line)
+        cell['source'] = out_lines
+    if not retargeted:
+        raise SystemExit(
+            'the notebook names no export (no EXPORT_NAME/DATA line to '
+            'retarget) - shipping it beside %s shards would point Colab at '
+            'whatever it was last edited for' % out_name)
+    body = json.dumps(nb, ensure_ascii=False, indent=1)
+    with open(notebook_dst, 'w', encoding='utf-8') as f:
+        f.write(body)
+    # Hash what was WRITTEN, not the template it came from.
+    hashes[notebook_name] = hashlib.sha256(body.encode('utf-8')).hexdigest()
     requirements = 'numpy\nscipy\ntorch\n'
     requirements_path = os.path.join(code_root, 'requirements.txt')
     with open(requirements_path, 'w') as f:
@@ -384,6 +468,41 @@ def write_training_bundle(out_dir):
     }
 
 
+# Above this share of a "verified empty" session flagged occupied, the claim
+# itself is wrong rather than imperfect and the export stops. Below it the
+# occupied frames are demoted and the count is printed loudly. radar3-dark-
+# negative1 sits at 53%: the operator recorded a person walking about and
+# filed it as an empty room, and 20% is already far past a mistake worth
+# passing over in a log line.
+NEGATIVE_WARN_FRACTION = 0.20
+NEGATIVE_REFUSE_FRACTION = 0.80
+
+
+def audit_negative(sess):
+    """Per-frame occupancy for a session claimed empty. -> (set of i, stats)."""
+    occupied, stats = occupied_frames(LiveSession(os.path.join(CAPTURES, sess)))
+    n, total = stats['frames_occupied'], stats['frames_checked']
+    frac = stats['fraction']
+    if frac >= NEGATIVE_REFUSE_FRACTION:
+        raise SystemExit(
+            f'[export] {sess}: {n} of {total} frames ({frac:.0%}) are not '
+            f'empty. This is not a negative session - drop it from '
+            f'--verified-negative, or trim it and re-record frames.jsonl.')
+    if frac >= NEGATIVE_WARN_FRACTION:
+        print(f'[export] {sess}: *** {n} of {total} frames ({frac:.0%}) hold '
+              f'something warm and were NOT recorded as empty. A session this '
+              f'far from empty was mis-verified; the runs are listed below so '
+              f'they can be read back against what was recorded.')
+    elif n:
+        print(f'[export] {sess}: {n} of {total} frames ({frac:.1%}) demoted '
+              f'to UNKNOWN - warm, so not evidence of an empty room')
+    else:
+        print(f'[export] {sess}: {total} frames, none occupied - clean negative')
+    for lo, hi in stats['runs']:
+        print(f'[export]     occupied i {lo}-{hi} ({hi - lo + 1} frames)')
+    return occupied, stats
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('--sessions', nargs='+', required=True,
@@ -393,7 +512,23 @@ def main():
                          'a frame split leaks near-duplicates)')
     ap.add_argument('--verified-negative', nargs='*', default=[], metavar='SESS',
                     help='sessions manually verified to contain no target; '
-                         'only these may supply negative supervision')
+                         'only these may supply negative supervision. Every '
+                         'frame is still checked by negative_gate, which '
+                         'demotes the occupied ones to UNKNOWN')
+    ap.add_argument('--negative-audit', action='store_true',
+                    help='report per-frame occupancy for the --verified-'
+                         'negative sessions and exit, exporting nothing')
+    ap.add_argument('--radar-unusable', nargs='*', default=[], metavar='SESS',
+                    help='sessions whose RADAR must not be used as evidence, '
+                         'while their thermal still is. The case this exists '
+                         'for is a session recorded under a different chirp '
+                         'config: radar_10hz.cfg aliases Doppler, so its '
+                         'velocities are not the quantity the other sessions '
+                         'measured, but its Lepton frames are exactly the '
+                         'same measurement. Their radar labels go to UNKNOWN '
+                         '(masked in training) and their radar provenance '
+                         'hashes are omitted, so the split-wide compatibility '
+                         'check neither trips on them nor blesses them.')
     ap.add_argument("--out-name", default="v2")
     ap.add_argument('--frames-per-shard', type=int, default=256)
     ap.add_argument('--no-rgb', action='store_true',
@@ -431,6 +566,23 @@ def main():
     }
 
     verified_negative = set(a.verified_negative)
+    radar_unusable = set(a.radar_unusable)
+    unknown = (radar_unusable | verified_negative | set(a.val)) - set(a.sessions)
+    if unknown:
+        raise SystemExit('not in --sessions: %s' % ', '.join(sorted(unknown)))
+
+    # Before a byte is written: a session claimed empty is checked frame by
+    # frame. Up front rather than inside the loop so a mis-verified session
+    # stops the run before shards land on disk half written.
+    occupancy, occupancy_stats = {}, {}
+    for sess in sorted(verified_negative):
+        try:
+            occupancy[sess], occupancy_stats[sess] = audit_negative(sess)
+        except NegativeGateError as exc:
+            raise SystemExit(f'[export] {sess}: cannot be verified empty: {exc}')
+    if a.negative_audit:
+        raise SystemExit('[export] --negative-audit: nothing exported')
+
     for sess in a.sessions:
         teacher_path = os.path.join(AUTOLABEL, f'{sess}_teacher.jsonl')
         teacher_available = os.path.exists(teacher_path)
@@ -438,7 +590,9 @@ def main():
         rows = export_session(
             sess, teacher, coco_boxes, keep_rgb,
             teacher_available=teacher_available,
-            verified_negative=sess in verified_negative)
+            verified_negative=sess in verified_negative,
+            radar_unusable=sess in radar_unusable,
+            occupied=occupancy.get(sess, ()))
         shards, stats = write_shards(rows, sess, out_dir, a.frames_per_shard,
                                      keep_rgb)
         if not stats['frames']:
@@ -452,15 +606,21 @@ def main():
             'shards': shards, 'frames': stats['frames'],
             'frames_with_gradeA': n_lab,
             'verified_negative_frames': n_neg,
-            'provenance': session_provenance(sess),
+            'provenance': session_provenance(sess, sess in radar_unusable),
             **thermal_meta,
         }
+        # What the operator claimed minus what the frames showed. Recorded so a
+        # checkpoint can be traced to the exact negative set that trained it -
+        # the thing that was missing when v3 and v4 were selected on a val
+        # split that was half occupied.
+        if sess in occupancy_stats:
+            manifest['sessions'][sess]['negative_gate'] = occupancy_stats[sess]
         which = 'val' if sess in a.val else 'train'
         manifest['split'][which].append(sess)
         print(f'[export] {sess}: {stats["frames"]} frames ({n_lab} with grade-A '
               f'boxes) -> {len(shards)} shard(s) [{which}]')
 
-    manifest['training_bundle'] = write_training_bundle(out_dir)
+    manifest['training_bundle'] = write_training_bundle(out_dir, a.out_name)
 
     with open(os.path.join(out_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)

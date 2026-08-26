@@ -74,22 +74,15 @@ goes), `/dev/ttyACM2` is the radar data stream at 921600. `send_radar_cfg.py`
 must run first — the IWR1843 emits nothing until it is configured, so a
 `--radar` run against an unconfigured sensor looks like a dead link.
 
-`--radar-hfov 62.7` overrides the 70° default with the measured value (f = 525
-px at 640 wide, checkerboard against a tape measure). `--radar-calib` cannot
-carry it: `Bootstrap._load()` reads only a top-level `K`, which neither
-`calib-artifacts/calib.json` (it has `K_rgb`) nor `T_camera_radar.json` (it has
-`yaw_deg`/`R`/`t_m`) provides — so passing either file loads nothing and the
-startup line still reads `intrinsics from assumed 70.0 deg HFOV`. Until the
-loader is taught those keys, apply the solved extrinsic by hand once the viewer
-is up:
+`--radar-hfov 62.7` overrides the 70° fallback with the measured value (f = 525
+px at 640 wide, checkerboard against a tape measure). `--radar-calib` accepts
+both calibration schemas (`K/R/t/dist` and
+`K_rgb/R_cam_from_radar/t_cam_m/dist_rgb`); `run_live.sh` automatically loads
+`calib-artifacts/radar_rgb_2026-08-18.json` when it is present.
 
-```sh
-curl -s 'localhost:8088/set?yaw=-1.09&tx=17&ty=47'   # T_camera_radar.json, mm
-```
-
-Add `--warp calib-artifacts/warp.lut` once block B2 has been shot and solved.
-Until then the thermal layer is stretched, not registered, and every
-temperature it quotes is marked `(unreg)` — see [tools/calib/](tools/calib/).
+`run_live.sh` also loads `calib-artifacts/warp.lut` when present. Without that
+artifact the thermal layer is stretched, not registered, and every temperature
+it quotes is marked `(unreg)` — see [tools/calib/](tools/calib/).
 
 The board sends a hardware-JPEG of the visible frame plus the thermal frame
 *uncompressed* — the thermal data is the measurement, and lossy compression on
@@ -117,12 +110,11 @@ sensor auto-picked.
 | 5 | Helium optimisation | not started, and possibly unnecessary |
 | 6 | radiometric API, palettes | done except the parallax slider |
 
-**Not yet calibrated.** The geometric mapping is a placeholder stretch, so
-`gain`/`eps`/`radius` cannot be tuned and no reading is registered to the visible
-image. The recorded hand-wave sequences cannot produce a fit — the object spans
-19% of the frame against a 25% gate — and `handreg.py` rejects them rather than
-returning the low-residual answer a cluster of near-identical points would
-happily fit.
+The runtime now has thermal-visible and radar-visible calibration artifacts
+under `calib-artifacts/`, and `run_live.sh` loads them automatically. A direct
+`live.py` invocation without `--warp`/`--radar-calib` still uses explicit
+placeholder geometry and reports that state in `/health`; mounting changes
+invalidate the solved artifacts and require a new calibration.
 
 ## Two facts about this hardware worth knowing before reading the code
 

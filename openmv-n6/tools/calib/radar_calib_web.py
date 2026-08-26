@@ -73,7 +73,9 @@ import numpy as np
 import cv2
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import radar_correspond as rc      # noqa: E402
+import thermal_io                  # noqa: E402
 import radar_extrinsics as rx      # noqa: E402
 
 # Measured 2026-08-10 with a caliper-measured 38.3 mm checkerboard at
@@ -302,18 +304,33 @@ class CalibSession:
         alongside the coloured one because the dead-row test and any future
         centroid assist must run on codes, never on the colour map.
         """
+        # thermal_off/thermal_len are byte offsets, so the blob is read as
+        # bytes and the frame's own dtype is applied to the slice. A 16-bit
+        # session used to land here as a size mismatch and lose every hold; the
+        # marker picture is the one thing this tool cannot do without.
         blob = np.fromfile(self.thermal_path, np.uint8)
+        th_meta = thermal_io.load_meta(self.dir)
+        th_dtype = thermal_io.dtype_of(th_meta)
+        frame_bytes = THERMAL_FRAME_BYTES * th_dtype.itemsize
         self.raw_thermal = []
         for h, row, _ in picked_rows:
             off, ln = row.get('thermal_off'), row.get('thermal_len')
             img = raw = None
-            if off is not None and ln == THERMAL_FRAME_BYTES \
+            if off is not None and ln == frame_bytes \
                     and off + ln <= blob.size:
-                raw = blob[off:off + ln].reshape(THERMAL_H, THERMAL_W)
-                # Percentile stretch, not min/max: one stuck-hot pixel would
-                # otherwise flatten the whole marker into the low end.
-                lo, hi = np.percentile(raw, (0.5, 99.5))
-                norm = np.clip((raw.astype(np.float32) - lo)
+                words = blob[off:off + ln].view(th_dtype).reshape(THERMAL_H,
+                                                                  THERMAL_W)
+                # raw stays 8-bit codes whatever was recorded: dead_rows() and
+                # any future centroid assist are thresholds in codes, and a
+                # 16-bit session must not quietly move them by a factor of 59.
+                raw = thermal_io.as_codes8(words, th_meta)
+                # The picture, though, is stretched off whatever precision the
+                # session actually has - on a 16-bit recording the marker is no
+                # longer competing with a 0.588C quantiser for contrast.
+                # Percentile, not min/max: one stuck-hot pixel would otherwise
+                # flatten the whole marker into the low end.
+                lo, hi = np.percentile(words, (0.5, 99.5))
+                norm = np.clip((words.astype(np.float32) - lo)
                                / max(hi - lo, 1.0), 0, 1)
                 img = cv2.applyColorMap((norm * 255).astype(np.uint8),
                                         cv2.COLORMAP_INFERNO)
@@ -328,7 +345,7 @@ class CalibSession:
         if bad:
             print('warning: %d hold(s) had no usable thermal frame (missing '
                   'or wrong-sized thermal_len; expected %d bytes)'
-                  % (bad, THERMAL_FRAME_BYTES), file=sys.stderr)
+                  % (bad, frame_bytes), file=sys.stderr)
 
     def _on_dead_row(self, k, v):
         """Is this pick sitting on a row the live pipeline would repair?"""

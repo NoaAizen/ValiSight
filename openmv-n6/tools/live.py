@@ -4,6 +4,8 @@
     ./live.py                       then open http://localhost:8088
     ./live.py --warp calib/warp.lut --gain 220
     ./live.py --radar               live + IWR1843 overlay (USB DATA port)
+    ./live.py --radar --channel thermal_radar
+    ./live.py --radar --channel ai  final detections/tracks without raw radar clutter
     ./live.py --record              live + recording to captures/live-<stamp>/
     ./live.py --radar --students    live + the three AI channels (see below)
     ./live.py --radar --record DIR  a full calibration session: session.mp4,
@@ -27,20 +29,27 @@ stamped. Frames written with no station are labelled UNLABELLED on the page
 rather than passing quietly; recovering the split afterwards from timestamps is
 what the V3 plan section 5d exists to stop.
 
-The view selector is there to judge registration, which the fused image cannot
-show you on its own - see the VIEWS comment below for why, and use blink/edges
-during a calibration session rather than trusting how sharp the picture looks.
+The channel selector is the product surface: thermal, visible+radar,
+thermal+radar, three-sensor fusion, and AI. The separate view selector is there
+to judge registration inside the fusion channel - see the VIEWS comment below
+for why, and use blink/edges during a calibration session rather than trusting
+how sharp the picture looks. The visible source is currently PAG7936 luma; the
+rgb_radar API id is reserved for true colour once RGB565 passes its link test.
 
 --students brings up three AI channels, switched on and off live from the page
 (keys t, r, c) or over /set?ai_thermal=0&ai_radar=1&ai_fusion=1, and read back
-on /ai:
+on /ai. They feed fusion and tracking but their intermediate boxes are hidden
+by default; final locks and silhouettes are drawn on the thermal-bearing
+products and the AI product. Key e (or /set?evidence=1) reveals intermediate
+evidence for model debugging:
 
     thermal   orange - the thermal student, drawn on the visible plane through
               the warp LUT. Without a LUT its boxes are still reported, on the
               thermal plane, but cannot be placed on the picture.
     radar     cyan   - the radar student, straight onto the visible plane.
     fusion    white  - the two of them agreeing: one person, seen by both. The
-              pair is made on u only, inside 50 px, because radar elevation
+              candidate pair is made on u only, inside 180 px, because live
+              motion can put the radar box behind the thermal box while radar elevation
               comes off a two-element aperture and says almost nothing about
               which box a return belongs to. A fused box carries the range.
 
@@ -64,7 +73,7 @@ card and in /health rather than dropped quietly, because something warm and
 motionless is not nobody. A person the detector sees is drawn at once, standing
 still or not.
 
-With `person outline` on (key s, the default), a detection is drawn as the warm
+With `person outline` on (key s, opt-in), a detection is drawn as the warm
 shape the thermal frame holds inside it rather than as a rectangle - the
 detector's green person boxes included, which is the pairing worth having: the
 COCO detector is the locator this rig trusts, and the thermal frame is the only
@@ -91,6 +100,7 @@ import glob
 import math
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -108,7 +118,9 @@ import radar_overlay
 import tracker as tracking  # noqa: E402
 import egomotion  # noqa: E402
 import recorder  # noqa: E402
+import thermal_io  # noqa: E402
 import soc as hostsoc  # noqa: E402
+import live_channels  # noqa: E402
 
 PORT = "/dev/ttyACM0"
 LIB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "host", "libfusion.so")
@@ -136,6 +148,33 @@ _t_prev = 0
 _stalled = 0
 
 
+def write_text(s):
+    """Write one control record completely on the SAME stream as payloads.
+
+    Mixing ``sys.stdout.write`` for headers with ``sys.stdout.buffer.write``
+    for images gives the text wrapper permission to buffer a header while the
+    binary payload passes it.  The host then sees JPEG/thermal bytes where #F
+    must be.  Encoding the tiny record once and writing it through ``out`` keeps
+    control and payload in one ordered CDC queue.
+    """
+    global _stalled
+    b = s.encode()
+    mv = memoryview(b)
+    off = 0
+    stalls = 0
+    while off < len(b):
+        w = out.write(mv[off:])
+        if w:
+            off += w
+            stalls = 0
+            continue
+        stalls += 1
+        _stalled += 1
+        if stalls > 2:
+            return False
+    return True
+
+
 def stream(n, report=0):
     global _t_prev, _stalled
     # gc.mem_free() walks the whole 25MB heap and costs 227ms - measured on the
@@ -145,13 +184,33 @@ def stream(n, report=0):
     # stall is harmless: plain gaps of up to 2.5s between snapshots were measured
     # not to disturb the sensor (unlike a collect, which wedges it at any length).
     if report:
-        sys.stdout.write("#HEAP %d\n" % gc.mem_free())
+        free = gc.mem_free()
+        # mem_free() monopolises the VM long enough that TinyUSB cannot service
+        # its CDC queue.  Yield once before putting the next header into that
+        # queue; the 50ms is inside the Lepton's measured-safe service gap and
+        # lets USB recover instead of dropping its first 512-byte packet.
+        time.sleep_ms(50)
+        if not write_text("#HEAP %d\n" % free):
+            return
     for _ in range(n):
         t, was_torn = good_snapshot(lep)       # paces the loop at the thermal rate
         t_th = time.ticks_ms()
         j = rgb.snapshot().to_jpeg(quality=QUALITY)
         t_rgb = time.ticks_ms()
         tb = t.bytearray()
+        if _raw is not None:
+            # Replaces the 8-bit plane rather than joining it. Both would be
+            # 56.25KB of thermal per frame, 493KB/s at 8.772fps, and with the
+            # JPEG on top that is 654KB/s against a link measured at 700-900 -
+            # inside the 500ms write timeout's reach, and the tail it discards
+            # is silent. The 8-bit frame is a lossy function of this one, so the
+            # host reconstructs it for free instead of paying to be told twice.
+            #
+            # t is still snapshotted and still used: good_snapshot() reads its
+            # segment boundaries to reject torn frames, which is a check on the
+            # VoSPI transport and is unaffected by which plane travels.
+            lep.ioctl(csi.IOCTL_LEPTON_GET_RAW, _raw)
+            tb = _raw
         # Two extra numbers, both differences taken on this clock so the host
         # never has to reason about ticks wrapping:
         #
@@ -179,9 +238,11 @@ def stream(n, report=0):
         # this frame's payload, so its stall count does not exist yet. It is the
         # number that says whether the host starved the board, which is the one
         # form of host load that can reach the sensor.
-        sys.stdout.write("#F %d %d %d %d %d %d\n" % (
-            j.size(), len(tb), 1 if was_torn else 0,
-            time.ticks_diff(t_th, _t_prev), time.ticks_diff(t_rgb, t_th), _stalled))
+        if not write_text("#F %d %d %d %d %d %d\n" % (
+                j.size(), len(tb), 1 if was_torn else 0,
+                time.ticks_diff(t_th, _t_prev), time.ticks_diff(t_rgb, t_th),
+                _stalled)):
+            return
         _t_prev = t_th
         _stalled = 0
         for buf in (memoryview(j.bytearray()), memoryview(tb)):
@@ -230,10 +291,10 @@ def stream(n, report=0):
     # minutes, but hours is still finite. Reporting free memory lets the host tear
     # the bring-up down and stand it back up at a moment of its choosing, instead
     # of discovering the problem as a dead stream.
-    sys.stdout.write("#BATCH\n")
+    write_text("#BATCH\n")
 
 
-sys.stdout.write("#READY %d %d %d %d %d %d\n" % (
+write_text("#READY %d %d %d %d %d %d\n" % (
     rgb.width(), rgb.height(), lep.width(), lep.height(), TMIN, TMAX))
 '''
 
@@ -242,10 +303,15 @@ sys.stdout.write("#READY %d %d %d %d %d %d\n" % (
 # the board wedges hard enough to need a physical replug. A batch self-terminates.
 BATCH_CODE = "stream(%d, %d)\n"
 
-# How often to ask the board what its heap looks like. The reading costs 227ms,
-# so this is a rate, not a habit: every 10th batch is one reading per ~200 frames
-# (~23s), which is ~1% of throughput to watch something that drains over hours.
-HEAP_EVERY = 10
+# How often to ask the board what its heap looks like while there is ample room.
+# gc.mem_free() walks the complete 25MB heap and blocks the MicroPython/TinyUSB
+# scheduler for 227ms.  At every 10th batch that pause landed every ~23s and the
+# live hardware lost 512-byte CDC packets at the same cadence.  With five frames
+# per batch, every 400th batch is ~3.8 minutes: still almost ten observations
+# inside the deliberately huge
+# 36-minute 4MB safety margin.  _want_heap() tightens to every third/every batch
+# as that margin closes, where memory safety correctly wins over frame cadence.
+HEAP_EVERY = 400
 
 
 # ---------------------------------------------------------------- fusion via ctypes
@@ -356,6 +422,14 @@ class Pipeline:
         cfg.agc_permille = args.agc
         cfg.detail_invert = 1 if args.palette == "black" else 0
         cfg.out_rgb565 = 0
+        # fusion.c has measured, motion-adaptive thermal smoothing enabled by
+        # default. Expose its two real controls here so the live product can
+        # trade settling time for a quieter picture without changing raw
+        # recordings or inventing a second host-side filter.
+        cfg.temporal_noise_mc = getattr(args, "thermal_noise_mc",
+                                        cfg.temporal_noise_mc)
+        cfg.temporal_frames = getattr(args, "thermal_frames",
+                                      cfg.temporal_frames)
         # Opt-in, and it must be set before fusion_init: the buffer it needs is
         # allocated there, so flipping the knee later cannot turn the filter on.
         cfg.y_temporal_knee = args.y_knee
@@ -380,6 +454,10 @@ class Pipeline:
         # never sees it - but it lives here because this is the object the HTTP
         # handlers already reach and the streamer already holds.
         self.view = "fused"
+        # Product channel, separate from the registration/calibration view
+        # above.  `view` chooses how a fused base is inspected; `channel`
+        # chooses which sensors and overlays are presented at all.
+        self.channel = getattr(args, "channel", "fusion")
         self.mix = 60
         self.outline = False
         self.blink_period = 0.5      # seconds per half-cycle; ~2 alternations/s
@@ -401,6 +479,11 @@ class Pipeline:
         self.ai_thermal = True
         self.ai_radar = True
         self.ai_fusion = True
+        # Raw student boxes are diagnostic evidence, not the product result.
+        # Keep the engines enabled for fusion/tracking while presenting a clean
+        # AI channel by default.  The operator can reveal these layers when
+        # debugging a model without turning inference off and losing the lock.
+        self.ai_evidence = False
         # Per-channel confidence floors, applied to what is DRAWN rather than
         # inside the engines. Two reasons: the engine's own threshold cannot be
         # lowered again without a restart, and a box that was found and then
@@ -543,6 +626,31 @@ class Pipeline:
             buf = ctypes.string_at(self.f.t_reg, n)
         return np.frombuffer(buf, np.uint8).reshape(self.f.cfg.low_h, self.f.cfg.low_w)
 
+    def thermal_image(self):
+        """Pure registered thermogram on the 640x400 visible coordinate plane.
+
+        Unlike the normal fused output this contains no detail borrowed from
+        the visible camera.  That distinction is the contract of the thermal
+        display channel: an edge in this image came from the thermal plane.
+        Pixels outside the calibrated footprint are neutral dark grey rather
+        than a made-up cold temperature.
+        """
+        treg = self.treg_grid()
+        cover = self.cover_grid()
+        # The registered grid is only 160x100. Nearest-neighbour expansion made
+        # each sample a visible 4x4 tile, so the pure thermal product looked
+        # blocky even though the temporal filter upstream was doing its job.
+        # Interpolate temperature codes before applying the palette: this keeps
+        # the colour ramp physically ordered and smooths only the operator
+        # display. The raw plane, measurements, student input and recordings
+        # remain untouched.
+        full = cv2.resize(treg, (OUT_W, OUT_H), interpolation=cv2.INTER_LINEAR)
+        valid = cv2.resize(cover, (OUT_W, OUT_H), interpolation=cv2.INTER_NEAREST).astype(bool)
+        palette = np.ctypeslib.as_array(self.palettes[self.palette_name]).reshape(256, 3)
+        out = palette[full].copy()
+        out[~valid] = (24, 24, 24)
+        return out
+
     def repaired_grid(self):
         """Low-res cells whose thermal sample came off a rebuilt row.
 
@@ -581,6 +689,18 @@ class Pipeline:
         with self.lock:
             buf = ctypes.string_at(self.f.t_prep, n)
         return np.frombuffer(buf, np.uint8).reshape(self.f.cfg.th_h, self.f.cfg.th_w)
+
+    def bad_rows(self):
+        """Which thermal rows fusion.c condemned on the frame it last processed.
+
+        Exposed so the 16-bit path can exclude them without re-deriving the
+        test. Two independent answers to "is this row dead" would eventually
+        disagree, and the one that disagreed would be the one nobody was
+        looking at."""
+        th = self.f.cfg.th_h
+        with self.lock:
+            buf = ctypes.string_at(self.f.row_bad, th)
+        return np.frombuffer(buf, np.uint8).astype(bool)
 
     def frame_stats(self):
         r = Region()
@@ -621,6 +741,7 @@ class Pipeline:
 # firmware, and these are display questions asked while calibrating.
 
 VIEWS = ("fused", "visible", "blink", "mix", "edges", "operator")
+CHANNELS = live_channels.CHANNELS
 
 
 def thermal_edges(treg, w, h, pct=97.0, exclude=None):
@@ -733,6 +854,20 @@ def operator_fusion(fused, y, cover=None, mix=60):
     return out
 
 
+def agc8(raw16, rng):
+    """The board's 8-bit plane, rebuilt from the 16-bit words it was made of.
+
+    This is what makes --raw16 additive: everything downstream - the warp LUT,
+    fusion.c's deband and dead-row thresholds, the students, the detector - was
+    tuned against the plane the board used to send, so this reproduces it rather
+    than improving on it. thermal_io.codes8() is the firmware's own arithmetic,
+    kept in one place so the live path and the offline readers cannot drift.
+    """
+    tmin, tmax = rng if rng else (-10, 140)
+    window = thermal_io.window_ck({"tmin": tmin, "tmax": tmax})
+    return thermal_io.codes8(raw16, window).tobytes()
+
+
 def compose(view, fused, y, treg=None, cover=None, mix=50, phase=True,
             exclude=None, outline=True):
     """Build the frame the browser sees. `fused` is never modified in place."""
@@ -753,6 +888,41 @@ def compose(view, fused, y, treg=None, cover=None, mix=50, phase=True,
 
     if cover is not None and outline:
         out[coverage_outline(cover, out.shape[1], out.shape[0])] = (255, 210, 40)
+    return out
+
+
+def compose_channel(pipe, fused, y, now=None):
+    """Build the clean image base for the selected product channel.
+
+    Sensor/AI overlays are intentionally absent.  Keeping this as a pure-ish
+    boundary makes the five channel contracts testable without a board, radar
+    or detector, and keeps calibration recording able to copy the clean frame
+    before any annotation is burned into it.
+    """
+    channel = live_channels.get(pipe.channel)
+    if channel.base == "thermal":
+        out = pipe.thermal_image()
+        if pipe.outline:
+            out[coverage_outline(pipe.cover_grid(), OUT_W, OUT_H)] = (255, 210, 40)
+        return out
+    if channel.base == "visible":
+        out = np.repeat(y[:, :, None], 3, 2)
+        if pipe.outline:
+            out[coverage_outline(pipe.cover_grid(), OUT_W, OUT_H)] = (255, 210, 40)
+        return out
+
+    out = fused
+    if pipe.view != "fused" or pipe.outline:
+        edges = pipe.view == "edges"
+        needs_cover = pipe.outline or pipe.view == "operator"
+        clock = time.time() if now is None else now
+        out = compose(pipe.view, out, y,
+                      treg=pipe.treg_grid() if edges else None,
+                      exclude=pipe.repaired_grid() if edges else None,
+                      cover=pipe.cover_grid() if needs_cover else None,
+                      mix=pipe.mix,
+                      phase=int(clock / pipe.blink_period) % 2 == 0,
+                      outline=pipe.outline)
     return out
 
 
@@ -802,12 +972,16 @@ def health(pipe, state, now):
     last = state.get("last_frame_t")
     fps = state.get("fps", 0.0)
     restarting = state.get("restarting_since")
+    link_recovering = state.get("link_recovering_since")
     if restarting is not None:
         # Recovering is not failing. A restart takes ~13s against a 5s stale
         # threshold, so without this branch every successful defence reports as a
         # dead stream - which is how a health panel gets ignored.
         add("stream", "warn", "restarting the board: %s (%.0fs)"
             % (state.get("last_restart", "fault"), now - restarting))
+    elif link_recovering is not None:
+        add("stream", "warn", "dropping one incomplete batch: %s"
+            % state.get("link_recovering_reason", "USB short write"))
     elif err:
         add("stream", "fail", err)
     elif last is None:
@@ -824,11 +998,13 @@ def health(pipe, state, now):
     # but silently surviving is how this went unnoticed for so long - a link
     # that needs to resynchronise is not a healthy link, so say so.
     rs = state.get("resyncs", 0)
-    if rs:
+    last_rs = state.get("last_resync_t")
+    if rs and last_rs is not None and now - last_rs < 60.0:
         add("framing", "warn", "%d resync%s: %s" % (
             rs, "" if rs == 1 else "s", state.get("last_resync", "")))
     else:
-        add("framing", "ok", "in step")
+        add("framing", "ok", "in step%s" % (
+            " (%d recovered total)" % rs if rs else ""))
 
     # --- the two sensors' timing, from the board's clock. Separate from the
     # "stream" check above on purpose: that one is about the link keeping up,
@@ -920,14 +1096,48 @@ def health(pipe, state, now):
     # --- detection. Reported separately from the boxes themselves because the
     # thing worth knowing is whether the temperature beside a label means
     # anything, and without a calibrated warp it does not.
+    # --- scene light. Its own line, above the detector, because it is what
+    # decides how to read the detector's line: a detector reporting nothing is
+    # either a working detector in an empty scene or a blind one, and those are
+    # the same sentence until this number is beside it.
+    light = state.get("light")
+    if light is not None:
+        if light["state"] == "blind":
+            add("light", "warn",
+                "visible is BLIND - %.1f%% of the frame is lit. Measured at "
+                "this light the detector recovers 1.6%% of the people in "
+                "front of it; thermal and radar are the channels to read"
+                % (100 * light["lit"]))
+        elif light["state"] == "dim":
+            add("light", "warn",
+                "part-lit - %.0f%% of the frame is lit, and nobody has measured "
+                "what this detector finds there. Its silence is NOT excused"
+                % (100 * light["lit"]))
+        else:
+            add("light", "ok", "lit - %.0f%% of the frame, median luma %.0f"
+                % (100 * light["lit"], light["p50"]))
+
     dt = state.get("detect_t")
     if dt is not None:
         age = now - dt
         n_det = len(state.get("detections") or [])
+        blind = (light or {}).get("state") == "blind"
         if state.get("detect_error"):
             add("detect", "fail", state["detect_error"])
         elif age > DETECT_STALE_S * 4:
             add("detect", "warn", "no detection for %.0fs" % age)
+        elif blind and not n_det:
+            # The one case where finding nothing is not a result. Saying "0
+            # boxes" here reads as "nobody is there", which is the claim this
+            # rig has no light to make.
+            add("detect", "warn", "silent, and explained: no light to see by")
+        elif state.get("detections_rejected"):
+            rej = state["detections_rejected"]
+            add("detect", "warn", "%d usable box%s; rejected %d implausible "
+                "person box%s (%s)" % (
+                    n_det, "" if n_det == 1 else "es", len(rej),
+                    "" if len(rej) == 1 else "es",
+                    rej[0].get("rejected", "geometry")))
         elif not pipe.warped:
             add("detect", "warn", "%d box%s, %.0fms - temperatures are read through "
                 "the placeholder warp and belong to the wrong pixels"
@@ -952,6 +1162,27 @@ def health(pipe, state, now):
                 % (state["radar_frames"], state.get("radar_drawn", 0),
                    state.get("radar_offscreen", 0),
                    ", %d bytes dropped" % drop if drop else ""))
+
+    # --- selected product channel. An unavailable sensor must not look like an
+    # empty scene, and the current visible transport must not be advertised as
+    # colour merely because the stable API id is rgb_radar.
+    product = live_channels.get(pipe.channel)
+    if product.raw_radar and state.get("radar_proj") is None:
+        add("channel", "warn", "%s selected without a radar source"
+            % product.label)
+    elif pipe.channel == "rgb_radar":
+        add("channel", "warn", "visible + radar is PAG7936 luma in this build; "
+            "true RGB waits on the RGB565 bandwidth gate")
+    # An AI overlay is optional decoration on the thermal-bearing products;
+    # missing inference must not make a healthy thermal camera look broken.
+    # The dedicated AI product, however, has no useful contract without an
+    # inference source, so it advertises that absence explicitly.
+    elif pipe.channel == "ai" and not (state.get("detector_available")
+                                      or state.get("students") is not None):
+        add("channel", "warn", "AI selected but neither detector nor student "
+            "engines are available")
+    else:
+        add("channel", "ok", "%s" % product.label)
 
     # --- the AI channels. Not "is the model loaded" - the switches are live,
     # so the question worth answering is whether what is on the screen right now
@@ -982,12 +1213,16 @@ def health(pipe, state, now):
                 % (n_t, "" if n_t == 1 else "es"))
         else:
             seen = state.get("student_seen") or {}
+            rejected_f = state.get("student_fused_rejected") or []
             hidden = (max(0, seen.get("thermal", 0) - n_t)
                       + max(0, seen.get("radar", 0) - n_r))
-            add("ai", "ok", "%s on - T %d / R %d / TR %d%s"
+            add("ai", "warn" if rejected_f and pipe.ai_fusion else "ok",
+                "%s on - T %d / R %d / TR %d%s%s"
                 % ("+".join(on), n_t, n_r, n_f,
                    "" if not hidden else
-                   ", %d below the confidence floor or deduplicated" % hidden))
+                   ", %d below the confidence floor or deduplicated" % hidden,
+                   "" if not rejected_f else
+                   ", %d TR rejected by raw-radar/geometry gate" % len(rejected_f)))
 
     # --- the lock. On its own line rather than inside the detector's: the
     # question it answers is not "did a sensor see somebody" but "is the viewer
@@ -1188,6 +1423,33 @@ class _PlannedRestart(Exception):
     """Not a failure: the supervisor is standing the board back up on purpose."""
 
 
+class _DroppedBatch(Exception):
+    """The board ended a batch while a promised payload was still incomplete.
+
+    This is intentionally distinct from a dead serial link.  ``stream()`` gives
+    up after three CDC no-progress timeouts to keep the Lepton inside its tested
+    service-gap envelope, then returns normally to the raw REPL.  Restarting the
+    cameras for that clean return turns one lost frame into a 20 second outage.
+    The prompt is proof that the interpreter and both sensors are still alive,
+    so the reader can discard this batch and submit the next one immediately.
+    """
+
+    def __init__(self, kind, received, expected):
+        self.kind = kind
+        self.received = received
+        self.expected = expected
+        super().__init__("%s short read %d/%d" % (kind, received, expected))
+
+
+# A bounded raw-REPL submission ends with the line written by stream(), followed
+# by MicroPython's stdout terminator and prompt.  Newline translation differs
+# between ports, so accept both forms.  Detection is restricted to an exact
+# BUFFER SUFFIX while fewer than the promised bytes are present; the prompt
+# cannot have legitimate payload after it, and the long suffix makes mistaking
+# binary image data for control framing vanishingly unlikely.
+_BATCH_FOOTERS = (b"#BATCH\r\n\x04\x04>", b"#BATCH\n\x04\x04>")
+
+
 # Free heap below this and the board gets restarted before the automatic collector
 # can fire. The collector is the hazard, not the memory: a gc.collect() with the
 # Lepton up wedges it permanently and no soft re-init recovers it - only a fresh
@@ -1206,6 +1468,66 @@ HEAP_FLOOR = 4 << 20
 # it there is simply no measurement. The board's own thermal interval is the only
 # way to see it, since a gap on this side is indistinguishable from a slow link.
 LEPTON_SAFE_GAP_MS = 2500
+
+# A luma a pixel has to reach before it counts as lit at all. Everything below
+# is the noise floor of an unlit frame: the three dark sessions below sit at a
+# median of 12.6-13.0 with a p95 under 22.
+LIGHT_FLOOR = 48
+
+# How much of the frame has to be lit before the detector can be expected to
+# work in it. Measured 2026-08-26 by running this rig's own yolov10n over
+# sampled frames of seven recorded sessions - `lit` is the share of pixels at or
+# above LIGHT_FLOOR:
+#
+#   session                 luma p50   lit share            frames with a person
+#   radar3-dark-empty2          12.6   0.000%               0 of 1413  (empty)
+#   radar3-dark1                13.0   0.000%               0 of  701  (unusable)
+#   radar3-dark-negative1       13.0   0.250%  (max 4.58%)  5 of  625
+#   static1                     85.0  73.880%  (min 73.08%)         99%
+#   moving1                     87.5  75.158%  (min 71.77%)        100%
+#   lobby1                      86.7  77.555%                      100%
+#   multi5                      88.5  78.113%                      100%
+#   radar3-negative1            90.3  92.485%                          -
+#
+# The third row is the measurement that matters, and the dark sessions were run
+# frame by frame rather than sampled to get it right: 306 of that session's
+# frames hold a person standing close enough to fill the thermal frame, and the
+# visible detector recovers FIVE of them - 1.6%. Not literally zero, and not a
+# channel either. "The detector saw nobody" and "the detector could not have
+# seen anybody" are the same picture and opposite claims, and until this metric
+# existed nothing in the viewer could tell them apart.
+#
+# Why a lit SHARE and not a percentile: a percentile cannot see a small bright
+# region. A dark room with one person-sized patch of light in it (20x50 px at
+# 15 m, 0.39% of a 640x400 frame) has a p95 of 13 and reads as pitch black -
+# and that is the one case where excusing the detector's silence would hide a
+# person standing in the only lit spot in the room.
+#
+# The two thresholds bound what was MEASURED, and the gap between them is
+# deliberately left unclaimed:
+LIGHT_BLIND_FRAC = 0.05      # 0-4.58% measured: 1.6% of people recovered
+LIGHT_LIT_FRAC = 0.70        # 71.8-92.5% measured: a person found in 99-100%
+# Between them nobody has measured anything on this rig, so a frame that lands
+# there is reported as part-lit and its silence is NOT excused. Excusing an
+# unmeasured case is how a real miss gets filed as darkness.
+
+
+def scene_light(y):
+    """How much light the visible frame has, and whether that explains silence.
+
+    Deliberately measured on the plain luma, before anything is drawn: an
+    overlay is bright, and a picture with boxes burned into it reads as better
+    lit than the scene it came from.
+    """
+    lit = float((y >= LIGHT_FLOOR).mean())
+    if lit < LIGHT_BLIND_FRAC:
+        state = "blind"
+    elif lit < LIGHT_LIT_FRAC:
+        state = "dim"
+    else:
+        state = "lit"
+    return {"lit": round(lit, 4), "p50": round(float(np.median(y)), 1),
+            "state": state}
 
 
 class Latest:
@@ -1258,10 +1580,29 @@ class Renderer(threading.Thread):
     500ms write stall that costs a frame's tail.
     """
 
+    # A close, clipped person may legitimately fill the height of the camera,
+    # so neither height nor area alone is grounds for rejection.  A landscape
+    # box covering most of the entire sensor is different: it is the detector
+    # calling the scene/doorway a person.  That exact failure was observed as a
+    # 613x392 box on this 640x400 stream, and once admitted it permanently gave
+    # a thermal/radar clutter track visible-detector trust.
+    MAX_LANDSCAPE_PERSON_AREA = 0.65
+    MIN_LANDSCAPE_PERSON_ASPECT = 1.10
+    # The visible model sometimes calls the fixed standing lamps in this room
+    # people at 0.35..0.75.  Those boxes are semantically plausible and have a
+    # body-temperature peak, so neither box geometry nor radiometry can reject
+    # them.  Above this floor the detector may vouch immediately; below it the
+    # observation is `det_weak` and must move or gain independent thermal
+    # evidence before the tracker presents it as a person.
+    DET_INSTANT_VOUCH_CONF = 0.80
+
     def __init__(self, pipe, state, work, detector=None, radar=None,
                  radar_proj=None, video=None, students=None, th2vis=None):
         super().__init__(daemon=True)
         self.pipe, self.state, self.work = pipe, state, work
+        # This frame's 16-bit words, or None on an 8-bit session. Only the
+        # silhouette reads it - see _split_plane().
+        self._raw16 = None
         self.students = students
         # The thermal->visible mapper. Held here and not inside `students`
         # because the person outline is drawn for the DETECTOR's boxes too,
@@ -1300,12 +1641,32 @@ class Renderer(threading.Thread):
             item = self.det_in.get()
             if item is None:
                 continue
-            y = item
+            y, light = item
+            if light["state"] == "blind":
+                # A detection in a frame whose pixels are all at the camera's
+                # dark-noise floor is not visual confirmation. Letting one such
+                # false positive reach the tracker permanently sets `ever det`
+                # and allows thermal/radar clutter to inherit detector trust.
+                # Report the channel as unavailable for this frame instead.
+                self.state["detections"] = []
+                self.state["detect_ms"] = 0.0
+                self.state["detect_suppressed"] = "blind"
+                self.state["detect_t"] = time.time()
+                continue
             try:
                 dets = self.det(y)
             except Exception as e:                  # a bad frame must not end detection
                 self.state["detect_error"] = "%s: %s" % (type(e).__name__, e)
                 continue
+            accepted, rejected = [], []
+            for d in dets:
+                reason = self._reject_person_geometry(d)
+                if reason is None:
+                    accepted.append(d)
+                else:
+                    rejected.append(dict(d, rejected=reason))
+            dets = accepted
+            self.state["detections_rejected"] = rejected
             # The temperature is the whole reason for the box. Taken here rather
             # than in the drawing code so that /detections and the overlay quote
             # the same number, and so a slow region query costs the detector's
@@ -1327,19 +1688,44 @@ class Renderer(threading.Thread):
                                       and detect.BODY_C[0] <= mx <= detect.BODY_C[1])
             self.state["detections"] = dets
             self.state["detect_ms"] = round(self.det.ms, 1)
+            self.state.pop("detect_suppressed", None)
             self.state["detect_t"] = time.time()
+
+    @classmethod
+    def _reject_person_geometry(cls, d):
+        """Reason an obviously scene-sized person box is unusable, else None.
+
+        This is deliberately one-sided and narrow.  It does not impose a
+        textbook standing-person aspect ratio: seated people, partial bodies
+        and close targets are all in scope.  It only refuses a box that is both
+        landscape and covers most of the complete image.
+        """
+        if d.get("cls") != "person":
+            return None
+        w, h = float(d.get("w", 0)), float(d.get("h", 0))
+        if w <= 0 or h <= 0:
+            return "empty person box"
+        area = w * h / float(OUT_W * OUT_H)
+        if (area >= cls.MAX_LANDSCAPE_PERSON_AREA
+                and w / h >= cls.MIN_LANDSCAPE_PERSON_ASPECT):
+            return "scene-sized landscape box (%.0f%%, %.2f:1)" % (
+                100.0 * area, w / h)
+        return None
 
     # Student overlay colours, RGB frame order (imencode flips to BGR later).
     STUDENT_TH_COL = (255, 150, 0)       # orange: thermal student
     STUDENT_RD_COL = (0, 210, 255)       # cyan: radar student
     STUDENT_FU_COL = (255, 255, 255)     # white: both channels agree
-    # The pairing gate for the fusion channel, in visible-plane pixels, applied
-    # to u ONLY. D3 measured the thermal/radar disagreement at du median 14.4 px
-    # and p90 37.5 px, inside the extrinsic envelope; elevation comes off a
-    # two-element aperture (sigma ~12 deg) and says almost nothing about which
-    # box a return belongs to, so v is not gated on at all. Same stance as
-    # radar_overlay.attach_range(), for the same measured reason.
-    FUSION_DU_PX = 50.0
+    # Candidate pairing is horizontal-only. D3's static measurements put the
+    # disagreement at p90 37.5 px, but the 2026-08-26 V6 dark walking test
+    # measured 60..193 px while the radar box lagged the moving thermal box.
+    # A tight 50 px gate therefore discarded two real detections before the
+    # physical checks below could examine them. This wider gate only proposes
+    # a pair: attach_range() must still find a current non-static raw return in
+    # the thermal support, and _fused_geometry_reason() rejects impossible
+    # range/height. Elevation remains ungated because the two-element aperture
+    # has ~12 deg sigma and cannot reliably identify a box vertically.
+    FUSION_DU_PX = 180.0
 
     # Two ways of being the same object twice, because the students emit eight
     # slots per frame with no NMS of their own:
@@ -1364,6 +1750,7 @@ class Renderer(threading.Thread):
     # How far outside the person the fusion ring is drawn, in visible pixels.
     # Far enough to read as a ring around them rather than a second outline.
     HALO_PX = 5
+    _RADAR_UNSET = object()
 
     @staticmethod
     def _draw_shape(rgb, mask, col, thick, grow=0):
@@ -1432,10 +1819,9 @@ class Renderer(threading.Thread):
         The fused box keeps the THERMAL extent. The radar box's height is a
         guess from that same two-element aperture; what the radar channel
         contributes here is agreement and range, not geometry. The score is the
-        noisy-OR of the two - two independent sensors each half-believing a
-        person is a stronger claim than either alone - and both components ride
-        along so the page can show what was actually combined rather than a
-        number nobody can take apart.
+        weaker component, not noisy-OR: both students were trained from the same
+        RGB teacher, so their errors are correlated and treating them as
+        independent inflated two weak claims into one strong claim.
         """
         pairs = []
         for i, t in enumerate(tdets):
@@ -1456,16 +1842,34 @@ class Renderer(threading.Thread):
             used_r.add(j)
             t, r = tdets[i], rdets[j]
             x, y, w, h = t["vis"]
-            t["fused"] = r["fused"] = True
             fused.append({"x": x, "y": y, "w": w, "h": h,
-                          "conf": 1.0 - (1.0 - t["conf"]) * (1.0 - r["conf"]),
+                          "conf": min(t["conf"], r["conf"]),
                           "conf_thermal": round(t["conf"], 3),
                           "conf_radar": round(r["conf"], 3),
-                          "du": round(du, 1)})
+                          "du": round(du, 1), "_ti": i, "_ri": j})
         return fused
 
-    def _run_students(self, thermal, rgb):
-        """Run the enabled student channels on this tick and draw them.
+    @staticmethod
+    def _fused_geometry_reason(d):
+        """Why this candidate is not physical Thermal+Radar agreement.
+
+        A radar-student rectangle by itself is a learned image-plane guess.  A
+        TR claim additionally needs a current non-static raw return inside its
+        horizontal support; attach_range() supplies that and excludes static
+        room clutter.  Once range exists, the thermal extent must not imply an
+        object taller than the tracker accepts as a person.
+        """
+        r = d.get("radar_m")
+        if r is None:
+            return "no moving radar return supports the thermal box"
+        implied_h = float(r) * float(d["h"]) / tracking.FOCAL_PX
+        if implied_h > tracking.MAX_PERSON_M:
+            return "range/box implies %.1fm height" % implied_h
+        d["implied_h_m"] = round(implied_h, 2)
+        return None
+
+    def _run_students(self, thermal, rgb, radar_frame=_RADAR_UNSET, draw=True):
+        """Run enabled student evidence, optionally drawing it on this channel.
 
         Runs inline in the render thread on purpose: both engines together
         are ~1.5 ms, two orders of magnitude under the frame period, and a
@@ -1479,9 +1883,20 @@ class Renderer(threading.Thread):
         """
         s = self.students
         pl = self.pipe
+        # On a thermal operator product the thermal student is the primary
+        # visual answer, even when the deployment switches expose only the
+        # stricter fusion result.  Fusion still owns which engines run; this
+        # only lets the already-computed thermal result speak on the view whose
+        # whole purpose is seeing heat.
+        thermal_product = live_channels.get(pl.channel).base == "thermal"
         want_t = pl.ai_thermal or pl.ai_fusion
         want_r = pl.ai_radar or pl.ai_fusion
-        tdets, rdets, fused, fr = [], [], [], None
+        # The sentinel preserves the small direct-call surface used by offline
+        # tests and tools.  The live render path always passes its one sampled
+        # frame explicitly, including None when the radar is stale.
+        fr = (self.radar.get() if radar_frame is self._RADAR_UNSET
+              and self.radar is not None else radar_frame)
+        tdets, rdets, fused = [], [], []
         if want_t and thermal is not None and len(thermal) == 160 * 120:
             try:
                 th = (np.frombuffer(thermal, np.uint8)
@@ -1510,16 +1925,14 @@ class Renderer(threading.Thread):
         for d in tdets:
             d["vis"] = (s["th2vis"].box(d["x"], d["y"], d["w"], d["h"])
                         if s["th2vis"] is not None else None)
-        if want_r and s["radar"] is not None and self.radar is not None:
-            fr = self.radar.get()
-            if fr is not None:
-                try:
-                    rdets = s["radar"](
-                        [[p['x'], p['y'], p['z'], p['v'], p['snr'],
-                          p['noise']] for p in fr['points']])
-                except Exception as e:
-                    self.state["student_error"] = "radar %s: %s" % (
-                        type(e).__name__, e)
+        if want_r and s["radar"] is not None and fr is not None:
+            try:
+                rdets = s["radar"](
+                    [[p['x'], p['y'], p['z'], p['v'], p['snr'],
+                      p['noise']] for p in fr['points']])
+            except Exception as e:
+                self.state["student_error"] = "radar %s: %s" % (
+                    type(e).__name__, e)
         seen_r = len(rdets)
         rdets = self._dedup([d for d in rdets
                              if d["conf"] >= pl.ai_conf_radar])
@@ -1527,13 +1940,13 @@ class Renderer(threading.Thread):
         # is exactly the box the fused entry carries, so the fusion ring can
         # find its person without threading an index through _fuse().
         shapes = {}
-        if (pl.ai_silhouette and self.th2vis is not None
+        if (draw and pl.ai_silhouette and self.th2vis is not None
                 and thermal is not None and len(thermal) == 160 * 120):
-            raw8 = np.frombuffer(thermal, np.uint8).reshape(120, 160)
+            plane = self._split_plane(thermal)
             for d in tdets:
                 if d["vis"] is None:
                     continue
-                m = self.th2vis.shape_in(raw8, *d["vis"])
+                m = self.th2vis.shape_in(plane, *d["vis"])
                 if m is not None:
                     shapes[tuple(d["vis"])] = m
 
@@ -1545,6 +1958,23 @@ class Renderer(threading.Thread):
                 # from the radar student, whose output is a box and carries no
                 # distance at all.
                 radar_overlay.attach_range(fused, fr["points"], self.radar_proj)
+            accepted, rejected = [], []
+            for d in fused:
+                reason = self._fused_geometry_reason(d)
+                if reason is not None:
+                    rejected.append({k: v for k, v in d.items()
+                                     if not k.startswith("_")}
+                                    | {"rejected": reason})
+                    continue
+                tdets[d["_ti"]]["fused"] = True
+                rdets[d["_ri"]]["fused"] = True
+                d.pop("_ti", None)
+                d.pop("_ri", None)
+                accepted.append(d)
+            fused = accepted
+            self.state["student_fused_rejected"] = rejected
+        else:
+            self.state["student_fused_rejected"] = []
         self.state["student_thermal"] = tdets
         self.state["student_radar"] = rdets
         self.state["student_fused"] = fused
@@ -1560,7 +1990,7 @@ class Renderer(threading.Thread):
         # unreadable. Which channel contributed is still visible - that is what
         # the box colour is for - and an UNpaired box keeps its label, which is
         # the case where the number actually decides something.
-        if pl.ai_thermal:
+        if draw and (pl.ai_thermal or (thermal_product and want_t)):
             for d in tdets:
                 if d["vis"] is None:
                     continue          # no LUT, or outside the overlap
@@ -1579,7 +2009,7 @@ class Renderer(threading.Thread):
                                 (x, max(11, y - 4)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.38,
                                 self.STUDENT_TH_COL, 1, cv2.LINE_AA)
-        if pl.ai_radar:
+        if draw and pl.ai_radar:
             for d in rdets:
                 x, y, w, h = d["x"], d["y"], d["w"], d["h"]
                 if d["conf"] >= self.STRONG_CONF:
@@ -1596,7 +2026,7 @@ class Renderer(threading.Thread):
         # with an orange one inside it says "the thermal channel found this and
         # the radar agreed", which is a different and more useful statement than
         # a single box in a third colour.
-        for d in fused:
+        for d in fused if draw else ():
             x, y = max(0, d["x"] - 3), max(0, d["y"] - 3)
             m = shapes.get((d["x"], d["y"], d["w"], d["h"]))
             # A ring at HALO_PX outside the person, so agreement reads as
@@ -1617,7 +2047,108 @@ class Renderer(threading.Thread):
     # Lock overlay colours, RGB frame order.
     LOCK_COL = (0, 230, 0)               # green, as the detector's person box
     LOCK_COAST_COL = (255, 190, 60)      # amber: predicted, not measured
-    SRC_LETTER = {"det": "D", "thermal": "T", "radar": "R", "fusion": "F"}
+    # Grey, and never green or amber: a suppressed candidate is not a person
+    # the viewer is claiming. It is deliberately the dimmest thing drawn.
+    STATIC_COL = (150, 150, 150)
+    SRC_LETTER = {"det": "D", "det_weak": "d", "thermal": "T",
+                  "radar": "R", "fusion": "F"}
+    COAST_OVERLAP_IOU = 0.5
+    # Once motion/fusion has vouched for a person, a current body-shaped warm
+    # component may hold that same track while they stand. These gates apply to
+    # the component inside the existing box; they never create a new track.
+    THERMAL_HOLD_MIN_PIXELS = 120
+    THERMAL_HOLD_MIN_BOX_FRAC = 0.04
+    THERMAL_HOLD_MIN_HEIGHT_FRAC = 0.25
+    # Cold-start exception for a person who was already sitting still when the
+    # process began. The learned thermal detector supplies the semantic claim;
+    # the current radiometric component must independently look like a body:
+    # tall enough, connected down its height, not a filled rectangle, and with
+    # a head/upper section narrower than the torso. A warm door fails the last
+    # two checks even if the student gives it a confident box.
+    THERMAL_SHAPE_CONF = 0.90
+    THERMAL_STATIC_CONF = 0.98
+    THERMAL_BODY_MIN_PIXELS = 400
+    THERMAL_BODY_MIN_BOX_FRAC = 0.08
+    THERMAL_BODY_MIN_HEIGHT_FRAC = 0.35
+    THERMAL_BODY_MIN_ASPECT = 0.65
+    THERMAL_BODY_MAX_FILL = 0.88
+    THERMAL_BODY_MIN_ROW_COVERAGE = 0.70
+    THERMAL_BODY_HEAD_TO_TORSO = 0.85
+
+    @classmethod
+    def _display_tracks(cls, tracks, now):
+        """Hide a coast that is visually replaced by a current measurement.
+
+        The tracker keeps both identities until its bounded coast expires. That
+        state is useful for reassociation, but drawing a dashed old box over a
+        measured box makes one nearby person look like two. Only presentation
+        is filtered; non-overlapping coasts remain visible and every track stays
+        in `/ui` and `/ai`.
+        """
+        measured = [t for t in tracks if t.coasting_for(now) <= 0.15]
+        return [t for t in tracks
+                if (t.coasting_for(now) <= 0.15
+                    or not any(tracking.iou(t.box, m.box)
+                               >= cls.COAST_OVERLAP_IOU for m in measured))]
+
+    @classmethod
+    def _thermal_human_shape(cls, mask, box):
+        """Does this warm component have conservative seated-person geometry?
+
+        This is not another object detector. It is an independent guard on a
+        thermal student's already-high-confidence person result, used only to
+        decide whether a motionless cold-start may be promoted to a lock.
+        Returns the verdict and compact metrics so `/ai` can explain it.
+        """
+        if mask is None:
+            return False, {"reason": "no warm component"}
+        ys, xs = np.nonzero(mask)
+        pixels = int(len(xs))
+        if not pixels:
+            return False, {"reason": "empty warm component", "pixels": 0}
+        x0, y0 = int(xs.min()), int(ys.min())
+        x1, y1 = int(xs.max()) + 1, int(ys.max()) + 1
+        bw, bh = x1 - x0, y1 - y0
+        area = max(1, bw * bh)
+        box_area = max(1, int(box[2]) * int(box[3]))
+        fill = pixels / float(area)
+        height_frac = bh / float(max(1, int(box[3])))
+        box_frac = area / float(box_area)
+        aspect = bh / float(max(1, bw))
+        crop = mask[y0:y1, x0:x1]
+        widths = np.count_nonzero(crop, axis=1).astype(np.float32)
+        row_coverage = float(np.count_nonzero(widths)) / max(1, bh)
+        cut = max(1, bh // 4)
+        top = widths[:cut]
+        torso = widths[cut:min(bh, 3 * cut)]
+        top_w = float(np.percentile(top[top > 0], 75)) if np.any(top > 0) else 0.0
+        torso_w = (float(np.percentile(torso[torso > 0], 75))
+                   if np.any(torso > 0) else 0.0)
+        head_ratio = top_w / max(1.0, torso_w)
+        metrics = {
+            "pixels": pixels,
+            "box_frac": round(box_frac, 3),
+            "height_frac": round(height_frac, 3),
+            "aspect": round(aspect, 3),
+            "fill": round(fill, 3),
+            "row_coverage": round(row_coverage, 3),
+            "head_torso": round(head_ratio, 3),
+        }
+        checks = (
+            (pixels >= cls.THERMAL_BODY_MIN_PIXELS, "too few warm pixels"),
+            (box_frac >= cls.THERMAL_BODY_MIN_BOX_FRAC, "component too small"),
+            (height_frac >= cls.THERMAL_BODY_MIN_HEIGHT_FRAC, "component too short"),
+            (aspect >= cls.THERMAL_BODY_MIN_ASPECT, "component too wide"),
+            (fill <= cls.THERMAL_BODY_MAX_FILL, "filled rectangle"),
+            (row_coverage >= cls.THERMAL_BODY_MIN_ROW_COVERAGE,
+             "broken vertical component"),
+            (torso_w > 0 and head_ratio <= cls.THERMAL_BODY_HEAD_TO_TORSO,
+             "no head-to-torso taper"),
+        )
+        for ok, reason in checks:
+            if not ok:
+                return False, dict(metrics, reason=reason)
+        return True, dict(metrics, reason="human thermal shape")
 
     def _lock_observations(self, thermal):
         """This cycle's person evidence, from every sensor that has any.
@@ -1637,21 +2168,98 @@ class Renderer(threading.Thread):
             for d in self.state.get("detections") or []:
                 if d.get("cls") != "person":
                     continue
+                # A low-confidence COCO person is useful evidence, but not a
+                # verdict: on this exact view the standing lamps repeatedly
+                # score 0.35..0.75 and sit inside the body-heat band.  Keep the
+                # observation so a real walker can earn the lock through
+                # continuity, while tracker.py refuses to vouch for it at rest.
+                conf = float(d.get("conf", 0.0))
+                src = ("det" if conf >= self.DET_INSTANT_VOUCH_CONF
+                       else "det_weak")
                 obs.append({"x": d["x"], "y": d["y"], "w": d["w"], "h": d["h"],
-                            "conf": d.get("conf", 0.0), "src": "det",
+                            "conf": conf, "src": src,
                             "radar_m": d.get("radar_m"), "max_c": d.get("max_c")})
-        for d in self.state.get("student_thermal") or []:
-            if d.get("vis"):
-                x, y, w, h = d["vis"]
-                obs.append({"x": x, "y": y, "w": w, "h": h,
-                            "conf": d["conf"], "src": "thermal"})
-        for d in self.state.get("student_radar") or []:
-            obs.append({"x": d["x"], "y": d["y"], "w": d["w"], "h": d["h"],
-                        "conf": d["conf"], "src": "radar"})
-        for d in self.state.get("student_fused") or []:
-            obs.append({"x": d["x"], "y": d["y"], "w": d["w"], "h": d["h"],
-                        "conf": d["conf"], "src": "fusion",
-                        "radar_m": d.get("radar_m")})
+        # A hidden diagnostic channel must not blindly become person evidence
+        # through the lock. In fusion-only operation ordinary thermal
+        # components are hold-only: they may refresh a person but may not turn
+        # a warm doorway into one.
+        # There is one conservative cold-start exception: a >=0.98 thermal
+        # person detection whose CURRENT warm component has independently
+        # human geometry. That can establish a seated, motionless person even
+        # before radar Doppler or visible light is available.
+        plane = (self._split_plane(thermal)
+                 if self.th2vis is not None and thermal is not None
+                 and len(thermal) == TH_W * TH_H else None)
+        if self.pipe.ai_thermal or self.pipe.ai_fusion:
+            for d in self.state.get("student_thermal") or []:
+                if d.get("vis"):
+                    x, y, w, h = d["vis"]
+                    mask = (self.th2vis.shape_in(plane, x, y, w, h)
+                            if plane is not None else None)
+                    shape_ok, shape_metrics = self._thermal_human_shape(
+                        mask, (x, y, w, h))
+                    human_shape = (d["conf"] >= self.THERMAL_SHAPE_CONF
+                                   and shape_ok)
+                    static_vouch = (d["conf"] >= self.THERMAL_STATIC_CONF
+                                    and shape_ok)
+                    d["human_shape"] = shape_ok
+                    d["shape_metrics"] = shape_metrics
+                    temp = self.pipe.temp_region(x, y, w, h)
+                    if temp is not None and temp.get("samples", 0):
+                        d["max_c"] = round(temp["max"], 1)
+                        d["mean_c"] = round(temp["mean"], 1)
+                    obs.append({"x": x, "y": y, "w": w, "h": h,
+                                "conf": d["conf"], "src": "thermal",
+                                "max_c": d.get("max_c"),
+                                "human_shape": human_shape,
+                                "shape_guarded": True,
+                                "static_vouch": static_vouch,
+                                # A thermal box is allowed to start only when
+                                # its CURRENT radiometric component looks like
+                                # a person. Selecting the thermal product still
+                                # draws weaker evidence, but does not turn it
+                                # into a green person lock.
+                                "hold_only": not human_shape})
+        if self.pipe.ai_radar:
+            for d in self.state.get("student_radar") or []:
+                obs.append({"x": d["x"], "y": d["y"], "w": d["w"],
+                            "h": d["h"], "conf": d["conf"], "src": "radar"})
+        if self.pipe.ai_fusion:
+            for d in self.state.get("student_fused") or []:
+                obs.append({"x": d["x"], "y": d["y"], "w": d["w"],
+                            "h": d["h"], "conf": d["conf"], "src": "fusion",
+                            "radar_m": d.get("radar_m")})
+        # A stationary person can make both learned students disappear: radar
+        # loses Doppler, while an occluder such as a laptop can break the
+        # thermal student's learned full-body box. The radiometric image still
+        # contains their warm head/arms/legs. Use that shape only to refresh a
+        # track already vouched for by prior motion/fusion. tracker.py enforces
+        # hold_only again, so a warm wall or empty-room blob cannot be born or
+        # promoted here even if this shape test accepts it.
+        if (self.pipe.ai_fusion and not (self.state.get("student_fused") or [])
+                and not (self.state.get("student_thermal") or [])
+                and self.th2vis is not None and thermal is not None
+                and len(thermal) == TH_W * TH_H):
+            plane = self._split_plane(thermal)
+            for t in self.lock.all():
+                if not t.vouched:
+                    continue
+                m = self.th2vis.shape_in(plane, *t.box)
+                if m is None:
+                    continue
+                ys, xs = np.nonzero(m)
+                if len(xs) < self.THERMAL_HOLD_MIN_PIXELS:
+                    continue
+                x0, y0 = int(xs.min()), int(ys.min())
+                x1, y1 = int(xs.max()) + 1, int(ys.max()) + 1
+                bw, bh = x1 - x0, y1 - y0
+                track_area = max(1, t.box[2] * t.box[3])
+                if (bw * bh < self.THERMAL_HOLD_MIN_BOX_FRAC * track_area
+                        or bh < self.THERMAL_HOLD_MIN_HEIGHT_FRAC * t.box[3]):
+                    continue
+                obs.append({"x": x0, "y": y0, "w": bw, "h": bh,
+                            "conf": t.conf, "src": "thermal",
+                            "hold_only": True})
         return obs
 
     def _draw_tracks(self, rgb, tracks, thermal, now):
@@ -1693,6 +2301,72 @@ class Renderer(threading.Thread):
             cv2.putText(rgb, label, (x + 3, ty), cv2.FONT_HERSHEY_SIMPLEX,
                         0.45, col, 1, cv2.LINE_AA)
 
+    def _draw_static(self, rgb, tracks, now):
+        """Draw what the lock is holding back, as held back.
+
+        These are candidates the visible detector never confirmed and which
+        have never moved: a warm door, a radiator, a lit sign - and, in the
+        dark, a person standing still. The tracker cannot tell those apart and
+        neither can this, which is exactly why they are drawn differently
+        rather than either claimed or hidden.
+
+        Counted on the card and API even when hidden. This diagnostic overlay
+        is shown only with `student evidence`: the normal AI product must not
+        surround furniture and other rejected candidates with tracking marks.
+
+        Corner ticks and not a rectangle, grey and not green, no thermal
+        silhouette: every choice here is to keep it from reading as a person.
+        The same corner-tick language the student channels already use below
+        their confidence floor, and for the same reason - a candidate and a
+        detection must not look alike.
+        """
+        for t in tracks:
+            x, y, w, h = t.box
+            arm = max(6, min(w, h) // 4)
+            col = self.STATIC_COL
+            for cx, sx in ((x, 1), (x + w, -1)):
+                for cy, sy in ((y, 1), (y + h, -1)):
+                    cv2.line(rgb, (cx, cy), (cx + sx * arm, cy), col, 1,
+                             cv2.LINE_AA)
+                    cv2.line(rgb, (cx, cy), (cx, cy + sy * arm), col, 1,
+                             cv2.LINE_AA)
+            # No id: it is not a track the viewer is claiming continuity for.
+            # How long it has been there is the useful number - something warm
+            # that has sat still for a minute is furniture, and something warm
+            # that appeared eight seconds ago and has not moved is worth a look.
+            label = "static %.0fs" % (now - t.born)
+            if t.max_c is not None:
+                label += "  %.1fC" % t.max_c
+            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                          0.4, 1)
+            ty = y - 5 if y - 5 - th > 0 else y + h + th + 5
+            cv2.putText(rgb, label, (x + 2, ty), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4, col, 1, cv2.LINE_AA)
+
+    def _split_plane(self, thermal):
+        """The thermal plane the silhouette should split, at the best precision
+        this session has.
+
+        Otsu is separating a person from whatever is behind them, and that
+        boundary is routinely a fraction of a degree - measured in this rig's
+        lobby, a person reads 30.9 C and a lit glass door 31.7 C. On the 8-bit
+        plane at the 0:60 window run_live.sh pins for the students, 0.8 C is 3.4
+        codes; over 4000 person-sized boxes, one holding 1-2 C of spread hands
+        Otsu a median of 8 distinct levels. Eight levels is not a histogram to
+        split, it is quantisation noise with a threshold drawn through it.
+
+        The same 0.8 C is 80 counts in the sensor's words, and the same boxes
+        give 79 levels. So the shape splits the words whenever --raw16 is
+        streaming.
+
+        Deliberately the ONLY thing that moves to 16-bit. The student engines
+        were trained on the 8-bit plane and have to keep seeing it, and this
+        changes what is drawn, never what is measured or recorded.
+        """
+        if self._raw16 is not None:
+            return self._raw16
+        return np.frombuffer(thermal, np.uint8).reshape(TH_H, TH_W)
+
     def _person_outline(self, thermal, rgb):
         """An annotate() callback that draws a person's thermal shape.
 
@@ -1703,21 +2377,61 @@ class Renderer(threading.Thread):
         if (not self.pipe.ai_silhouette or self.th2vis is None
                 or thermal is None or len(thermal) != 160 * 120):
             return None
-        raw8 = np.frombuffer(thermal, np.uint8).reshape(120, 160)
+        plane = self._split_plane(thermal)
 
         def draw(d, col):
             if d["cls"] != "person":
                 return False
-            m = self.th2vis.shape_in(raw8, d["x"], d["y"], d["w"], d["h"])
+            m = self.th2vis.shape_in(plane, d["x"], d["y"], d["w"], d["h"])
             return m is not None and self._draw_shape(rgb, m, col, 2)
         return draw
+
+    def _raw_stats(self, raw16):
+        """Scene temperature at the sensor's own precision, off the 16-bit words.
+
+        Reported beside frame_stats() rather than instead of it, because the two
+        answer different questions. That one asks "how hot is this pixel of the
+        picture", sampling the registered, warped, 8-bit plane the fused image is
+        built from, and it stays the right answer for a click on the image. This
+        one asks "what is actually in front of the camera", on the thermal
+        sensor's own grid, with no window, no clipping and no requantisation -
+        0.01C per code against the 0.588C the wide-open 8-bit plane can express
+        and the ~0.141C it manages after auto-ranging.
+
+        The dead rows come out first or they own both ends of the answer. This
+        unit returns 14 rows carrying no scene, pinned high - measured ~190
+        codes above the frame median - so an unfiltered max is those rows every
+        time and an unfiltered mean is 11.67% of the frame pulling upward.
+        fusion.c has already decided which rows they are, on this very frame, so
+        the verdict is borrowed rather than re-derived.
+        """
+        bad = self.pipe.bad_rows()
+        kept = raw16[~bad] if bad.any() else raw16
+        if kept.size == 0:
+            return None
+        v = thermal_io.celsius(kept)
+        lo, hi = float(v.min()), float(v.max())
+        return {"min": lo, "max": hi, "mean": float(v.mean()),
+                "delta": hi - lo, "rows_dead": int(bad.sum())}
 
     def run(self):
         while not self.stop.is_set():
             item = self.work.get()
             if item is None:
                 continue
-            jpg, thermal = item
+            jpg, wire = item
+
+            # One wire format, two meanings, told apart by length alone. 19200
+            # bytes is the board's AGC'd picture and is used as-is. 38400 is the
+            # Lepton's own radiometric output at 0.01C per code: the picture is
+            # rebuilt from it so the pipeline sees exactly what it always saw,
+            # and the words themselves go on to the recorder and the stats,
+            # which are the two things that wanted a measurement.
+            thermal, raw16 = wire, None
+            if len(wire) == 2 * TH_W * TH_H:
+                raw16 = np.frombuffer(wire, "<u2").reshape(TH_H, TH_W)
+                thermal = agc8(raw16, self.state.get("range"))
+            self._raw16 = raw16
 
             y = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_GRAYSCALE)
             if y is None or y.shape != (OUT_H, OUT_W):
@@ -1731,22 +2445,27 @@ class Renderer(threading.Thread):
                 continue
 
             p = self.pipe
-            rgb = p.process(y.tobytes(), thermal)
+            fused = p.process(y.tobytes(), thermal)
+            channel = live_channels.get(p.channel)
+
+            # One radar answer per camera frame.  Every consumer below - the
+            # radar student, detector range association, map state and raw
+            # overlay - sees this exact object, so a single displayed frame can
+            # no longer mix two adjacent radar frame numbers.
+            radar_frame = self.radar.get() if self.radar is not None else None
 
             rw = self.state.setdefault("rows_window", [])
             rw.append(p.f.rows_rebuilt)
             del rw[:-60]
 
-            if p.view != "fused" or p.outline:
-                edges = p.view == "edges"
-                needs_cover = p.outline or p.view == "operator"
-                rgb = compose(p.view, rgb, y,
-                              treg=p.treg_grid() if edges else None,
-                              exclude=p.repaired_grid() if edges else None,
-                              cover=p.cover_grid() if needs_cover else None,
-                              mix=p.mix,
-                              phase=int(time.time() / p.blink_period) % 2 == 0,
-                              outline=p.outline)
+            # After process(), so fusion.c's row verdict describes this frame.
+            if raw16 is not None:
+                self.state["raw_stats"] = self._raw_stats(raw16)
+
+            # PAG7936 is currently transported as luma.  compose_channel() is
+            # the stable boundary where true RGB will enter after its board-side
+            # bandwidth gate; fusion.c and the detector will continue to get y.
+            rgb = compose_channel(p, fused, y)
 
             # The recording feeds calibration picking, so it must not carry the
             # guessed radar overlay or detection boxes: a pixel clicked next to
@@ -1755,8 +2474,21 @@ class Renderer(threading.Thread):
             # radar_calib_web.py refuses frames that lack the 'clean' flag.
             clean = rgb.copy() if self.video is not None else None
 
+            # How much light the visible camera had this frame. Measured on the
+            # plain luma before any overlay, every frame and not only under the
+            # lock, because the question it answers - is the visible channel's
+            # silence explained - is asked of the detector too.
+            self.state["light"] = scene_light(y)
+
             if self.students is not None:
-                self._run_students(thermal, rgb)
+                self._run_students(
+                    thermal, rgb, radar_frame=radar_frame,
+                    # Raw student evidence normally stays behind the evidence
+                    # switch. On a thermal product the thermal silhouette is
+                    # the product itself, not debug clutter; _run_students()
+                    # still keeps hidden radar components hidden.
+                    draw=(channel.ai_overlay
+                          and (p.ai_evidence or channel.base == "thermal")))
 
             if self.det_in is not None:
                 # The detector reads the plain visible luma, not the fused frame.
@@ -1764,8 +2496,8 @@ class Renderer(threading.Thread):
                 # thermal composite is further from that than grey is, and the
                 # boxes are wanted in visible-camera coordinates anyway - that is
                 # the frame fusion_temp_region() maps through the warp.
-                self.det_in.put(y)
-                if p.show_detections:
+                self.det_in.put((y, self.state["light"]))
+                if p.show_detections and channel.ai_overlay:
                     dets = self.state.get("detections") or []
                     age = time.time() - self.state.get("detect_t", 0)
                     # Boxes outlive the frame they were found in by design - the
@@ -1773,11 +2505,9 @@ class Renderer(threading.Thread):
                     # claim about a scene that may be gone, so drop them rather
                     # than draw a stale rectangle over a moved object.
                     if age < DETECT_STALE_S:
-                        if self.radar is not None and self.radar_proj is not None:
-                            fr = self.radar.get()
-                            if fr is not None:
-                                radar_overlay.attach_range(dets, fr["points"],
-                                                           self.radar_proj)
+                        if radar_frame is not None and self.radar_proj is not None:
+                            radar_overlay.attach_range(dets, radar_frame["points"],
+                                                       self.radar_proj)
                         # The detector says WHERE and the thermal frame says
                         # what shape is warm there. This is the pairing worth
                         # drawing: the detector is the locator this rig
@@ -1808,44 +2538,61 @@ class Renderer(threading.Thread):
                 self.state["ego"] = self.ego.as_dict()
                 tracks = self.lock.update(self._lock_observations(thermal), now,
                                           ego=ego)
-                if p.show_detections:
-                    self._draw_tracks(rgb, tracks, thermal, now)
+                suppressed = self.lock.suppressed(now)
+                if p.show_detections and channel.ai_overlay:
+                    # Rejected/static candidates are diagnostics, not final AI
+                    # output. When explicitly revealed, draw them first so a
+                    # confirmed lock over the same pixels wins the picture.
+                    if p.ai_evidence:
+                        self._draw_static(rgb, suppressed, now)
+                    self._draw_tracks(
+                        rgb, self._display_tracks(tracks, now), thermal, now)
                 self.state["tracks"] = [t.as_dict(now) for t in tracks]
                 # Held back for never having moved and never having been seen
                 # by the detector - a warm door, a radiator, a lit sign. Counted
                 # and reported: "nothing there" and "something warm there that
                 # has never moved" are different answers.
                 self.state["tracks_static"] = [
-                    t.as_dict(now) for t in self.lock.suppressed(now)]
+                    t.as_dict(now) for t in suppressed]
             elif self.state.get("tracks"):
                 self.state["tracks"] = []
                 self.state["tracks_static"] = []
 
-            if self.radar is not None and self.pipe.show_radar:
-                fr = self.radar.get()
-                if fr is not None:
+            if self.radar is not None:
+                if radar_frame is not None:
+                    fr = radar_frame
+                    # Map and diagnostics consume radar whether or not this
+                    # display channel draws the raw points.
+                    self.state["radar_frame"] = fr["frame_number"]
+                    self.state["radar_points"] = fr["points"]
+                    self.state["radar_points_t"] = time.time()
+                if (radar_frame is not None and channel.raw_radar
+                        and self.pipe.show_radar):
+                    fr = radar_frame
                     d, off, al = radar_overlay.annotate(
                         rgb, fr["points"], self.radar_proj,
                         show_whisker=self.pipe.radar_whisker)
                     self.state["radar_drawn"] = d
                     self.state["radar_offscreen"] = off
                     self.state["radar_aliased"] = al
-                    self.state["radar_frame"] = fr["frame_number"]
-                    # The map layer reads the returns from here: (x fwd, y
-                    # left, z up, v, snr) per point, and the wall clock.
-                    self.state["radar_points"] = fr["points"]
-                    self.state["radar_points_t"] = time.time()
-                    if getattr(self, "radar_ai", False):
-                        # radar AI layer (Noa 2026-08-18): green PERSON rings
-                        self.state["radar_persons"] = radar_overlay.annotate_ai(
-                            rgb, fr["points"], self.radar_proj)
+                elif radar_frame is not None:
+                    self.state["radar_drawn"] = 0
+                    self.state["radar_offscreen"] = 0
+                    self.state["radar_aliased"] = 0
+                if (radar_frame is not None and channel.ai_overlay
+                        and getattr(self, "radar_ai", False)):
+                    # Optional legacy radar classifier belongs to the AI
+                    # channel, not to the raw sensor channels.
+                    self.state["radar_persons"] = radar_overlay.annotate_ai(
+                        rgb, radar_frame["points"], self.radar_proj)
                 self.state["radar_frames"] = self.radar.frames
                 self.state["radar_dropped"] = self.radar.dropped_bytes
                 if self.radar.error:
                     self.state["radar_error"] = self.radar.error
 
             if self.video is not None:
-                extra = {"view": self.pipe.view, "clean": True}
+                extra = {"view": self.pipe.view, "channel": self.pipe.channel,
+                         "clean": True}
                 if self.radar is not None:
                     # The radar frame number this picture was drawn against ties
                     # the two recordings together even if a timestamp is doubted.
@@ -1853,7 +2600,12 @@ class Renderer(threading.Thread):
                 # The raw thermal bytes go too: the mp4 is for looking, the
                 # thermal stream is the measurement, and a temperature must
                 # never be read back off an 8-bit lossy video.
-                self.video.write(clean, thermal=thermal, extra=extra)
+                # The wire bytes, byte-for-byte as the board sent them, which
+                # is what recorder.py's index promises and what lets it declare
+                # thermal_dtype for the session. Writing the rebuilt 8-bit plane
+                # here would record a picture and throw the measurement away -
+                # the exact trade --raw16 exists to stop making.
+                self.video.write(clean, thermal=wire, extra=extra)
                 self.state["video_frames"] = self.video.frames
                 if self.video.error:
                     self.state["video_error"] = self.video.error
@@ -1886,9 +2638,13 @@ class Streamer(threading.Thread):
     That is the failure this project spent a long time chasing.
     """
 
-    def __init__(self, port, pipeline, quality, state, work, batch=20):
+    def __init__(self, port, pipeline, quality, state, work, batch=5, raw16=False):
         super().__init__(daemon=True)
         self.port, self.pipe, self.quality, self.state = port, pipeline, quality, state
+        # Ask the board for the Lepton's own 16-bit words instead of the 8-bit
+        # plane it derives from them. See --raw16, and lepton_copy_raw() in the
+        # firmware for what is being kept.
+        self.raw16 = raw16
         # Range policy for the board's Lepton. None = auto-range (the default,
         # a percentile clip off one early frame); a (tmin, tmax) pair pins the
         # window instead. Pinning exists because auto-range samples ONCE, and
@@ -1938,8 +2694,15 @@ class Streamer(threading.Thread):
             if not self._fill(timeout):
                 raise TimeoutError("no line from board")
 
-    def _exact(self, n):
+    def _exact(self, n, kind="payload"):
         while len(self.buf) < n:
+            for footer in _BATCH_FOOTERS:
+                if self.buf.endswith(footer):
+                    received = len(self.buf) - len(footer)
+                    # Keep the raw-REPL prompt for the normal pending==0 path.
+                    # It will consume it and submit the next batch immediately.
+                    del self.buf[:received + len(footer) - 3]
+                    raise _DroppedBatch(kind, received, n)
             if not self._fill():
                 raise TimeoutError("short read %d/%d" % (len(self.buf), n))
         out = bytes(self.buf[:n])
@@ -2029,6 +2792,14 @@ class Streamer(threading.Thread):
         self.s = None
         self.state["ready"] = False
         self.state.pop("heap_free", None)
+        # SETUP_CODE recreates the board clock and resets _t_prev to zero.  Its
+        # first delta is therefore board uptime, not a thermal service gap.  Do
+        # not let rolling values from the previous clock survive and make that
+        # first sample look like a multi-hour Lepton starvation event.
+        for key in ("dt_window", "skew_window", "torn_window", "starved",
+                    "last_starve_ms", "stalls", "last_stall_t",
+                    "board_session_frames"):
+            self.state.pop(key, None)
 
     def _record_failure(self, e):
         # The counters first, then the evidence. pending is the one that decides:
@@ -2161,6 +2932,7 @@ class Streamer(threading.Thread):
         """
         self.state["resyncs"] = self.state.get("resyncs", 0) + 1
         self.state["last_resync"] = why
+        self.state["last_resync_t"] = time.time()
         self.pending = 0
 
     def _range(self, lo, hi):
@@ -2202,8 +2974,8 @@ class Streamer(threading.Thread):
         exhausted heap, which wedges the Lepton permanently, and how urgent that
         is depends entirely on how much room is left.
 
-        So the rate follows the margin. Far from the floor, every 10th batch
-        (~23s) is plenty against a drain measured in hours. Close to it, the
+        So the rate follows the margin. Far from the floor, every 400th batch
+        (~3.8min) is plenty against a drain measured in hours. Close to it, the
         assumption that the drain rate is the one that was measured is exactly
         what should not be relied on - a leak this code does not know about, or a
         scene that makes the loop allocate more, would be invisible until the
@@ -2220,11 +2992,16 @@ class Streamer(threading.Thread):
         return batch_no % HEAP_EVERY == 0
 
     def _run(self):
-        self.s = serial.Serial(self.port, 115200, timeout=0.2, write_timeout=10)
+        # TIOCEXCL is the serial equivalent of owning this stream. A second
+        # opener toggling DTR makes TinyUSB discard queued 512-byte packets; it
+        # must fail to open instead of corrupting a live frame silently.
+        self.s = serial.Serial(self.port, 115200, timeout=0.2,
+                               write_timeout=10, exclusive=True)
         tmin, tmax = self.fixed_range if self.fixed_range else (-10, 140)
         setup = (SETUP_CODE
                  .replace("__TMIN__", str(tmin)).replace("__TMAX__", str(tmax))
                  .replace("__AUTORANGE__", str(self.fixed_range is None))
+                 .replace("__RAW__", str(self.raw16))
                  .replace("__Q__", str(self.quality)))
         self._attention()
         self._submit(setup)
@@ -2240,6 +3017,7 @@ class Streamer(threading.Thread):
                 p = line.split()
                 self._range(int(p[5]), int(p[6]))
                 self.state["ready"] = True
+                self.state["board_session_frames"] = 0
                 # Frames are flowing again, so the error that got us here is
                 # history. Leaving it set would pin the health panel red for the
                 # rest of the session and train the user to ignore it.
@@ -2309,13 +3087,28 @@ class Streamer(threading.Thread):
             # meant well. A negative jlen would be worse than a wrong one:
             # _exact's guard is vacuous for it and del buf[:-n] throws the
             # buffer away.
-            if not (0 < jlen <= OUT_W * OUT_H and tlen == TH_W * TH_H):
+            # Two legal thermal sizes, and the header is what distinguishes
+            # them: one byte per pixel is the board's AGC'd 8-bit plane, two is
+            # the 16-bit radiometric one. Nothing else has to be negotiated -
+            # the length already says which arrived.
+            if not (0 < jlen <= OUT_W * OUT_H
+                    and tlen in (TH_W * TH_H, 2 * TH_W * TH_H)):
                 self._resync("implausible header %r" % line[:40])
                 continue
             self.headers += 1
             self.pending -= 1
-            jpg = self._exact(jlen)
-            thermal = self._exact(tlen)
+            try:
+                jpg = self._exact(jlen, "jpeg")
+                thermal = self._exact(tlen, "thermal")
+            except _DroppedBatch as e:
+                self.state["batch_drops"] = self.state.get("batch_drops", 0) + 1
+                self.state["last_batch_drop_t"] = time.time()
+                self.state["link_recovering_since"] = time.time()
+                self.state["link_recovering_reason"] = str(e)
+                self._resync("board ended batch during %s" % e)
+                print("batch dropped (continuing without sensor restart): %s" % e,
+                      file=sys.stderr)
+                continue
 
             # Hand off and go straight back to the port. Nothing that decodes,
             # fuses, composes or encodes belongs on this thread: every
@@ -2330,7 +3123,11 @@ class Streamer(threading.Thread):
             n += 1
             now = time.time()
             self.state["frames"] = self.state.get("frames", 0) + 1
+            self.state["board_session_frames"] = (
+                self.state.get("board_session_frames", 0) + 1)
             self.state["last_frame_t"] = now
+            self.state.pop("link_recovering_since", None)
+            self.state.pop("link_recovering_reason", None)
 
             # Short rolling windows rather than totals: the panel is meant to
             # report the state of the board now, and a fault that cleared ten
@@ -2377,6 +3174,7 @@ class Streamer(threading.Thread):
             # side, and it is the only such signal the board can give.
             if stalled:
                 self.state["stalls"] = self.state.get("stalls", 0) + stalled
+                self.state["stalls_total"] = self.state.get("stalls_total", 0) + stalled
                 self.state["last_stall_t"] = now
             # frames > 1: the first interval of a session spans whatever came
             # before the viewer attached - board idle, bring-up, a previous
@@ -2385,8 +3183,9 @@ class Streamer(threading.Thread):
             # count would hold the panel red for the whole run (2026-08-23:
             # worst 21737302ms = six idle hours, on a link running at 8.77fps).
             if dt_ms is not None and dt_ms > LEPTON_SAFE_GAP_MS \
-                    and self.state.get("frames", 0) > 1:
+                    and self.state.get("board_session_frames", 0) > 1:
                 self.state["starved"] = self.state.get("starved", 0) + 1
+                self.state["starved_total"] = self.state.get("starved_total", 0) + 1
                 self.state["last_starve_ms"] = dt_ms
 
             if now - t_prev >= 1.0:
@@ -2493,16 +3292,46 @@ def ui_payload(pipe, state, now):
     lo, hi = state.get("range", (0, 0))
     rp = state.get("radar_proj")
     c = pipe.f.cfg
+    stream_status = None
+    if state.get("restarting_since") is not None:
+        stream_status = {
+            "kind": "restart",
+            "title": "RECONNECTING SENSORS",
+            "detail": "%s · %.0fs" % (
+                state.get("last_restart", "stream fault"),
+                now - state["restarting_since"]),
+        }
+    elif state.get("link_recovering_since") is not None:
+        stream_status = {
+            "kind": "drop",
+            "title": "RECOVERING LINK",
+            "detail": state.get("link_recovering_reason", "incomplete USB batch"),
+        }
+    elif state.get("last_frame_t") is not None and now - state["last_frame_t"] > 1.0:
+        # The MJPEG connection deliberately keeps the last good frame visible.
+        # Without this overlay that honest last frame looks like a live one.
+        stream_status = {
+            "kind": "stale",
+            "title": "WAITING FOR A NEW FRAME",
+            "detail": "last frame %.1fs ago" % (now - state["last_frame_t"]),
+        }
     return {
         "worst": worst_level(checks),
         "checks": checks,
+        "stream_status": stream_status,
         "timing": timing(state, now),
         "stats": dict(stats, valid=True) if stats else {"valid": False},
+        # Only with --raw16, hence None rather than a default: the page hides
+        # the row instead of showing an invented one. The two decimal places it
+        # carries are real, which is the entire distinction from "stats" above -
+        # that is this same scene after the sensor window has quantised it.
+        "raw_stats": state.get("raw_stats"),
         "detections": {
             "warped": pipe.warped,
             "age_s": round(now - state["detect_t"], 2) if state.get("detect_t") else None,
             "ms": state.get("detect_ms"),
             "list": state.get("detections") or [],
+            "rejected": state.get("detections_rejected") or [],
         },
         # Quantities that drift rather than jump, and which the page draws as a
         # 60s trace: a heap reading is not interesting, a heap reading that is
@@ -2517,8 +3346,13 @@ def ui_payload(pipe, state, now):
         # The lock silently assumes a still rig whenever this is refused, and
         # an assumption nobody can see is one nobody thinks to doubt.
         "ego": state.get("ego"),
+        # Whether the visible camera had light. Beside the tracks rather than
+        # buried in health, because it is the number that says how to read
+        # every other channel on this frame.
+        "light": state.get("light"),
         "heap_free": state.get("heap_free"),
         "restarts": state.get("restarts", 0),
+        "batch_drops": state.get("batch_drops", 0),
         "coverage": round(float(pipe.cover_grid().mean()), 4) if pipe.f.have_frame else None,
         "recording": os.path.basename(state["recording"]) if state.get("recording") else None,
         # Which station the frames going to disk right now are labelled with.
@@ -2542,7 +3376,9 @@ def ui_payload(pipe, state, now):
         "nav": nav_horizon(state) if state.get("map_prior") is not None else None,
         "cfg": {
             "gain": c.detail_gain, "eps": c.gf_eps, "radius": c.gf_radius,
-            "agc": c.agc_permille, "palette": pipe.palette_name, "view": pipe.view,
+            "agc": c.agc_permille, "palette": pipe.palette_name,
+            "channel": pipe.channel, "channels": live_channels.public_specs(),
+            "view": pipe.view,
             "mix": pipe.mix, "outline": pipe.outline, "boxes": pipe.show_detections,
             "lock": pipe.ai_lock,
             "emissivity": round(pipe.eps, 3), "reflected": pipe.refl,
@@ -2569,6 +3405,7 @@ def ui_payload(pipe, state, now):
                 # card that only showed `n` cannot tell a quiet scene from a
                 # slider parked too high.
                 "floor": round(pipe.ai_conf_floor, 2),
+                "evidence": pipe.ai_evidence,
                 "silhouette": pipe.ai_silhouette,
                 "thermal": {"on": pipe.ai_thermal,
                             "n": len(state.get("student_thermal") or []),
@@ -2582,6 +3419,7 @@ def ui_payload(pipe, state, now):
                           "ready": state["students"].get("radar") is not None},
                 "fusion": {"on": pipe.ai_fusion,
                            "n": len(state.get("student_fused") or []),
+                           "rejected": len(state.get("student_fused_rejected") or []),
                            "ready": (state["students"].get("th2vis") is not None
                                      and state["students"].get("radar") is not None)},
                 "age_s": (round(now - state["student_t"], 2)
@@ -2666,6 +3504,12 @@ body.field aside,body.field #notes{display:none}
    is 55vh of height at this 1.6 aspect. */
 #wrap{position:relative;line-height:0;align-self:start;border:1px solid var(--line);
 border-radius:8px;overflow:hidden;background:#000;width:min(100%,1024px,88vh)}
+#streamstate{position:absolute;inset:0;z-index:4;display:flex;flex-direction:column;
+align-items:center;justify-content:center;gap:8px;background:#07090bba;line-height:1.35;
+text-align:center;pointer-events:none;backdrop-filter:blur(2px)}
+#streamstate[hidden]{display:none}
+#streamtitle{font:650 15px/1.2 var(--mono);letter-spacing:.08em;color:var(--warn)}
+#streamdetail{max-width:80%;font:12px/1.4 var(--mono);color:var(--txt)}
 /* The picture and the map, side by side. The picture says what is out there;
    the map says where the rig was standing while it said it, and reading one
    against the other is the whole point of the map layer - it cannot be done
@@ -2717,6 +3561,9 @@ padding:2px;gap:2px}
 padding:5px 2px;border-radius:4px;cursor:pointer;transition:background .12s,color .12s}
 .seg button:hover{color:var(--txt);background:#ffffff0a}
 .seg button.on{background:#2b3238;color:var(--txt);box-shadow:inset 0 0 0 1px #3a444c}
+#channel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+#channel button{min-height:30px;line-height:1.2}
+#channel button:last-child{grid-column:1/-1}
 .seg.pal button.on{color:#0c0e10;font-weight:600}
 .seg.pal button[data-v=ironbow].on{background:linear-gradient(90deg,#5a1a70,#e05020,#ffd23c)}
 .seg.pal button[data-v=white].on{background:linear-gradient(90deg,#333,#fff)}
@@ -2837,6 +3684,7 @@ padding:1px 5px;color:var(--dim);background:var(--panel2)}
       <div id=wrap>
         <img id=im src="/stream">
         <svg id=ovl viewBox="0 0 640 400" preserveAspectRatio=none></svg>
+        <div id=streamstate hidden><div id=streamtitle></div><div id=streamdetail></div></div>
         <div id=read></div>
         <div id=probes></div>
       </div>
@@ -2869,8 +3717,17 @@ padding:1px 5px;color:var(--dim);background:var(--panel2)}
       <div class=kv><em>coverage</em><b id=k_cov>&ndash;</b>
         <svg class=spark id=sp_cov width=90 height=16></svg></div>
       <div class=kv><em>last ffc</em><b id=k_ffc>&ndash;</b></div>
+      <!-- Scene light. On the BOARD strip beside coverage rather than in the
+           sidebar: it is a property of the frame that just arrived, and it is
+           read together with what the detector said about that frame. -->
+      <div class=kv id=kv_light><em>scene light</em><b id=k_light>&ndash;</b></div>
       <div class=kv id=kv_load><em>sensor load</em><b id=k_load>&ndash;</b></div>
       <div class=kv><em>frame band</em><b id=k_band>&ndash;</b></div>
+      <!-- --raw16 only. Deliberately next to the frame band, because reading
+           the two together is what shows the difference: same scene, one of
+           them through the 8-bit window. -->
+      <div class=kv id=kv_raw style=display:none><em>scene 16-bit</em>
+        <b id=k_raw>&ndash;</b></div>
     </div>
 
     <!-- The machine the viewer runs on. A separate strip rather than more items
@@ -2895,15 +3752,25 @@ SOC</div>
 
   <aside>
     <div class=card>
-      <h4>view <span class=k>1-6</span></h4>
+      <h4>channel <span class=k>1-5</span></h4>
       <div class=body>
-        <div class=seg id=view></div>
-        <div class=sl><label>thermal weight &mdash; mix/operator</label><output id=o_mix>60</output>
-          <input type=range id=mix min=0 max=100 value=60></div>
+        <div class=seg id=channel></div>
+        <div class=hintline>display channels choose the sensor product. The
+          thermal/radar/fusion switches in the AI card are evidence layers,
+          not additional display modes.</div>
         <label class=chk><input type=checkbox id=outline> thermal footprint
           <span class=sub id=s_cov></span></label>
         <label class=chk><input type=checkbox id=boxes checked> detection boxes
           <span class=sub id=s_det></span></label>
+      </div>
+    </div>
+
+    <div class=card id=fusionviewcard>
+      <h4>fusion / calibration view</h4>
+      <div class=body>
+        <div class=seg id=view></div>
+        <div class=sl><label>thermal weight &mdash; mix/operator</label><output id=o_mix>60</output>
+          <input type=range id=mix min=0 max=100 value=60></div>
       </div>
     </div>
 
@@ -2984,11 +3851,13 @@ SOC</div>
     </div>
 
     <div class=card id=aicard>
-      <h4>ai <span class=k>t r c s l</span></h4>
+      <h4>ai <span class=k>e t r c s l</span></h4>
       <div class=body>
         <label class=chk><input type=checkbox id=lock checked> lock on people
           <span class=sub id=s_lock></span></label>
-        <label class=chk><input type=checkbox id=silhouette checked>
+        <label class=chk><input type=checkbox id=evidence> student evidence
+          <span class=sub>debug overlays</span></label>
+        <label class=chk><input type=checkbox id=silhouette>
           person outline <span class=sub id=s_ai_sil></span></label>
         <div id=aistudents style=display:none>
         <label class=chk><input type=checkbox id=ai_thermal checked> thermal
@@ -3001,8 +3870,10 @@ SOC</div>
           <input type=range id=conf_thermal min=50 max=99 value=50></div>
         <div class=sl><label>radar confidence</label><output id=o_conf_radar>0.50</output>
           <input type=range id=conf_radar min=50 max=99 value=50></div>
-        <div class=hintline>the sliders hide boxes, they do not stop the
-          engines: the count beside each channel reads
+        <div class=hintline><b>student evidence</b> reveals the intermediate
+          T/R/TR boxes and rejected static-candidate ticks for model debugging.
+          It is hidden by default; inference, fusion and person lock keep running. The sliders hide candidates, they
+          do not stop the engines: the count beside each channel reads
           <i>shown of found</i>, so a quiet scene and a slider parked too high
           never look the same. They cannot go below the threshold the engines
           were started with (&minus;&minus;student-conf).</div>
@@ -3092,7 +3963,7 @@ SOC</div>
   so a wide band there is a real anomaly, not ordinary jitter.</p></details>
 
   <details><summary>Keys</summary>
-  <p><kbd>1</kbd>-<kbd>5</kbd> view &middot; <kbd>f</kbd> field mode (hide everything but the
+  <p><kbd>1</kbd>-<kbd>5</kbd> channel &middot; <kbd>f</kbd> field mode (hide everything but the
   stream and the health) &middot; <kbd>o</kbd> footprint &middot; <kbd>b</kbd> boxes &middot;
   <kbd>t</kbd> thermal ai &middot; <kbd>r</kbd> radar ai &middot; <kbd>c</kbd> fusion &middot;
   <kbd>s</kbd> person outline &middot; <kbd>l</kbd> lock &middot;
@@ -3146,7 +4017,7 @@ for (const [id, param] of [['outline','outline'],['boxes','boxes'],
                            ['radar','radar'],['whisker','whisker'],
                            ['ai_thermal','ai_thermal'],['ai_radar','ai_radar'],
                            ['ai_fusion','ai_fusion'],['silhouette','silhouette'],
-                           ['lock','lock']])
+                           ['evidence','evidence'],['lock','lock']])
   $(id).onchange = (e) => set(param + '=' + (e.target.checked ? 1 : 0));
 
 // Sent as a fraction, drawn as one, but an <input type=range> only counts in
@@ -3165,7 +4036,8 @@ $('poseid').onkeydown = (e) => { if (e.key === 'Enter') $('posego').click(); };
 
 function seg(boxId, names, param, onpick) {
   const box = $(boxId);
-  box.innerHTML = names.map(n => '<button data-v="' + n + '">' + n + '</button>').join('');
+  const items = names.map(n => typeof n === 'string' ? {id:n,label:n} : n);
+  box.innerHTML = items.map(n => '<button data-v="' + n.id + '">' + n.label + '</button>').join('');
   box.onclick = (e) => {
     if (e.target.tagName !== 'BUTTON') return;
     pick(boxId, e.target.dataset.v);
@@ -3176,6 +4048,10 @@ function seg(boxId, names, param, onpick) {
 function pick(boxId, v) {
   for (const b of $(boxId).children) b.className = (b.dataset.v === v) ? 'on' : '';
 }
+function applyChannel(v) {
+  $('fusionviewcard').style.display = v === 'fusion' ? '' : 'none';
+}
+let CHANNELS = [];
 const VIEWS = ['fused','visible','blink','mix','edges','operator'];
 seg('view', VIEWS, 'view');
 seg('pal', ['ironbow','white','black','gray'], 'palette');
@@ -3244,13 +4120,17 @@ addEventListener('keydown', (e) => {
   if (e.key === 'f') document.body.classList.toggle('field');
   if (e.key === 'o') { $('outline').click(); }
   if (e.key === 'b') { $('boxes').click(); }
+  if (e.key === 'e') { $('evidence').click(); }
   if (e.key === 't') { $('ai_thermal').click(); }
   if (e.key === 'r') { $('ai_radar').click(); }
   if (e.key === 'c') { $('ai_fusion').click(); }
   if (e.key === 's') { $('silhouette').click(); }
   if (e.key === 'l') { $('lock').click(); }
   const i = Number(e.key) - 1;
-  if (i >= 0 && i < VIEWS.length) { pick('view', VIEWS[i]); set('view=' + VIEWS[i]); }
+  if (i >= 0 && i < CHANNELS.length) {
+    pick('channel', CHANNELS[i].id); applyChannel(CHANNELS[i].id);
+    set('channel=' + CHANNELS[i].id);
+  }
 });
 
 async function refreshProbes() {
@@ -3346,7 +4226,7 @@ const GROUPS = [
   ['link', ['stream','framing','jpeg','render']],
   ['sensor', ['cadence','pairing','thermal load','ffc','tearing','dead rows','board heap']],
   ['measurement', ['registration','coverage','range','clipping','agc','emissivity']],
-  ['perception', ['detect','radar','ai','recording']],
+  ['perception', ['channel','detect','radar','ai','recording']],
   ['host', ['host cpu','host memory','host thermal','host power']],
   ['map', ['map']],
 ];
@@ -3397,12 +4277,16 @@ const VERDICT = {
 };
 let inited = false;
 function initControls(cfg) {
+  CHANNELS = cfg.channels || [];
+  seg('channel', CHANNELS, 'channel', applyChannel);
   for (const k of SLIDERS) { $(k).value = cfg[k]; $('o_' + k).textContent = cfg[k]; }
   $('emis').value = cfg.emissivity;
   $('refl').value = cfg.reflected;
   $('outline').checked = cfg.outline;
   $('boxes').checked = cfg.boxes;
   $('lock').checked = cfg.lock;
+  pick('channel', cfg.channel);
+  applyChannel(cfg.channel);
   pick('view', cfg.view);
   pick('pal', cfg.palette);
   if (cfg.ai) {
@@ -3410,6 +4294,7 @@ function initControls(cfg) {
     $('ai_thermal').checked = cfg.ai.thermal.on;
     $('ai_radar').checked = cfg.ai.radar.on;
     $('ai_fusion').checked = cfg.ai.fusion.on;
+    $('evidence').checked = cfg.ai.evidence;
     $('silhouette').checked = cfg.ai.silhouette;
     for (const [k, c] of [['conf_thermal', cfg.ai.thermal],
                           ['conf_radar', cfg.ai.radar]]) {
@@ -3569,6 +4454,16 @@ async function poll() {
   $('vtext').textContent = vt;
   $('vsub').textContent = vs;
 
+  // The MJPEG endpoint keeps the last good frame on screen while the reader is
+  // recovering.  That is preferable to a broken image icon, but only if the
+  // operator can see that the pixels are stale rather than live.
+  const ss = d.stream_status;
+  $('streamstate').hidden = !ss;
+  if (ss) {
+    $('streamtitle').textContent = ss.title;
+    $('streamdetail').textContent = ss.detail || '';
+  }
+
   // The facts that qualify every number on screen, in one place. They used to be
   // spread across /stat, a health pill and the word UNREGISTERED on each box.
   const cfg = d.cfg, q = [];
@@ -3632,10 +4527,28 @@ async function poll() {
     $('k_cov').innerHTML = Math.round(100 * d.coverage) + '<span class=u> %</span>';
     $('s_cov').textContent = Math.round(100 * d.coverage) + '%';
   }
+  if (d.light) {
+    // "blind" is a warn and not a fail: the rig is working exactly as designed,
+    // it simply has no light. What would be a fail is showing 0 boxes without
+    // saying so.
+    $('kv_light').className = 'kv' + (d.light.state === 'lit' ? '' : ' bad');
+    $('k_light').innerHTML = (d.light.state === 'blind' ? 'BLIND'
+        : d.light.state === 'dim' ? 'part-lit' : 'lit')
+      + '<span class=u> &#183; ' + (100 * d.light.lit).toFixed(1) + '% lit</span>';
+  }
   $('k_band').innerHTML = d.stats.valid
     ? d.stats.min.toFixed(1) + '<span class=u>..</span>' + d.stats.max.toFixed(1)
       + '<span class=u> \\u00b0C &#183; \\u0394 ' + d.stats.delta.toFixed(1) + '</span>'
     : '<span class=u>no thermal coverage</span>';
+  if (d.raw_stats) {
+    $('kv_raw').style.display = '';
+    $('k_raw').innerHTML = d.raw_stats.min.toFixed(2)
+      + '<span class=u>..</span>' + d.raw_stats.max.toFixed(2)
+      + '<span class=u> \\u00b0C &#183; \\u0394 ' + d.raw_stats.delta.toFixed(2)
+      + '</span>';
+  } else {
+    $('kv_raw').style.display = 'none';
+  }
   $('agcwarn').innerHTML = cfg.agc
     ? '<span style=color:#f0c060>scene-relative</span>' : '';
 
@@ -3892,12 +4805,25 @@ def topdown_view(state, radius_m=60.0):
         from perception import map_api
         map_api.locate_mapinit(state.get("mapinit_dir"))
         from mapinit import BuildingLayer
-        from mapinit.nav.walls import footprint_edges, PosePrior, local_scales
         layer = BuildingLayer.from_geojson(pr["overture_path"])
-        pp = PosePrior(prior["latitude_deg"], prior["longitude_deg"], 0.0, 1.0, 1.0)
-        segs = footprint_edges(layer, pp, radius_m=radius_m)
-        cache = {"path": pr["overture_path"], "edges": [[round(v, 2) for v in s] for s in segs.tolist()],
-                 "scales": local_scales(prior["latitude_deg"])}
+        # The deployed mapinit checkout exports BuildingLayer but has no
+        # mapinit.nav.walls module.  Top-down rendering only needs the public
+        # footprint rings, so convert them locally instead of depending on a
+        # private/nonexistent navigation helper. x is east, y is north.
+        lat0, lon0 = prior["latitude_deg"], prior["longitude_deg"]
+        lat_scale = 111_320.0
+        lon_scale = lat_scale * math.cos(math.radians(lat0))
+        segs = []
+        for building in layer.near(lat0, lon0, radius_m * 2.0):
+            ring = list(building.ring)
+            for (lon_a, lat_a), (lon_b, lat_b) in zip(ring, ring[1:]):
+                edge = [(lon_a - lon0) * lon_scale, (lat_a - lat0) * lat_scale,
+                        (lon_b - lon0) * lon_scale, (lat_b - lat0) * lat_scale]
+                if min(math.hypot(edge[0], edge[1]),
+                       math.hypot(edge[2], edge[3])) <= radius_m * 1.5:
+                    segs.append([round(v, 2) for v in edge])
+        cache = {"path": pr["overture_path"], "edges": segs,
+                 "scales": (lon_scale, lat_scale)}
         state["_topdown_cache"] = cache
     heading = prior.get("heading_deg")
     walls = static_wall_returns(state.get("radar_points"))
@@ -3985,6 +4911,8 @@ def make_handler(state, pipe):
 
                 if "palette" in q:
                     pipe.set_palette(q.pop("palette"))
+                if q.get("channel") in CHANNELS:
+                    pipe.channel = q.pop("channel")
                 if q.get("view") in VIEWS:
                     pipe.view = q.pop("view")
                 if "mix" in q:
@@ -4005,6 +4933,9 @@ def make_handler(state, pipe):
                     pipe.ai_lock = q.pop("lock") not in ("0", "false", "")
                 if "silhouette" in q:
                     pipe.ai_silhouette = q.pop("silhouette") not in (
+                        "0", "false", "")
+                if "evidence" in q:
+                    pipe.ai_evidence = q.pop("evidence") not in (
                         "0", "false", "")
                 for k in ("ai_thermal", "ai_radar", "ai_fusion"):
                     if k in q:
@@ -4100,7 +5031,14 @@ def make_handler(state, pipe):
                 self.send_response(200 if td else 404)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps(td or {"error": "no map layer or priors not loaded"}).encode())
+                try:
+                    self.wfile.write(json.dumps(
+                        td or {"error": "no map layer or priors not loaded"}).encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    # The first top-down build may outlive a browser navigation
+                    # or readiness probe. The computed cache is still valid;
+                    # a client going away is not a live-system exception.
+                    pass
             elif u.path == "/map":
                 # Yael's map layer as the schema-1.0 contract, or the reason
                 # there is none. 404 only when live.py was started without
@@ -4186,7 +5124,8 @@ def make_handler(state, pipe):
                         "radar": {"on": pipe.ai_radar,
                                   "list": state.get("student_radar") or []},
                         "fusion": {"on": pipe.ai_fusion,
-                                   "list": state.get("student_fused") or []},
+                                   "list": state.get("student_fused") or [],
+                                   "rejected": state.get("student_fused_rejected") or []},
                     }})
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -4269,6 +5208,29 @@ def session_meta(args):
     else:
         tmin_c, tmax_c = -10, 140
 
+    # --raw16 changes the unit and not merely the width, so everything that
+    # describes how a count becomes a temperature has to move with it. Leaving
+    # the uint8 block in place would declare 0.588C steps over a plane whose
+    # steps are 0.01C, and a reader has no way to notice: both are plausible
+    # numbers. This is the same failure that shipped gexport v1 with c_per_lsb
+    # null and turned its thermal plane into intensity.
+    if args.raw16:
+        thermal_scale = {
+            'thermal_dtype': 'uint16_le',
+            # Absolute, straight off the sensor's TLinear output. Nothing to
+            # undo: C = count / 100 - 273.15, whatever tmin/tmax happen to be.
+            'thermal_encoding': 'radiometric_centikelvin',
+            'c_per_lsb': 0.01,
+            'thermal_counts_max': 65535,
+        }
+    else:
+        thermal_scale = {
+            'thermal_dtype': 'uint8',
+            'thermal_encoding': 'linear_set_range',
+            'c_per_lsb': (tmax_c - tmin_c) / 255.0,
+            'thermal_counts_max': 255,
+        }
+
     def _sha(path):
         # Calibration files are small (a LUT is ~1 MB); hashing at session
         # start is the only moment the file on disk is KNOWN to be the file
@@ -4307,6 +5269,7 @@ def session_meta(args):
         'argv': sys.argv[1:],
         'board_port': args.port,
         'radar_port': args.radar,
+        'channel': args.channel,
         'view': args.view,
         'warp_lut': args.warp,
         'warp_lut_sha256': _sha(args.warp),
@@ -4326,12 +5289,12 @@ def session_meta(args):
         'student_engines': student_engines or None,
         'radar_cfg_stamp': stamp,
         'radar_cfg_stamp_note': stamp_note,
+        # Still recorded under --raw16, and still true: the window goes on
+        # deciding the board's own 8-bit frame, which live.py reproduces for
+        # the pipeline. It just stops being what turns a count into a degree.
         'tmin': tmin_c,
         'tmax': tmax_c,
-        'c_per_lsb': (tmax_c - tmin_c) / 255.0,
-        'thermal_dtype': 'uint8',
-        'thermal_encoding': 'linear_set_range',
-        'thermal_counts_max': 255,
+        **thermal_scale,
         # The bring-up has run the Lepton in HIGH gain since 2026-08-09
         # (capture._BRINGUP, SET_MODE(True, False)); recorded so a future
         # low-gain session cannot be silently mixed in as the same scale.
@@ -4360,6 +5323,12 @@ def main():
     ap.add_argument("--agc", type=int, default=0, metavar="PERMILLE",
                     help="scene AGC, per-mille clipped each end (20 = 2%%). "
                          "Makes tone scene-relative rather than absolute")
+    ap.add_argument("--thermal-noise-mc", type=int, default=148, metavar="MC",
+                    help="thermal temporal-filter noise estimate in milli-Celsius; "
+                         "0 disables it (default 148, measured on this Lepton)")
+    ap.add_argument("--thermal-frames", type=int, default=8, metavar="N",
+                    help="equivalent frames averaged by the motion-adaptive thermal "
+                         "filter; 1 disables smoothing (default 8)")
     # The visible temporal filter. fusion.c leaves it off because it costs 768KB
     # (fusion.c:993-994) that only pays back in the dark - but
     # dark is the case this project exists for. In an unlit cabinet the detail
@@ -4395,7 +5364,19 @@ def main():
     # q50 256KB/s, q80 325KB/s, q90 420KB/s. FS CDC measures out around
     # 700-900KB/s, so q80 sits near 40% duty and q90 near 55%. q80 buys most of
     # the improvement for the smaller share of the pipe.
-    ap.add_argument("--quality", type=int, default=80, help="board-side JPEG quality")
+    ap.add_argument("--quality", type=int, default=70,
+                    help="board-side JPEG quality (default 70 leaves CDC headroom; "
+                         "80 was measured dropping 512-byte USB tails)")
+    # Costs 18.75KB/frame more on the wire - 164KB/s at 8.772fps, taking a q80
+    # session from ~325 to ~490KB/s against a link measured at 700-900. Sending
+    # it is a swap, not an addition: the 8-bit plane is rebuilt on this side
+    # from the same words, so nothing downstream sees a difference. Needs the
+    # raw-passthrough firmware; an older build fails the bring-up with a clear
+    # message rather than quietly streaming 8-bit.
+    ap.add_argument("--raw16", action="store_true",
+                    help="stream the Lepton's 16-bit radiometric frame (0.01C "
+                         "per code) instead of the board's 8-bit plane, and "
+                         "record it as the session's thermal.bin")
     ap.add_argument("--range", metavar="TMIN:TMAX",
                     help="pin the sensor range instead of auto-ranging, e.g. "
                          "--range 10:45. Auto-range picks off ONE frame at "
@@ -4443,6 +5424,9 @@ def main():
                          "cluster_model_v0.pkl) on the picture: green ring = PERSON")
     ap.add_argument("--radar-calib", metavar="JSON",
                     help="solved intrinsics/extrinsics to project with, instead of the guess")
+    ap.add_argument("--channel", default="fusion", choices=list(CHANNELS),
+                    help="operator display channel: thermal, rgb_radar (currently "
+                         "visible luma), thermal_radar, fusion, or ai")
     ap.add_argument("--view", default="fused",
                     choices=list(VIEWS),
                     help="view to start in, and therefore what gets recorded. "
@@ -4452,7 +5436,7 @@ def main():
                          "content carries that unknown offset into the extrinsic")
     ap.add_argument("--students", action="store_true",
                     help="run the trained thermal+radar person students "
-                         "(TensorRT engines from perception/out/gexport/v2/"
+                         "(TensorRT engines from perception/out/gexport/v6/"
                          "models/) as extra detection channels: orange boxes "
                          "= thermal student, cyan = radar student, white = the "
                          "two of them agreeing. Pick which channels are on with "
@@ -4461,14 +5445,14 @@ def main():
                     help="confidence threshold for both students")
     ap.add_argument("--students-dir", metavar="DIR",
                     help="load the student engines from this directory "
-                         "instead of perception/out/gexport/v2/models. The "
+                         "instead of perception/out/gexport/v6/models. The "
                          "engines belong to the export that trained them; the "
                          "session meta records which ones actually loaded")
     ap.add_argument("--no-lock", action="store_true",
                     help="start with the person lock off, so every frame's "
                          "boxes stand on that frame alone. The lock is on by "
                          "default and switchable live (key l, /set?lock=0)")
-    ap.add_argument("--ai-channels", default="thermal,radar,fusion", metavar="LIST",
+    ap.add_argument("--ai-channels", default="fusion", metavar="LIST",
                     help="which AI channels start switched on: any of "
                          "thermal,radar,fusion (or 'none'). All three are "
                          "switchable live from the page and over "
@@ -4521,6 +5505,7 @@ def main():
         os.environ["STUDENT_ENGINES"] = os.path.abspath(args.students_dir)
 
     pipe = Pipeline(args)
+    pipe.channel = args.channel
     pipe.view = args.view
 
     # Validated here rather than shrugged off later: a typo in --ai-channels
@@ -4542,7 +5527,7 @@ def main():
     pipe.ai_conf_thermal = pipe.ai_conf_radar = args.student_conf
     # One sampler for the process; it primes its own counters, so the first
     # /ui already carries a CPU figure rather than a null.
-    state = {"soc": hostsoc.Soc()}
+    state = {"soc": hostsoc.Soc(), "detector_available": False}
 
     detector = None
     if args.detect != "off":
@@ -4573,6 +5558,7 @@ def main():
             args.detect_backend = detector.backend
             args.detect_model = detector.model_name
             args.detect_engine = getattr(detector, "engine_path", None)
+    state["detector_available"] = detector is not None
 
     work = Latest()
     radar = radar_proj = video = None
@@ -4683,7 +5669,7 @@ def main():
                       th2vis=th2vis)
     render.radar_ai = bool(args.radar_ai)
     render.start()
-    stream = Streamer(args.port, pipe, args.quality, state, work)
+    stream = Streamer(args.port, pipe, args.quality, state, work, raw16=args.raw16)
     if args.range:
         lo, hi = (int(v) for v in args.range.split(":"))
         stream.fixed_range = (lo, hi)
@@ -4722,9 +5708,22 @@ def main():
     t0 = time.time()
     down_since, last_err = None, None
     warned_no_radar = False
+    # `run_live.sh` starts this process under nohup/setsid.  A background shell
+    # may leave SIGINT ignored in that child, and Python deliberately preserves
+    # an inherited SIG_IGN disposition.  The launcher used to wait, conclude
+    # that live.py ignored it, and SIGKILL the process; SessionRecorder.close()
+    # then never ran and the MP4 had no moov/index atom.  Explicit handlers make
+    # both the launcher's SIGINT and an ordinary SIGTERM request the same clean
+    # exit through the finally block below.
+    stop_requested = threading.Event()
+
+    def request_stop(_signum, _frame):
+        stop_requested.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
     try:
-        while True:
-            time.sleep(0.2)
+        while not stop_requested.wait(0.2):
             # A calibration recording with zero radar frames is a wasted
             # session that looks fine on screen (the camera side records
             # happily). The usual cause on this bench: a power cycle wiped the
@@ -4760,10 +5759,12 @@ def main():
             if args.seconds and time.time() - t0 > args.seconds:
                 tm = timing(state, time.time())
                 print("fps %.1f, frames %d, rendered %d, dropped %d, bad jpeg %d, "
-                      "batches %d, resyncs %d, restarts %d, frames flowing: %s" % (
+                      "batches %d, batch drops %d, resyncs %d, restarts %d, "
+                      "frames flowing: %s" % (
                           state.get("fps", 0.0), state.get("frames", 0),
                           state.get("rendered", 0), state.get("dropped", 0),
                           state.get("bad_jpeg", 0), state.get("batches", 0),
+                          state.get("batch_drops", 0),
                           state.get("resyncs", 0), state.get("restarts", 0),
                           state.get("frame") is not None), file=sys.stderr)
                 # Board clock separately: the fps above is arrival times and says
@@ -4779,16 +5780,24 @@ def main():
     finally:
         stream.stop.set()
         render.stop.set()
+        if radar is not None:
+            radar.stop.set()
         # The render thread owns the recorder, and the mp4 is only finalized by
         # its close() - so wait for the thread rather than letting the daemon
         # flag kill it mid-write.
         render.join(timeout=3.0)
+        # Streamer.release() drains and interrupts the raw REPL in its own
+        # finally block.  Give that cleanup a bounded chance to finish so a
+        # replacement viewer does not inherit a board still writing payload.
+        stream.join(timeout=5.0)
         if radar is not None:
+            radar.join(timeout=2.0)
             radar.close()
         if video is not None and video.frames:
             print("recorded %d frames -> %s/" % (video.frames, record_dir),
                   file=sys.stderr)
         srv.shutdown()
+        srv.server_close()
 
 
 if __name__ == "__main__":

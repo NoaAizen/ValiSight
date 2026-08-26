@@ -351,6 +351,39 @@ if __AUTORANGE__:
     lep.ioctl(csi.IOCTL_LEPTON_SET_RANGE, TMIN, TMAX)
     time.sleep_ms(300)
     lep.snapshot()
+
+# ---- 16-bit radiometric passthrough ---------------------------------------
+# Off unless the caller asks for it, and it changes nothing when off.
+#
+# Everything above this line spends its effort choosing a good 8-bit window,
+# because until now 8 bits was all there was. The Lepton's own output is 16-bit,
+# and in radiometric mode a word is absolute temperature in centi-kelvin - 0.01C
+# per code. The driver clamps that to [TMIN,TMAX] and scales it onto 0..255, so
+# the frame this file has always handled quantises at 0.588C wide open and about
+# 0.141C after the auto-range above. Both are coarser than this part's own
+# per-pixel temporal noise, measured 126-148mK: the 8-bit plane is
+# quantisation-limited, and the ~4x that temporal averaging should buy is
+# unreachable because the steps are already bigger than the noise being averaged
+# away.
+#
+# With RAW on, the firmware keeps each frame's words before that conversion and
+# hands them over on request. No window, no clipping, no dependence on what the
+# auto-range picked - TMIN/TMAX go on deciding the picture and stop deciding the
+# measurement. Needs the raw-passthrough firmware; older builds have no such
+# ioctl, hence the explicit check rather than an AttributeError inside a stream.
+#
+# The buffer is allocated once here and refilled in place forever after. Per
+# frame allocation is what most of this file's comments exist to avoid: 37.5KB
+# of garbage per frame drains the heap in minutes, and the emergency collect
+# that follows wedges a live Lepton permanently.
+RAW = __RAW__
+_raw = None
+if RAW:
+    if not hasattr(csi, "IOCTL_LEPTON_SET_RAW"):
+        raise RuntimeError("firmware has no Lepton raw passthrough; reflash")
+    _raw = bytearray(lep.width() * lep.height() * 2)
+    lep.ioctl(csi.IOCTL_LEPTON_SET_RAW, True)
+    lep.snapshot()                  # arm: the buffer is empty until a frame lands
 '''
 
 RECORD_CODE = _BRINGUP + r'''
@@ -614,6 +647,11 @@ def subst(code, args, npairs=None):
             .replace("__TMIN__", str(args.tmin))
             .replace("__TMAX__", str(args.tmax))
             .replace("__AUTORANGE__", str(not args.no_autorange))
+            # This tool's own capture modes are 8-bit throughout - their
+            # consumers index thermal.raw as one byte per pixel. live.py is
+            # where the 16-bit plane is streamed and recorded; it substitutes
+            # its own value here.
+            .replace("__RAW__", "False")
             .replace("__INTERVAL_MS__", str(int(args.interval * 1000)))
             .replace("__DIR__", BOARD_DIR))
 

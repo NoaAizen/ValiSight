@@ -128,10 +128,35 @@ class SupervisionTest(unittest.TestCase):
             self.assertEqual(got["radar_cfg_sha256"], "cfg")
             self.assertEqual(got["lepton_gain"], "high")
 
+    def test_a_session_whose_radar_is_withdrawn_carries_no_radar_hashes(self):
+        # A session recorded under a different chirp config keeps its thermal
+        # but must not claim its radar is comparable: the split-wide check
+        # treats a missing hash as "says nothing" and a differing one as a
+        # conflict that stops training.
+        with tempfile.TemporaryDirectory() as td:
+            os.makedirs(os.path.join(td, "s"))
+            with open(os.path.join(td, "s", "meta.json"), "w") as f:
+                json.dump({"lepton_gain": "high",
+                           "radar_calib_sha256": "calib",
+                           "radar_cfg_stamp": {"sha256": "cfg",
+                                               "name": "radar_10hz.cfg"}}, f)
+            old = export_shards.CAPTURES
+            export_shards.CAPTURES = td
+            try:
+                got = session_provenance("s", radar_unusable=True)
+            finally:
+                export_shards.CAPTURES = old
+            self.assertIsNone(got["radar_cfg_sha256"])
+            self.assertIsNone(got["radar_calib_sha256"])
+            self.assertTrue(got["radar_unusable"])
+            # what it was recorded under is still on the record
+            self.assertEqual(got["radar_cfg_name"], "radar_10hz.cfg")
+            self.assertEqual(got["lepton_gain"], "high")
+
 
     def test_training_bundle_is_versioned_with_the_export(self):
         with tempfile.TemporaryDirectory() as td:
-            got = write_training_bundle(td)
+            got = write_training_bundle(td, 'v9')
             self.assertEqual(
                 got['entrypoint'], 'python -m perception.train_students')
             for rel, digest in got['sha256'].items():
@@ -141,6 +166,23 @@ class SupervisionTest(unittest.TestCase):
                 self.assertEqual(len(digest), 64)
             self.assertTrue(os.path.exists(
                 os.path.join(td, 'train_students_colab.ipynb')))
+            self.assertTrue(os.path.exists(os.path.join(
+                td, 'code', 'perception', 'export_students_onnx.py')))
+
+            with open(os.path.join(
+                    td, 'train_students_colab.ipynb'), encoding='utf-8') as f:
+                notebook = json.load(f)
+            notebook_text = ''.join(
+                ''.join(cell.get('source', ()))
+                for cell in notebook.get('cells', ()))
+            self.assertIn('Preflight', notebook_text)
+            self.assertIn('perception.export_students_onnx', notebook_text)
+            # The bundled notebook must name THIS export. It used to be copied
+            # verbatim, so v3's bundle shipped pointing at v2: opening it
+            # beside the v3 shards and running it trained on v2 and wrote the
+            # checkpoint into v3/models, and nothing anywhere said so.
+            self.assertIn("EXPORT_NAME = 'v9'", notebook_text)
+            self.assertNotIn("EXPORT_NAME = 'v2'", notebook_text)
 
     def test_range_profile_is_exported_without_ra_or_rd(self):
         from unittest import mock

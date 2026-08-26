@@ -22,12 +22,27 @@ colour and feathers the calibrated thermal footprint. It is the default in
 `run_live.sh`; use `--view visible` for calibration picking and `--view fused`
 when the rendered palette itself must remain a fixed thermal scale.
 
+## Display channels
+
+`--channel thermal|rgb_radar|thermal_radar|fusion|ai` chooses the operator
+product independently of the calibration `--view`. The five channels are:
+pure registered thermal; visible plus raw radar; thermal plus raw radar;
+thermal+visible+radar fusion; and a clean AI view containing final detections
+and tracks. Keys 1-5 and the first card in the browser switch them live.
+
+The PAG7936 transport is still `GRAYSCALE`, so `rgb_radar` is labelled
+**visible + radar** in the browser. Its stable API id is reserved for the true
+RGB565 path; it must not be relabelled as colour until that path passes the
+raw16 bandwidth and long-run sensor-stall gate.
+
 ## AI channels in the viewer
 
 `live.py --students` runs the two trained person students beside the COCO
-detector and draws three switchable channels: thermal (orange), radar (cyan)
-and their fusion (white — the same person found by both, paired horizontally
-inside 50 px). **lock** (key `l`, on by default) keeps a person between frames: seen twice
+detector. Their thermal (orange), radar (cyan), and fusion (white) boxes are
+intermediate evidence and are hidden in the AI product by default; the engines
+continue feeding fusion and tracking. Enable **student evidence** (key `e`) only
+when debugging those model outputs. The clean product uses one plain final box;
+the jagged thermal **person outline** is opt-in with key `s`. **lock** (key `l`, on by default) keeps a person between frames: seen twice
 they become `P1`, held through the frames no sensor found them in for up to
 1.5 s and carried on their own velocity, drawn amber and dashed while coasting.
 All three sensors feed one tracker, so a lock the detector loses can be held by

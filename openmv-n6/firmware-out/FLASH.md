@@ -1,5 +1,29 @@
 # Flashing this build
 
+> **Corrected 2026-08-25.** Two claims below did not survive contact with the
+> board, and both are load-bearing:
+>
+> 1. **This build was not on the board.** Read back over DFU, the FIRMWARE
+>    partition held `v1.28.0-49 on 2026-07-02` and no `fusion` module - five
+>    weeks older than the build documented here. That copy is now saved in
+>    `backup/`, which is the first time this project has had one.
+> 2. **`STM32_Programmer_CLI` is not the only way, and not the way used here.**
+>    The bootloader's own DFU works from the Jetson with plain `dfu-util`, needs
+>    no probe and no SDK, and cannot touch the bootloader partition at all -
+>    `boards/OPENMV_N6/boot_config.h` marks alt 0 `.rdonly = 1`. See
+>    `backup/README.md` for the recipe, including how to get into DFU (there is
+>    no software command for it; you race the 1500 ms window after a reset).
+>
+> One more thing worth carrying forward, learned the hard way on this flash:
+> **verify `firmware.bin`, never `firmware.elf`.** The ELF keeps symbol and debug
+> sections that never reach the device, so a symbol can be present in the ELF and
+> absent from the image. An incremental `make` here regenerated
+> `genhdr/qstrdefs.generated.h` without rebuilding `py/qstr.o`, and produced a
+> firmware whose code indexed a string table that did not contain its own new
+> entries. It booted, and the only symptom was two missing names in `dir(csi)`.
+> `make clean` is the fix; grepping the `.bin` is the check.
+
+
 Built on the Jetson 2026-08-09 from `src/fusion.c` @ 1457 lines (the merged tree,
 including the temporal filters). Checksums in `SHA256SUMS`.
 

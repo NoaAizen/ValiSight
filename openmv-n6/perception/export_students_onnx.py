@@ -116,6 +116,8 @@ def main():
     a = ap.parse_args()
     models = os.path.join(a.data, "models")
     torch.manual_seed(0)
+    thermal_exported = False
+    radar_exported = False
 
     ck_path = os.path.join(models, "thermal_student.pt")
     if os.path.exists(ck_path):
@@ -131,32 +133,49 @@ def main():
             output_names=["scores", "boxes"])
         print(f"exported {out}")
         verify(out, model, ex)
+        thermal_exported = True
     else:
         print(f"[skip] {ck_path} not found")
 
     ck_path = os.path.join(models, "radar_student.pt")
     if os.path.exists(ck_path):
         ck = torch.load(ck_path, map_location="cpu", weights_only=False)
-        model = RadarOnnx(rebuild_radar(ck)).eval()
-        pts = torch.zeros(1, a.max_points, 6)
-        pts[0, :12] = torch.randn(12, 6) * torch.tensor(
-            [2.0, 3.0, 0.5, 1.0, 10.0, 5.0])
-        ex = (pts, torch.tensor([12], dtype=torch.long))
-        out = os.path.join(models, "radar_student.onnx")
-        torch.onnx.export(
-            model, ex, out, opset_version=OPSET,
-            input_names=["radar_points", "n_radar"],
-            output_names=["scores", "boxes"])
-        print(f"exported {out}")
-        verify(out, model, ex)
+        streams = ck.get("streams", {})
+        dense = [name for name in ("ra", "rd", "rp")
+                 if streams.get(name, False)]
+        if dense:
+            # tools/trt_students.py currently has a point-cloud-only radar
+            # input contract. Silently replacing trained dense streams with
+            # zeros would create a valid-looking but behaviorally different
+            # model, so refuse that lossy deployment conversion explicitly.
+            print("[skip] radar ONNX: checkpoint uses dense stream(s) "
+                  f"{dense}, while the Jetson runtime accepts points only")
+        else:
+            model = RadarOnnx(rebuild_radar(ck)).eval()
+            pts = torch.zeros(1, a.max_points, 6)
+            pts[0, :12] = torch.randn(12, 6) * torch.tensor(
+                [2.0, 3.0, 0.5, 1.0, 10.0, 5.0])
+            ex = (pts, torch.tensor([12], dtype=torch.long))
+            out = os.path.join(models, "radar_student.onnx")
+            torch.onnx.export(
+                model, ex, out, opset_version=OPSET,
+                input_names=["radar_points", "n_radar"],
+                output_names=["scores", "boxes"])
+            print(f"exported {out}")
+            verify(out, model, ex)
+            radar_exported = True
     else:
         print(f"[skip] {ck_path} not found")
 
     print("\nOn the Jetson, build the TensorRT engines with:")
-    print("  /usr/src/tensorrt/bin/trtexec --onnx=models/thermal_student.onnx"
-          " --saveEngine=models/thermal_student.engine --fp16")
-    print("  /usr/src/tensorrt/bin/trtexec --onnx=models/radar_student.onnx"
-          " --saveEngine=models/radar_student.engine --fp16")
+    if thermal_exported:
+        print("  /usr/src/tensorrt/bin/trtexec "
+              "--onnx=models/thermal_student.onnx "
+              "--saveEngine=models/thermal_student.engine --fp16")
+    if radar_exported:
+        print("  /usr/src/tensorrt/bin/trtexec "
+              "--onnx=models/radar_student.onnx "
+              "--saveEngine=models/radar_student.engine --fp16")
 
 
 if __name__ == "__main__":
