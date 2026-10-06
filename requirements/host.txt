@@ -1,0 +1,7 @@
+# Portable host runtime and calibration. These are dependency declarations,
+# not a frozen environment. See docs/DEVELOPMENT.md for Jetson setup.
+numpy
+opencv-python
+pyserial
+scipy
+Pillow

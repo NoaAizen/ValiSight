@@ -1,0 +1,3 @@
+[tool.pytest.ini_options]
+testpaths = ["openmv-n6/perception/tests", "openmv-n6/tools/tests"]
+addopts = "-ra"

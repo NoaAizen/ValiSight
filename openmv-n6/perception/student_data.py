@@ -221,6 +221,15 @@ def load_split(data_dir: str, which: str,
     ])
     combined["session_index"] = session_index
 
+    # Optional per-frame training emphasis. Older shards and sessions without
+    # mined examples contribute False, so a V7 dataset may mix them safely.
+    if any("thermal_hard_negative" in a for a in session_arrays):
+        combined["thermal_hard_negative"] = np.concatenate([
+            a.get("thermal_hard_negative",
+                  np.zeros(len(a["thermal"]), np.bool_)).astype(np.bool_)
+            for a in session_arrays
+        ])
+
     for key, valid_key in OPTIONAL_STREAMS.items():
         if key not in shapes:
             continue
@@ -340,4 +349,3 @@ def detection_target(split: LoadedSplit, i: int, plane: str,
         "gt_boxes": boxes,
         "gt_confidence": confidence,
     }
-

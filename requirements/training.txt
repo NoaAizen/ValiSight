@@ -1,0 +1,8 @@
+# Install the matching Jetson PyTorch/CUDA build separately before this file.
+-r host.txt
+onnx
+onnxruntime
+scikit-learn
+PyYAML
+# torch, torchvision, TensorRT and Ultralytics are environment-specific;
+# use the existing training workflow/container, not a generic pip upgrade.

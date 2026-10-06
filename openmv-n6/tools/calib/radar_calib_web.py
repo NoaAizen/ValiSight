@@ -77,6 +77,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import radar_correspond as rc      # noqa: E402
 import thermal_io                  # noqa: E402
 import radar_extrinsics as rx      # noqa: E402
+from web.assets import read_text
 
 # Measured 2026-08-10 with a caliper-measured 38.3 mm checkerboard at
 # tape-measured 1.00 m (19.95 px/square -> f=521) and 2.00 m (10.13 px ->
@@ -705,127 +706,7 @@ class CalibSession:
             return buf.tobytes() if ok else None
 
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
-<title>radar &harr; camera calibration</title><style>
- body{background:#111;color:#ddd;font:14px system-ui,sans-serif;margin:16px}
- h1{font-size:18px} a{color:#8ac} .row{display:flex;gap:12px;flex-wrap:wrap}
- img{max-width:100%;display:block} #framewrap{position:relative;flex:0 1 640px}
- #frame{cursor:crosshair;width:100%}
- #hint{color:#aaa;margin:6px 0} button{background:#333;color:#ddd;border:1px
- solid #555;padding:6px 14px;margin-right:6px;border-radius:4px;cursor:pointer}
- button:hover{background:#444} #solve{background:#274;border-color:#3a6}
- table{border-collapse:collapse;margin-top:10px;font-size:13px}
- td,th{padding:2px 10px;text-align:right;border-bottom:1px solid #2a2a2a}
- tr.cur{background:#232b36} tr{cursor:pointer} .picked{color:#7d7}
- .mov{color:#fa6} pre{background:#181818;padding:10px;border:1px solid #333;
- white-space:pre-wrap;max-width:900px}
- .ok{color:#7d7}.bad{color:#f77}.warn{color:#fc6}
- #issues li{color:#fc6}
-</style></head><body>
-<h1>radar &harr; camera calibration</h1>
-<div id="hint">click the subject's <b>visible body outline</b> (not a thermal
-blob) &middot; <b>enter</b>/click again = accept &middot; <b>n</b>/<b>p</b> =
-next/prev hold &middot; <b>u</b> = unpick &middot; <b>s</b> = solve</div>
-<div class="row">
- <div id="framewrap"><img id="frame"></div>
- <div><img id="bird"></div>
-</div>
-<div style="margin-top:10px">
- <button onclick="nav(-1)">&larr; prev</button>
- <button onclick="nav(1)">next &rarr;</button>
- <button onclick="unpick()">unpick</button>
- <button id="solve" onclick="solve()">solve</button>
- <span id="prog"></span>
-</div>
-<ul id="issues"></ul>
-<pre id="result" style="display:none"></pre>
-<table id="holds"></table>
-<div id="meta" style="color:#888;margin-top:8px"></div>
-<script>
-let S=null,k=0,pending=null;
-const $=id=>document.getElementById(id);
-async function post(p,body){const r=await fetch(p,{method:'POST',
- headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})});
- return r.json();}
-async function refresh(){S=await(await fetch('/state')).json();render();}
-function bust(u){return u+'?t='+Date.now();}
-function render(){
- if(!S)return;
- if(S.error){alert(S.error);return;}
- $('frame').src=bust('/frame/'+k); $('bird').src=bust('/bird/'+k);
- const n=S.holds.filter(h=>h.picked).length;
- $('prog').textContent=' '+n+'/'+S.holds.length+' holds picked';
- const ul=$('issues');ul.innerHTML='';
- (S.spread.issues||[]).forEach(t=>{const li=document.createElement('li');
-  li.textContent=t;ul.appendChild(li);});
- const tb=$('holds');tb.innerHTML=
-  '<tr><th>#</th><th>range m</th><th>az &deg;</th><th>el &deg;</th>'+
-  '<th>frames</th><th>sd(az)</th><th>snr dB</th><th></th></tr>';
- S.holds.forEach(h=>{const tr=document.createElement('tr');
-  if(h.k===k)tr.className='cur';
-  tr.innerHTML='<td>'+h.k+'</td><td>'+h.range_m.toFixed(2)+'</td><td>'+
-   h.az_deg.toFixed(1)+'</td><td>'+h.el_deg.toFixed(1)+'</td><td>'+h.n+
-   '</td><td>'+h.az_sd.toFixed(2)+'</td><td>'+h.snr_db.toFixed(1)+'</td><td>'+
-   (h.picked?'<span class=picked>&#10003; ('+h.picked[0].toFixed(0)+','+
-    h.picked[1].toFixed(0)+')</span>':'')+
-   (h.moving?' <span class=mov>moving</span>':'')+
-   (h.ghost?' <span class=mov>GHOST? az mismatch</span>':'')+'</td>';
-  tr.onclick=()=>{k=h.k;pending=null;render();};
-  tb.appendChild(tr);});
- const r=$('result');
- if(S.result){r.style.display='block';
-  r.innerHTML='<span class="'+(S.result.passed?'ok':'bad')+'">'+
-   (S.result.passed?'GATE PASSED':'GATE FAILED')+'</span>'+
-   (S.result.nominal_k?'  <span class=warn>(nominal K - provisional)</span>':'')+
-   '\\n'+esc(S.result.summary)+'\\n'+esc(S.result.holdout_worst)+
-   '\\nwrote '+esc(S.result.wrote);}
- else r.style.display='none';
- $('meta').textContent='session '+S.session+' | intrinsics: '+S.k_source+
-  ' | excluded: '+S.n_scenery+' scenery, '+S.n_outside+' outside camera, '+
-  S.n_tainted+' tainted pictures | writes '+S.corr_path;
-}
-function esc(s){const d=document.createElement('div');
- d.appendChild(document.createTextNode(s||''));return d.innerHTML;}
-let lastAccept=0;
-$('frame').addEventListener('click',async e=>{
- /* a fast double-click on the accept would otherwise land its echo on the
-    NEXT hold and stamp it with the same pixel - seen in real data as two
-    different stations sharing one pixel exactly */
- if(Date.now()-lastAccept<600)return;
- const im=$('frame'),r=im.getBoundingClientRect();
- const u=(e.clientX-r.left)*im.naturalWidth/r.width;
- const v=(e.clientY-r.top)*im.naturalHeight/r.height;
- if(pending&&Math.hypot(pending[0]-u,pending[1]-v)<12){await accept();return;}
- pending=[u,v];drawPending();
-});
-function drawPending(){ /* re-fetch keeps it simple: server draws accepted
- marks; the pending one is shown by a floating div */
- let d=$('pend');if(!d){d=document.createElement('div');d.id='pend';
-  d.style.cssText='position:absolute;width:14px;height:14px;margin:-7px 0 0 '+
-  '-7px;pointer-events:none;border:2px solid #f6a;border-radius:50%';
-  $('framewrap').appendChild(d);}
- const im=$('frame'),r=im.getBoundingClientRect(),
-  wr=$('framewrap').getBoundingClientRect();
- d.style.left=(pending[0]*r.width/im.naturalWidth+r.left-wr.left)+'px';
- d.style.top=(pending[1]*r.height/im.naturalHeight+r.top-wr.top)+'px';
- d.style.display='block';}
-async function accept(){if(!pending)return;
- S=await post('/accept',{k:k,u:pending[0],v:pending[1]});pending=null;
- lastAccept=Date.now();
- const d=$('pend');if(d)d.style.display='none';
- nav(1);}
-async function unpick(){S=await post('/remove',{k:k});render();}
-async function solve(){$('solve').textContent='solving...';
- S=await post('/solve',{});$('solve').textContent='solve';
- if(S.error){alert(S.error);await refresh();}else render();}
-function nav(d){k=Math.max(0,Math.min(S.holds.length-1,k+d));pending=null;
- const p=$('pend');if(p)p.style.display='none';render();}
-document.addEventListener('keydown',e=>{
- if(e.key==='Enter')accept();
- else if(e.key==='n')nav(1);else if(e.key==='p')nav(-1);
- else if(e.key==='u')unpick();else if(e.key==='s')solve();});
-refresh();
-</script></body></html>"""
+PAGE = read_text("radar_calibration.html")
 
 
 def make_handler(cal):

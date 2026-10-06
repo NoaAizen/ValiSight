@@ -1,0 +1,21 @@
+
+import os, sys, gc
+
+out = sys.stdout.buffer
+CHUNK = 4096
+names = sorted(os.listdir("__DIR__"))
+sys.stdout.write("#LIST %d\n" % len(names))
+buf = bytearray(CHUNK)
+mv = memoryview(buf)
+for n in names:
+    p = "__DIR__/" + n
+    sz = os.stat(p)[6]
+    sys.stdout.write("#FILE %s %d\n" % (n, sz))
+    with open(p, "rb") as f:
+        while True:
+            k = f.readinto(buf)
+            if not k:
+                break
+            out.write(mv[:k])         # chunked: never park in one huge blocking write
+    gc.collect()
+sys.stdout.write("#FETCHDONE\n")

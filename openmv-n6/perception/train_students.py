@@ -68,6 +68,29 @@ def initialise_from(model, path, tag):
     own = model.state_dict()
     usable = {k: v for k, v in state.items()
               if k in own and own[k].shape == v.shape}
+    expanded = []
+    for key, old in state.items():
+        if key not in own or key in usable:
+            continue
+        fresh = own[key]
+        # V7 appends derived thermal channels. Preserve every V6 filter on its
+        # original input channel and leave only the new slices initialized.
+        if (key == "encoder.net.0.weight"
+                and old.ndim == fresh.ndim == 4
+                and old.shape[0] == fresh.shape[0]
+                and old.shape[2:] == fresh.shape[2:]
+                and old.shape[1] < fresh.shape[1]):
+            value = fresh.clone()
+            value[:, :old.shape[1]] = old
+            usable[key] = value
+            expanded.append(key)
+        elif (key == "derived.channel_mask"
+              and old.ndim == fresh.ndim == 1
+              and old.shape[0] < fresh.shape[0]):
+            value = fresh.clone()
+            value[:old.shape[0]] = old
+            usable[key] = value
+            expanded.append(key)
     if not usable:
         raise SystemExit(
             f"--init-from {path}: nothing in it fits this model (checkpoint "
@@ -84,6 +107,9 @@ def initialise_from(model, path, tag):
         print(f"[{tag}] not in the checkpoint, staying random: "
               f"{', '.join(skipped[:6])}"
               + (f" (+{len(skipped) - 6} more)" if len(skipped) > 6 else ""))
+    if expanded:
+        print(f"[{tag}] expanded V6 tensors for new V7 channels: "
+              f"{', '.join(expanded)}")
     return model
 
 
@@ -139,6 +165,10 @@ def main():
                          "balances them against positives (capped at 20), a "
                          "number sets it outright, 1 restores the unweighted "
                          "loss that learns to always answer 'person'")
+    ap.add_argument("--hard-negative-weight", type=float, default=3.0,
+                    help="no-object loss multiplier on mined thermal hard-"
+                         "negative frames (default 3; matched real-person "
+                         "queries keep their normal positive weight)")
     ap.add_argument("--disable-thermal", default="",
                     help="comma-separated derived thermal channels")
     ap.add_argument("--disable-radar-family", action="append", default=[],
@@ -239,7 +269,8 @@ def main():
             epochs=args.epochs, learning_rate=args.learning_rate,
             weight_decay=args.weight_decay, use_amp=not args.no_amp,
             tag="THERMAL", resume_path=resume,
-            negative_weight=negative_weight_for("thermal"))
+            negative_weight=negative_weight_for("thermal"),
+            hard_negative_weight=args.hard_negative_weight)
         path = os.path.join(out_dir, "thermal_student.pt")
         torch.save(checkpoint_payload(
             model, metrics, manifest, args, {
@@ -313,4 +344,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

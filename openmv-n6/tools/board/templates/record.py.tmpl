@@ -1,0 +1,29 @@
+
+try:
+    os.mkdir("__DIR__")
+except OSError:
+    pass
+for f in os.listdir("__DIR__"):
+    os.remove("__DIR__/" + f)
+
+meta = {"tmin": TMIN, "tmax": TMAX, "rgb_w": rgb.width(), "rgb_h": rgb.height(),
+        "th_w": lep.width(), "th_h": lep.height(), "burst": __BURST__}
+with open("__DIR__/meta.json", "w") as f:
+    f.write(str(meta).replace("'", '"').replace("True", "true").replace("False", "false"))
+
+for i in range(__NPAIRS__):
+    t = lep.snapshot()               # blocks ~113ms -> paces the loop at the thermal rate
+    with open("__DIR__/%04d_thermal.raw" % i, "wb") as f:
+        f.write(t.bytearray())
+    for b in range(__BURST__):
+        with open("__DIR__/%04d_rgb%d.raw" % (i, b), "wb") as f:
+            f.write(rgb.snapshot().bytearray())
+    sys.stdout.write("#REC %d\n" % i)
+    # No gc.collect() here, deliberately. It wedges the Lepton - see the invariant
+    # above good_snapshot(). This loop is bounded by __NPAIRS__ rather than running
+    # forever, so it does not need one; RAM_CODE below collects after its loop, and
+    # that is the pattern to copy.
+
+# No shutdown(True): OMV_CSI_POWER_PIN is shared, so powering one sensor down
+# cuts the other, and the second shutdown then talks I2C to an unpowered part.
+sys.stdout.write("#RECDONE\n")

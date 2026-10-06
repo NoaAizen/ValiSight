@@ -26,6 +26,7 @@ And nothing here says anything about range: the exit gate wants a walker at
 12 m, and no amount of waving at 1.5 m substitutes for it.
 """
 import argparse
+from pathlib import Path
 import collections
 import json
 import os
@@ -148,71 +149,9 @@ def reader(ser, st):
             st.err = '%s: %s' % (type(e).__name__, e)
 
 
-PAGE = """<!doctype html><meta charset=utf-8>
-<title>Doppler gate</title>
-<style>
- body{background:#111;color:#ddd;font:14px/1.5 ui-monospace,monospace;margin:0;padding:18px}
- h1{font-size:15px;color:#888;font-weight:400;margin:0 0 14px}
- .big{font-size:64px;line-height:1;margin:6px 0}
- .verdict{padding:12px 16px;border-radius:6px;margin:14px 0;font-size:15px}
- .no{background:#2a1a1a;border-left:4px solid #a44}
- .yes{background:#152a15;border-left:4px solid #4a4}
- .warn{background:#2a2415;border-left:4px solid #aa4}
- table{border-collapse:collapse;margin-top:8px}td,th{padding:2px 14px 2px 0;text-align:right}
- th{color:#777;font-weight:400}
- .bar{background:#2c4a6e;height:11px;display:inline-block;vertical-align:middle}
- .k{color:#777}
- .fold{color:#c66}
-</style>
-<h1>radar_people.cfg &mdash; live Doppler. Move radially: toward the sensor and away.</h1>
-<div id=v></div>
-<script>
-function pct(x){return (100*x).toFixed(0)}
-async function tick(){
- let d = await (await fetch('/data')).json();
- let el = document.getElementById('v');
- if(d.err){el.innerHTML='<div class="verdict no">reader died: '+d.err+'</div>';return}
- let verdict;
- if(d.near_ceiling>0)
-   verdict='<div class="verdict warn"><b>near the new ceiling.</b> '+d.near_ceiling+
-     ' points within 2% of &plusmn;'+d.v_max.toFixed(2)+' m/s &mdash; that is ambiguous '+
-     'again. Slow down, or this reading folds too.</div>';
- else if(d.proven)
-   verdict='<div class="verdict yes"><b>the fix is real.</b> '+d.above_old+
-     ' points above the old &plusmn;'+d.old_v_max+' m/s ceiling. Under radar_10hz.cfg '+
-     'every one of them would have folded and read as near-static.</div>';
- else
-   verdict='<div class="verdict no"><b>not yet.</b> nothing above the old '+
-     '&plusmn;'+d.old_v_max+' m/s. Either nothing is moving radially, or the profile '+
-     'did not take. Walk straight at the sensor &mdash; sideways motion has no '+
-     'radial component and reads as zero.</div>';
- let hmax = Math.max(1, ...d.hist.map(h=>h[1]));
- let hist = d.hist.map(h=>'<tr><td'+(Math.abs(h[0])>d.old_v_max?' class=fold':'')+'>'+
-   h[0].toFixed(2)+'</td><td style="text-align:left"><span class=bar style="width:'+
-   (240*h[1]/hmax)+'px"></span> '+h[1]+'</td></tr>').join('');
- let pts = d.points.map(p=>'<tr><td>'+p.r.toFixed(2)+'</td><td'+
-   (Math.abs(p.v)>d.old_v_max?' class=fold':'')+'>'+p.v.toFixed(3)+'</td><td>'+
-   p.az.toFixed(0)+'</td><td>'+(p.snr==null?'-':p.snr.toFixed(1))+'</td></tr>').join('');
- el.innerHTML = '<div class=k>largest |v| reported</div>'+
-  '<div class="big">'+d.max_abs_v.toFixed(3)+'</div>'+
-  '<div class=k>m/s, at '+d.max_v_range.toFixed(2)+' m &nbsp;|&nbsp; old ceiling '+
-  d.old_v_max+' &nbsp; new ceiling '+d.v_max.toFixed(2)+'</div>'+
-  verdict+
-  '<table><tr><th>frames</th><td>'+d.frames+'</td><th>with motion</th><td>'+
-  pct(d.frames_with_motion/Math.max(1,d.frames))+'%</td></tr>'+
-  '<tr><th>moving points</th><td>'+d.moving_points+'</td><th>above old v_max</th><td>'+
-  d.above_old+'</td></tr>'+
-  '<tr><th>fps</th><td>'+d.fps.toFixed(1)+'</td><th>margin</th><td>'+
-  (d.margin_us==null?'-':(d.margin_us/1000).toFixed(1)+' ms')+'</td></tr>'+
-  '<tr><th>dropped bytes</th><td>'+d.dropped+'</td><th></th><td></td></tr></table>'+
-  '<h1 style="margin-top:20px">velocity histogram, m/s (red = the old config could not report this)</h1>'+
-  '<table>'+hist+'</table>'+
-  '<h1 style="margin-top:20px">live points, fastest first</h1>'+
-  '<table><tr><th>range m</th><th>v m/s</th><th>az deg</th><th>snr</th></tr>'+pts+'</table>';
-}
-setInterval(tick,200);tick();
-</script>
-"""
+PAGE = (
+    Path(__file__).resolve().parents[1] / "web" / "radar_doppler.html"
+).read_text(encoding="utf-8")
 
 
 def make_handler(st):

@@ -64,6 +64,9 @@ class StudentDataTest(unittest.TestCase):
                 [LABEL_NEGATIVE, LABEL_POSITIVE]
                 + [LABEL_UNKNOWN] * (n - 2), np.int8),
         }
+        if name == "a":
+            arrays["thermal_hard_negative"] = np.array(
+                [False, True] + [False] * (n - 2), np.bool_)
         if with_ra:
             arrays["range_angle"] = np.ones((n, 4, 5), np.float16)
             arrays["ra_valid"] = np.ones(n, np.bool_)
@@ -103,6 +106,11 @@ class StudentDataTest(unittest.TestCase):
         seq, valid = split.sequence("range_angle", 3, "ra_valid")
         self.assertEqual(valid.tolist(), [False, False, False])
         self.assertFalse(seq.any())
+
+    def test_optional_hard_negatives_are_false_filled_by_session(self):
+        split = load_split(self.data, "train")
+        self.assertEqual(split.arrays["thermal_hard_negative"].tolist(),
+                         [False, True, False, False, False])
 
     def test_targets_use_the_students_own_plane(self):
         split = load_split(self.data, "train")
@@ -145,4 +153,3 @@ class StudentDataTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

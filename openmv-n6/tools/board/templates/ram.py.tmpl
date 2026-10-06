@@ -1,0 +1,47 @@
+
+RGB_W, RGB_H = rgb.width(), rgb.height()
+TH_W, TH_H = lep.width(), lep.height()
+
+# No IOCTL_LEPTON_GET_*_TEMP here. Those are blocking CCI/I2C transactions on the
+# shared I2C3 bus, and issuing one while VoSPI is streaming can stall the
+# interpreter. On this board USB is serviced by TinyUSB from the MicroPython
+# scheduler (mp_usbd.c -> mp_usbd_task_callback -> tud_task_ext), so a long
+# blocking call starves tud_task(), the host stops getting answers, and the
+# device drops off the bus with no Python-level error at all.
+
+frames = []
+torn_total = 0
+for i in range(__NPAIRS__):
+    t, was_torn = good_snapshot(lep)
+    torn_total += 1 if was_torn else 0
+    # bytearray() is a view onto the framebuffer, which the next snapshot
+    # overwrites - copy it out or every frame ends up identical
+    frames.append(("%04d_thermal" % i, bytes(t.bytearray())))
+    for b in range(__BURST__):
+        frames.append(("%04d_rgb%d" % (i, b), bytes(rgb.snapshot().bytearray())))
+    sys.stdout.write("#REC %d\n" % i)
+    if __INTERVAL_MS__:
+        time.sleep_ms(__INTERVAL_MS__)
+
+sys.stdout.write("#TORN %d\n" % torn_total)
+
+# No shutdown(True): OMV_CSI_POWER_PIN (PE1) is shared, so powering one sensor
+# down cuts the other too, and the second shutdown then talks I2C to an
+# unpowered part. Just stop pulling frames.
+gc.collect()
+
+sys.stdout.write("#META %s\n" % str({
+    "tmin": TMIN, "tmax": TMAX, "rgb_w": RGB_W, "rgb_h": RGB_H,
+    "th_w": TH_W, "th_h": TH_H, "burst": __BURST__,
+}).replace("'", '"'))
+
+out = sys.stdout.buffer
+CHUNK = 4096
+for name, data in frames:
+    sys.stdout.write("#FILE %s.raw %d\n" % (name, len(data)))
+    m = memoryview(data)
+    off = 0
+    while off < len(m):
+        out.write(m[off:off + CHUNK])
+        off += CHUNK
+sys.stdout.write("#FETCHDONE\n")

@@ -26,7 +26,8 @@ import cv2
 import numpy as np
 
 # The bench already has these; no download and no network at run time.
-MODEL_DIR = os.path.expanduser("~/archive/radar/models")
+MODEL_DIR = os.path.expanduser(os.environ.get(
+    "THERMAL_FUSION_MODEL_DIR", "~/archive/radar/models"))
 CFG = os.path.join(MODEL_DIR, "yolov4-tiny.cfg")
 WEIGHTS = os.path.join(MODEL_DIR, "yolov4-tiny.weights")
 
@@ -201,7 +202,8 @@ def make_detector(backend="auto", size=SIZE, conf=CONF, classes=None,
         if not os.path.isfile(selected_engine):
             onnx = trt_detect.model_paths(model)[0]
             raise FileNotFoundError(
-                "%s\nexpected NMS engine for %s; export %s with nms=True "
+                "%s\nexpected decoded/NMS engine for %s; export %s with "
+                "tools/export_ultralytics_onnx.py "
                 "and run: %s" %
                 (selected_engine, model, onnx,
                  " ".join(trt_detect.build_command(model))))

@@ -383,11 +383,11 @@ class Track:
         cx, cy = self.x + self.w / 2.0, self.y + self.h / 2.0
         self.moved = max(self.moved,
                          ((cx - self.cx0) ** 2 + (cy - self.cy0) ** 2) ** 0.5)
-        # Range and temperature come from whichever observation carried them
-        # and are not invented while coasting: they are cleared with the box
-        # they belonged to, at the point the box stops being a measurement.
-        if obs.get("radar_m") is not None:
-            self.radar_m = obs["radar_m"]
+        # Range describes THIS measurement, not the identity forever.  A
+        # thermal-only correction therefore clears an old radar range instead
+        # of labelling a standing person with the last range Doppler happened
+        # to provide (the P40 2.3 m failure in the smoke/dark run).
+        self.radar_m = obs.get("radar_m")
         if obs.get("max_c") is not None:
             self.max_c = obs["max_c"]
         if obs.get("static_vouch", False):

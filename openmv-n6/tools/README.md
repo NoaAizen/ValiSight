@@ -1,20 +1,42 @@
 # tools/ — what runs where
 
-The root of this directory is **the live pipeline**: the files that import each
-other and together put a fused picture on a screen. Everything that is not part
-of that pipeline lives in a subdirectory named for what it is.
+The root contains command-line entry points and shared sensor/recording modules.
+Viewer components live in [viewer/](viewer/README.md), browser pages in
+[web/](web/README.md), and transmitted MicroPython source in
+[board/templates/](board/README.md). Calibration and bench diagnostics have
+their own directories. Existing commands and `live.py` component imports remain
+available.
 
 ## The pipeline (root)
 
 | file | role |
 |---|---|
 | `live.py` | live viewer: board streams, host fuses, browser watches. `--radar` overlays the IWR1843, `--record` writes a session |
+| `desktop_app.py` | desktop app window, startup progress and safe reuse of a running viewer; `--install` installs desktop/menu launchers |
 | `capture.py` | synchronized RGB+thermal pairs, board → disk |
 | `detect.py` | COCO detector over the visible luma, temperatures read per box |
 | `radar_overlay.py` | RadarReader (owns the DATA port) + radar point → pixel |
 | `recorder.py` | session recording: clean mp4, frames.jsonl, raw thermal.bin |
 | `send_radar_cfg.py` | pushes the chirp config to the radar CLI UART — run this before `live.py --radar` |
 | `mpx.py` | minimal raw-REPL runner; how everything in `board/` gets onto the board |
+
+## Desktop application
+
+Run `python3 tools/desktop_app.py --install` from `openmv-n6` once, then open
+**Thermal Fusion** from the application menu or the desktop shortcut. The Hebrew
+menu label is **מערכת צילום תרמי**. If the desktop asks to trust the shortcut,
+choose **Allow Launching**. Re-run installation after moving the checkout.
+
+The launcher uses the installed Chromium in app mode, without an address bar,
+with a separate browser profile. Python Tkinter provides startup progress and
+error messages. It reuses an existing viewer, otherwise starts `run_live.sh`
+with its normal sensor and AI configuration. It waits for an existing acquisition
+instead of interrupting it. `HTTP` can override the default local port, 8088.
+
+Closing the app window **leaves acquisition and recordings running**. Stop the
+sensor system explicitly with `tools/run_live.sh --stop` when finished.
+Startup/window logs are in `~/.local/state/thermal-fusion/`; the underlying
+sensor log remains `/tmp/live_radar.$USER.log` unless `LOG` was overridden.
 
 
 The viewer's `operator` mode preserves visible luminance, adds adaptive thermal
@@ -67,8 +89,8 @@ rather than showing an empty count.
 
 ## Detector models on the Jetson
 
-`live.py` accepts `--detect-model yolov10n|yolov8n|yolo11n`. The repository
-loader requires one static 640×640 TensorRT input and an NMS-included
+`live.py` accepts `--detect-model yolov10n|yolov8n|yolo11n|yolo26n|yolo26s|yolo26m|yolo26l|yolo26x`.
+The repository loader requires one static TensorRT input and a decoded
 `[1,max_det,6]` output; raw Ultralytics exports are rejected. YOLOv10n is
 already installed on this rig. To prepare YOLO11n, export ONNX in an isolated
 Ultralytics environment (this may be a workstation or Colab), copy the ONNX to
@@ -79,6 +101,12 @@ python3 tools/export_ultralytics_onnx.py --model yolo11n
 python3 tools/trt_detect.py --build yolo11n --verbose
 python3 tools/live.py --detect person --detect-backend gpu --detect-model yolo11n
 ```
+
+For YOLO26n, use the [isolated export and deployment guide](../../deployment/yolo26/README.md).
+`bash tools/run_yolo26.sh` selects YOLO26n on the GPU with the existing sensor
+stack. YOLO26 uses its one-to-one head (`nms=False` in the pinned exporter),
+whereas YOLOv8/11 use embedded NMS. `detector_models.py` is the shared artifact
+registry used by export, runtime and launcher checks.
 
 TensorRT engines are specific to the target GPU/TensorRT version; do not copy
 an engine built on a different computer. Ultralytics code and pretrained models

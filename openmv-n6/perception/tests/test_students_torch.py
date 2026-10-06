@@ -30,6 +30,8 @@ class StudentTorchTest(unittest.TestCase):
 
     def test_thermal_forward_and_hungarian_loss(self):
         model = ThermalStudent(20.0, 5.0, max_objects=4)
+        self.assertTrue({"scene_delta_c", "warm_mask", "warm_persistence"}
+                        <= set(model.derived.channel_names))
         batch = {
             "thermal_seq": torch.rand(2, 3, 120, 160),
             "valid_prev1": torch.ones(2),
@@ -76,4 +78,3 @@ class StudentTorchTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

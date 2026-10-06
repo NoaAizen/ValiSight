@@ -62,8 +62,13 @@ class RadarOnnx(nn.Module):
 
 
 def rebuild_thermal(ck):
+    channels = ck.get("channels") or []
+    radiometric = (not channels or
+                   any(c in channels for c in
+                       ("scene_delta_c", "warm_mask", "warm_persistence")))
     model = ThermalStudent(
-        ck["thermal_mean"], ck["thermal_std"], ck["max_objects"])
+        ck["thermal_mean"], ck["thermal_std"], ck["max_objects"],
+        radiometric_channels=radiometric)
     if ck.get("disabled_channels"):
         model.derived.disable_channels(ck["disabled_channels"])
     model.load_state_dict(ck["model_state"])

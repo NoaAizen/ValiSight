@@ -29,6 +29,7 @@ but "do ALL of them arrive, while the cameras are running" -- which is what
 The accounting is exact rather than statistical: each magic word declares its
 own totalPacketLen, so the byte distance to the next magic must equal it.
 """
+from pathlib import Path
 import argparse
 import sys
 import time
@@ -37,155 +38,9 @@ import serial
 
 PORT = '/dev/ttyACM0'
 
-BOARD_CODE = r'''
-import time
-from machine import UART
-
-UART_ID = __UART__
-BAUD = 921600          # requested; the N6 divisor actually yields 917431 (-0.45%)
-RXBUF = __RXBUF__      # 32 KB minimum: a blocked 113 ms snapshot lets 10.4 KB in
-DURATION_MS = __MS__
-WINDOW_MS = 2000
-HEXDUMP = __HEX__
-WITH_CAMERA = __CAM__
-
-MAGIC = b"\x02\x01\x04\x03\x06\x05\x08\x07"
-TOTAL_OFF = 12         # magic(8) + version(4) -> totalPacketLen
-
-lep = rgb = None
-if WITH_CAMERA:
-    # Visible sensor first, then the Lepton soft-reset. The reset line is shared
-    # across CSI devices and a hard reset of one while the other streams locks
-    # the bus; this is the same order capture.py uses.
-    import csi
-    try:
-        rgb = csi.CSI(cid=0x7936)
-        rgb.reset()
-        rgb.pixformat(csi.GRAYSCALE)
-        rgb.framesize(csi.VGA)
-        lep = csi.CSI(cid=0x5435)
-        lep.reset(hard=False)
-        lep.pixformat(csi.GRAYSCALE)
-        lep.framesize(csi.QQVGA)
-        lep.ioctl(csi.IOCTL_LEPTON_SET_MODE, True, False)   # radiometry, HIGH gain
-        time.sleep_ms(2000)                                  # VoSPI sync settle
-        lep.snapshot()                                       # first one costs ~1.7 s
-        print("stage1: cameras up (PAG + Lepton)")
-    except Exception as e:
-        print("stage1: camera bring-up failed: %s" % e)
-        lep = None
-
-uart = UART(UART_ID, BAUD, bits=8, parity=None, stop=1, timeout=0, rxbuf=RXBUF)
-print("stage1: UART%d @%d 8N1 rxbuf=%d camera=%s" % (UART_ID, BAUD, RXBUF,
-                                                     lep is not None))
-print("stage1: gate is lost=0 for the whole run")
-
-def hexdump(chunk, base):
-    for off in range(0, len(chunk), 16):
-        row = chunk[off:off + 16]
-        print("%06x  %s" % (base + off, " ".join("%02x" % b for b in row)))
-
-carry = b""
-pos = 0                # absolute offset of the start of carry
-dumped = 0
-magics = 0
-good = 0
-bad = 0
-lost = 0
-last_pos = None
-last_total = None
-totals_lo = 0
-totals_hi = 0
-win_bytes = 0
-win_magics = 0
-snaps = 0
-win_start = time.ticks_ms()
-t0 = win_start
-
-# No gc.collect() anywhere in this loop, and none after it while the Lepton is
-# up: a collect wedges that CSI object permanently and only a fresh csi.CSI()
-# recovers it. The loop is written to allocate as little as possible for the
-# same reason -- the automatic collector is the thing being kept away.
-while time.ticks_diff(time.ticks_ms(), t0) < DURATION_MS:
-    data = uart.read()
-
-    if data:
-        win_bytes += len(data)
-        if dumped < HEXDUMP:
-            take = data[:HEXDUMP - dumped]
-            hexdump(take, dumped)
-            dumped += len(take)
-            if dumped >= HEXDUMP:
-                print("stage1: hexdump done, stats every %d ms" % WINDOW_MS)
-
-        buf = carry + data
-        base = pos
-        i = buf.find(MAGIC)
-        while i >= 0:
-            if i + TOTAL_OFF + 4 > len(buf):
-                break                      # totalPacketLen not here yet
-            total = (buf[i + TOTAL_OFF] | (buf[i + TOTAL_OFF + 1] << 8) |
-                     (buf[i + TOTAL_OFF + 2] << 16) |
-                     (buf[i + TOTAL_OFF + 3] << 24))
-            p = base + i
-            magics += 1
-            win_magics += 1
-            if last_pos is not None:
-                gap = p - last_pos
-                if gap == last_total:
-                    good += 1
-                else:
-                    bad += 1
-                    lost += gap - last_total
-                    if bad <= 8:
-                        print("stage1:   gap %d expected %d (%+d B) after %d frames"
-                              % (gap, last_total, gap - last_total, magics))
-            if totals_lo == 0 or total < totals_lo:
-                totals_lo = total
-            if total > totals_hi:
-                totals_hi = total
-            last_pos = p
-            last_total = total
-            i = buf.find(MAGIC, i + 8)
-
-        if i >= 0:
-            carry = buf[i:]                # replay the incomplete header
-        else:
-            carry = buf[-7:]               # possible split magic
-        pos = base + len(buf) - len(carry)
-
-    if lep is not None:
-        # The whole point of --camera: snapshot() parks us in the driver for
-        # 113 ms per frame with nobody draining the UART ring.
-        try:
-            lep.snapshot()
-            snaps += 1
-        except Exception as e:
-            print("stage1: snapshot failed: %s" % e)
-            lep = None
-    elif not data:
-        time.sleep_ms(2)
-
-    now = time.ticks_ms()
-    if time.ticks_diff(now, win_start) >= WINDOW_MS:
-        secs = time.ticks_diff(now, win_start) / 1000
-        print("stage1: %7.0f B/s | %4.1f frames/s | magics %d | frame %d..%d B"
-              " | ok %d bad %d lost %+d B | snaps %d" % (
-                  win_bytes / secs, win_magics / secs, magics,
-                  totals_lo, totals_hi, good, bad, lost, snaps))
-        if win_bytes == 0:
-            print("stage1:   no bytes -- DATA_TX on P13? ground? sensorStart?")
-        elif win_magics == 0:
-            print("stage1:   bytes but no magic -- CLI port tapped, or baud")
-        win_start = now
-        win_bytes = 0
-        win_magics = 0
-
-uart.deinit()
-print("stage1: %s -- %d frames, %d good gaps, %d bad, %+d bytes, %d snapshots"
-      % ("PASS" if (magics > 0 and bad == 0) else "FAIL",
-         magics, good, bad, lost, snaps))
-'''
+BOARD_CODE = (
+    Path(__file__).resolve().parents[1] / "board" / "templates" / "radar_stage1.py.tmpl"
+).read_text(encoding="utf-8")
 
 
 def main():

@@ -32,6 +32,14 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 HTTP="${HTTP:-8088}"
+PYTHON="${PYTHON:-python3}"
+# Resolve and validate model selection before touching any sensor or process.
+DETECT_ENGINE="$("$PYTHON" "$HERE/detector_models.py" "$@")"
+if [ "${ALLOW_DEGRADED:-0}" != "1" ] && [ "${1:-}" != "--stop" ] \
+        && [ "${1:-}" != "stop" ] && [ ! -s "$DETECT_ENGINE" ]; then
+    echo "missing selected RGB detector engine: $DETECT_ENGINE" >&2
+    exit 1
+fi
 
 # --- port resolution -------------------------------------------------------
 # The N6 enumerates as a MicroPython CDC device. The IWR1843 sits behind an
@@ -130,7 +138,7 @@ stop_viewer() {
 if [ "${1:-}" = "--stop" ] || [ "${1:-}" = "stop" ]; then
     stop_viewer
     if [ "${KEEP_RADAR:-0}" != "1" ]; then
-        if python3 "$HERE/send_radar_cfg.py" --port "$RADAR_CLI" --stop >/dev/null 2>&1; then
+        if "$PYTHON" "$HERE/send_radar_cfg.py" --port "$RADAR_CLI" --stop >/dev/null 2>&1; then
             echo "  radar stopped"
         else
             echo "  radar did not answer sensorStop - it may already be parked" >&2
@@ -153,7 +161,7 @@ if [ "${SKIP_CFG:-0}" != "1" ]; then
     # the training provenance gate.
     RADAR_CFG_PATH="${RADAR_CFG:-$ROOT/radar/configs/radar_people.cfg}"
     echo "sending chirp config ($RADAR_CFG_PATH)..."
-    python3 "$HERE/send_radar_cfg.py" "$RADAR_CFG_PATH" --port "$RADAR_CLI" >/dev/null \
+    "$PYTHON" "$HERE/send_radar_cfg.py" "$RADAR_CFG_PATH" --port "$RADAR_CLI" >/dev/null \
         || { echo "chirp config failed - rerun send_radar_cfg.py by hand to see why" >&2; exit 1; }
 fi
 
@@ -192,12 +200,6 @@ done
 # It only matters as a fallback: when the solved calib below exists, its K
 # (and R,t and distortion) replace the guess entirely.
 ALLOW_DEGRADED="${ALLOW_DEGRADED:-0}"
-DETECT_ENGINE="$HOME/archive/radar/models/yolov10n_fp16.engine"
-if [ "$ALLOW_DEGRADED" != "1" ] && [ ! -s "$DETECT_ENGINE" ]; then
-    echo "missing RGB detector engine: $DETECT_ENGINE" >&2
-    echo "set ALLOW_DEGRADED=1 only if running intentionally without the full stack" >&2
-    exit 1
-fi
 ARGS=(-p "$BOARD" --radar "$RADAR_DATA" --radar-hfov 62.7
       --detect person --channel fusion --view operator --agc 56 --thermal-frames 16
       --y-knee 4 --y-frames 8 --http "$HTTP")
@@ -293,8 +295,8 @@ fi
 # undulation, the ground and surface elevation off a 30 m DEM posting, and the
 # building footprints the top-down draws. Being 20 m out moved the ground
 # elevation by 5.5 m when it was measured on 2026-08-25.
-MAP="${MAP:-31.764559,35.191150}"
-MAP_DEFAULT="31.764559,35.191150"
+MAP="${MAP:-31.764592106299197,35.191233721163876}"
+MAP_DEFAULT="31.764592106299197,35.191233721163876"
 # The geoid assertion belongs to the position, not to the script: 19..20.5 m is
 # Jerusalem, and asserting it over a site in another country fails the stage
 # for the right reason but the wrong reading. So it rides only with the default
@@ -344,7 +346,7 @@ fi
 # before it starts, which reads as "the board is broken" rather than "someone
 # else ran this last".
 LOG="${LOG:-/tmp/live_radar.$(id -un).log}"
-nohup setsid python3 "$HERE/live.py" "${ARGS[@]}" "$@" >"$LOG" 2>&1 </dev/null &
+nohup setsid "$PYTHON" "$HERE/live.py" "${ARGS[@]}" "$@" >"$LOG" 2>&1 </dev/null &
 NEW_PID=$!
 echo "log         $LOG"
 LAUNCH_READY=0
@@ -384,7 +386,7 @@ echo
 # here would corrupt the solution, so skip.
 CAL="$ROOT/calib-artifacts/T_camera_radar.json"
 if [ ! -f "$CAL_SOLVED" ] && [ -f "$CAL" ]; then
-    QS="$(python3 - "$CAL" <<'PY'
+    QS="$("$PYTHON" - "$CAL" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1]))
 t = c.get("t_m", [0, 0, 0])                      # metres in the file, mm in /set
@@ -423,7 +425,7 @@ for ((i=0; i<${#USER_ARGS[@]}; i++)); do
         --agc) if (( i + 1 < ${#USER_ARGS[@]} )); then EXPECTED_AGC="${USER_ARGS[$((i+1))]}"; fi;;
     esac
 done
-python3 - "http://localhost:$HTTP" "$EXPECT_AI" "$EXPECT_MAP" "$EXPECTED_AGC" <<'PY'
+"$PYTHON" - "http://localhost:$HTTP" "$EXPECT_AI" "$EXPECT_MAP" "$EXPECTED_AGC" <<'PY'
 import json, sys, time
 from urllib.request import urlopen
 
@@ -513,7 +515,7 @@ grep -m3 -E '^students: ' "$LOG" >&2 || true
 # the viewer down, so a failed layer is one line far up the log and an empty
 # card on the page.
 grep -m1 -E '^map: ' "$LOG" >&2 || true
-curl -s --max-time 5 "http://localhost:$HTTP/health" 2>/dev/null | python3 -c '
+curl -s --max-time 5 "http://localhost:$HTTP/health" 2>/dev/null | "$PYTHON" -c '
 import json, sys
 raw = sys.stdin.read()
 if not raw.strip():

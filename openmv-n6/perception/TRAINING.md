@@ -75,6 +75,32 @@ python3 perception/export/export_shards.py \
   ו-dtype תרמי מוצהר; המחברת המעודכנת דורשת אותם).
 - `--no-rgb` משמיט את ה-RGB אם צריך לחסוך נפח.
 
+### V7 — עשן, מנורות ו־hard negatives
+
+V7 מוסיף למודל התרמי שלושה ערוצים נגזרים (הם מחושבים ב-GPU ולא נשמרים
+ב-shards): הפרש צלזיוס מרקע הסצנה, מסכת חום רכה והתמדת המסכה בשלושת הפריימים.
+הערוצים הקיימים של טמפרטורה מוחלטת, קצוות ושינוי בזמן נשארים. כך המודל יכול
+ללמוד שהזיוף מהעשן הוא קונטור חלש של כ־0.7°C, ולא גוף שמתמיד כ־7°C מעל הרקע.
+
+בסשן עשן שיש בו גם אדם **אסור** להשתמש ב-`--verified-negative`. קודם מתייגים
+את האדם (ורק סשן שהוקלט עם `--view visible` מתאים לשרשרת התיוג), בונים מחדש
+את ה-COCO, ואז מוסיפים את פריימי הזיוף כמשקל אימון — לא כתווית "חדר ריק":
+
+```sh
+python3 perception/export/export_shards.py \
+  --sessions <train-sessions...> smoke-dark-train <val-sessions...> \
+  --val smoke-dark-val <other-val...> \
+  --thermal-hard-negative \
+    smoke-dark-train=smoke-dark-train/thermal_v6_replay.jsonl \
+  --out-name v7
+```
+
+ה-miner מקבל רק תוצאות V6 עם confidence של לפחות 0.90, צורה אנושית והפרש
+קטן מ־3°C. הדגל מסמן דגש ל-loss בלבד; פריים ללא תווית עצמאית נשאר UNKNOWN
+ואינו נכנס ל-loss. לכן הוא לא הופך אדם שה-teacher פספס ל-background.
+יש להחזיק סשן עשן שלם ונפרד ב-val — לעולם לא לפצל פריימים מאותו סרט בין
+train ו-val.
+
 ## 4. העלאה ל-Google Drive
 
 להעלות את התיקייה `perception/out/gexport/v2/` אל:
@@ -115,7 +141,20 @@ python3 -m perception.train_students \
 
 דגלים עיקריים: `--student thermal|radar|both`, `--epochs 50`,
 `--batch-size 32`, `--learning-rate 1e-3`, `--device auto|cpu|cuda`,
-`--out DIR` (ברירת מחדל `DATA/models`).
+`--out DIR` (ברירת מחדל `DATA/models`), ו-`--hard-negative-weight 3`.
+
+Fine-tune מ־V6 ל־V7:
+
+```sh
+python3 -m perception.train_students \
+  --data perception/out/gexport/v7 --student thermal --epochs 50 \
+  --init-from perception/out/gexport/v6/models/thermal_student.pt \
+  --hard-negative-weight 3
+```
+
+השכבה הראשונה של V7 רחבה בשלושה ערוצים. הטעינה מעתיקה לתוכה את כל מסנני
+V6 בערוצים הישנים ומשאירה רק את שלושת הערוצים החדשים מאותחלים. במחברת Colab
+אפשר להגדיר `INIT_FROM_THERMAL` לנתיב ה-checkpoint ב-Drive.
 
 > **אזהרה ל-Jetson:** אין `pip install torch` רגיל — כל התקנת pip שגוררת
 > numpy 2.x שוברת את cv2 של apt (numpy נעול על 1.21). רק wheel של NVIDIA

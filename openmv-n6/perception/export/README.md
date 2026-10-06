@@ -63,6 +63,15 @@ The full loop, from a live rig to a trained student and back:
        --data perception/out/gexport/v2 --student both --epochs 50
    ```
 
+For V7 smoke/clutter fine-tuning, keep an entire smoke session in validation,
+mine low-delta V6 replay candidates with
+`--thermal-hard-negative SESSION=SESSION/thermal_v6_replay.jsonl`, and initialize
+the thermal run with `--init-from .../v6/models/thermal_student.pt`. A mixed
+session is never `--verified-negative`: the hard-negative marker only increases
+the no-object loss on independently supervised frames and never creates a
+label. V7 derives explicit Celsius-above-scene, warm-mask and warm-persistence
+channels on the GPU; shards continue to store the raw measurement only.
+
    Ablations do not require editing Python:
 
    ```sh

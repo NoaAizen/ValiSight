@@ -1,0 +1,166 @@
+
+out = sys.stdout.buffer
+CHUNK = 4096
+QUALITY = __Q__
+
+# Last thermal arrival, on the board's own clock. The host cannot derive this:
+# by the time a frame reaches it, the interval has been through a 4KB-chunked
+# CDC write, a 500ms stall retry loop and the host's own scheduling, and the
+# sensor cadence is buried under all three. ticks_ms() is a plain counter read,
+# not a heap walk like gc.mem_free(), and small ints do not allocate - so unlike
+# the heap reading this is safe to take every frame.
+_t_prev = 0
+# 500ms write timeouts hit on the previous frame. Nonzero means the host stopped
+# draining the port, which is the only way host load reaches the thermal sensor:
+# the board sits in out.write() instead of calling snapshot().
+_stalled = 0
+
+
+def write_text(s):
+    """Write one control record completely on the SAME stream as payloads.
+
+    Mixing ``sys.stdout.write`` for headers with ``sys.stdout.buffer.write``
+    for images gives the text wrapper permission to buffer a header while the
+    binary payload passes it.  The host then sees JPEG/thermal bytes where #F
+    must be.  Encoding the tiny record once and writing it through ``out`` keeps
+    control and payload in one ordered CDC queue.
+    """
+    global _stalled
+    b = s.encode()
+    mv = memoryview(b)
+    off = 0
+    stalls = 0
+    while off < len(b):
+        w = out.write(mv[off:])
+        if w:
+            off += w
+            stalls = 0
+            continue
+        stalls += 1
+        _stalled += 1
+        if stalls > 2:
+            return False
+    return True
+
+
+def stream(n, report=0):
+    global _t_prev, _stalled
+    # gc.mem_free() walks the whole 25MB heap and costs 227ms - measured on the
+    # board 2026-08-09, and it is the same heap-sized cost as gc.collect(). Per
+    # frame it took the stream from 8.8 to 3.2 fps. So the host asks for a reading
+    # only every Nth batch, and it is taken here, before the frame loop, where a
+    # stall is harmless: plain gaps of up to 2.5s between snapshots were measured
+    # not to disturb the sensor (unlike a collect, which wedges it at any length).
+    if report:
+        free = gc.mem_free()
+        # mem_free() monopolises the VM long enough that TinyUSB cannot service
+        # its CDC queue.  Yield once before putting the next header into that
+        # queue; the 50ms is inside the Lepton's measured-safe service gap and
+        # lets USB recover instead of dropping its first 512-byte packet.
+        time.sleep_ms(50)
+        if not write_text("#HEAP %d\n" % free):
+            return
+    for _ in range(n):
+        t, was_torn = good_snapshot(lep)       # paces the loop at the thermal rate
+        t_th = time.ticks_ms()
+        j = rgb.snapshot().to_jpeg(quality=QUALITY)
+        t_rgb = time.ticks_ms()
+        tb = t.bytearray()
+        if _raw is not None:
+            # Replaces the 8-bit plane rather than joining it. Both would be
+            # 56.25KB of thermal per frame, 493KB/s at 8.772fps, and with the
+            # JPEG on top that is 654KB/s against a link measured at 700-900 -
+            # inside the 500ms write timeout's reach, and the tail it discards
+            # is silent. The 8-bit frame is a lossy function of this one, so the
+            # host reconstructs it for free instead of paying to be told twice.
+            #
+            # t is still snapshotted and still used: good_snapshot() reads its
+            # segment boundaries to reject torn frames, which is a check on the
+            # VoSPI transport and is unaffected by which plane travels.
+            lep.ioctl(csi.IOCTL_LEPTON_GET_RAW, _raw)
+            tb = _raw
+        # Two extra numbers, both differences taken on this clock so the host
+        # never has to reason about ticks wrapping:
+        #
+        #   dt    since the previous thermal frame landed. The sensor's true
+        #         cadence - 114ms, and 1824ms across an FFC.
+        #   skew  from the thermal frame landing to the visible one being in
+        #         hand. This is the pairing error the fusion inherits: the two
+        #         planes it registers were not looked at at the same moment, and
+        #         anything moving is displaced by whatever this says.
+        #
+        # skew is measured between *completions*, which is the honest thing to
+        # report and not the whole story: the Lepton's frame is already ~one
+        # VoSPI transfer old when snapshot() returns, while the PAG's is fresh.
+        # So the true exposure gap is larger than this number, and this is its
+        # lower bound.
+        # A sixth field costs nothing. MicroPython's GC allocates in 16-byte
+        # blocks, and both the 3-tuple and the 6-tuple, and both the short and
+        # the long header string, land in the same block - so the whole clock is
+        # free against the ~208 B/frame this loop already leaks. That mattered
+        # enough to check: the leak is what drains the heap, an exhausted heap is
+        # what fires the automatic collector, and a collect with the Lepton up
+        # wedges it permanently.
+        #
+        # _stalled belongs to the PREVIOUS frame - this header is written before
+        # this frame's payload, so its stall count does not exist yet. It is the
+        # number that says whether the host starved the board, which is the one
+        # form of host load that can reach the sensor.
+        if not write_text("#F %d %d %d %d %d %d\n" % (
+                j.size(), len(tb), 1 if was_torn else 0,
+                time.ticks_diff(t_th, _t_prev), time.ticks_diff(t_rgb, t_th),
+                _stalled)):
+            return
+        _t_prev = t_th
+        _stalled = 0
+        for buf in (memoryview(j.bytearray()), memoryview(tb)):
+            off = 0
+            stalls = 0
+            while off < len(buf):
+                # out.write returns what the CDC actually took, and returns 0
+                # when its 500ms no-progress timeout fires - the unsent tail is
+                # then DISCARDED, never queued and never retried, with no
+                # exception. Advancing by CHUNK regardless drops those bytes
+                # while the header has already promised them, and the host reads
+                # straight into the next frame. Measured on this board: a host
+                # stall past 500ms costs exactly one CHUNK, every time.
+                w = out.write(buf[off:off + CHUNK])
+                if w:
+                    off += w
+                    stalls = 0
+                    continue
+                # Nothing moved for a full timeout. Retrying is right - that is
+                # what recovers the frame - but not forever, and the limit is set
+                # by the Lepton rather than by patience.
+                #
+                # Every millisecond in here is a millisecond snapshot() is not
+                # being called. Measured 2026-08-09, plain gaps between snapshots
+                # of 150/300/600/1000/1500/2500 ms were all harmless - 2500ms is
+                # the largest gap this part is KNOWN to survive, and beyond it
+                # there is no measurement, only hope. The old limit of 4 allowed
+                # five 500ms timeouts, 2.5s in this loop alone, before the frame
+                # loop and the host's round trip to submit the next batch were
+                # added on top - so it could put the sensor outside the tested
+                # envelope in exactly the situation where the host is already
+                # struggling. Three timeouts is 1.5s, which leaves the rest of
+                # the gap inside 2500ms.
+                #
+                # The trade is deliberate: giving up costs the tail of one frame
+                # and a resync. Wedging the Lepton costs a full restart and is
+                # unrecoverable any other way.
+                stalls += 1
+                _stalled += 1
+                if stalls > 2:
+                    return
+    # The heap reading is the whole early-warning system. gc.collect() cannot be
+    # called while the Lepton is up - it wedges the part permanently, measured
+    # 2026-08-09 - so the automatic collector firing on an exhausted heap is a
+    # guaranteed kill. This loop leaks ~208 B/frame, which is hours rather than
+    # minutes, but hours is still finite. Reporting free memory lets the host tear
+    # the bring-up down and stand it back up at a moment of its choosing, instead
+    # of discovering the problem as a dead stream.
+    write_text("#BATCH\n")
+
+
+write_text("#READY %d %d %d %d %d %d\n" % (
+    rgb.width(), rgb.height(), lep.width(), lep.height(), TMIN, TMAX))

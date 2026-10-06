@@ -26,12 +26,18 @@ the same frame, on which clock and with what left unsynchronised: [SYNC.md](SYNC
 
 ## Layout
 
+The repository [source map and test targets](../README.md) cover all code
+directories. Viewer internals are described in [tools/viewer/](tools/viewer/README.md)
+and model/training boundaries in [perception/](perception/README.md).
+
 | path | what |
 |---|---|
 | `src/fusion.c`, `fusion.h` | the pipeline. Portable C99, no MicroPython, no floating point. One translation unit for host and Cortex-M55 |
 | `src/py_fusion.c` | thin MicroPython binding; every decision lives in `fusion.c` |
 | `host/` | harness that runs the same C over recorded frames, plus the test suites |
 | `tools/` | the live pipeline: `capture.py` (board -> disk), `live.py` (live viewer; `--radar` overlay, `--record` session) and its modules. See [tools/README.md](tools/README.md) |
+| `tools/viewer/` | native C wrapper, display composition, rendering, board streaming and health/timing |
+| `tools/web/` | HTML assets used by the viewer, labeling and calibration/diagnostic servers |
 | `tools/board/` | board-side MicroPython, pushed whole via `mpx.py` |
 | `tools/diag/` | bench diagnostics: radar bring-up probes, capture comparisons |
 | `tools/tests/` | the offline test suites - no board, no radar needed |
@@ -49,9 +55,9 @@ cycle is under a second, against minutes for a firmware flash.
 ```sh
 cd host
 make                # fuse (harness) + libfusion.so (for the viewer)
-make test           # 33 synthetic assertions, under ASan + UBSan
+make test           # synthetic regression checks, under ASan + UBSan
 make real           # the same pipeline over recorded frames
-python3 ../tools/tests/test_live.py    # 57 viewer assertions, no board needed
+python3 ../tools/tests/test_live.py    # viewer regression checks, no board needed
 ```
 
 `make test` proves the pipeline is *correct* on frames built to have a known
@@ -68,11 +74,13 @@ cd tools
           --detect person --view visible        # http://localhost:8088
 ```
 
-Three ports on this Jetson, and they are not interchangeable: `/dev/ttyACM0` is
+Example port assignments from the bench (USB numbering can change): `/dev/ttyACM0` is
 the OpenMV N6, `/dev/ttyACM1` is the radar CLI at 115200 (where the `.cfg`
 goes), `/dev/ttyACM2` is the radar data stream at 921600. `send_radar_cfg.py`
-must run first — the IWR1843 emits nothing until it is configured, so a
+must run first for direct invocation — the IWR1843 emits nothing until it is configured, so a
 `--radar` run against an unconfigured sensor looks like a dead link.
+Use `tools/run_live.sh` for normal operation; it resolves the USB identities
+and configures the radar automatically.
 
 `--radar-hfov 62.7` overrides the 70° fallback with the measured value (f = 525
 px at 640 wide, checkerboard against a tape measure). `--radar-calib` accepts
@@ -98,7 +106,10 @@ wrong side of the edge. The health row reports what only a live stream can
 show: dead rows rebuilt this frame, thermal coverage, tearing, the range the
 sensor auto-picked.
 
-## State
+## Historical milestones
+
+This table records the original bring-up, not a current deployment check.
+See [verified project status](../docs/STATUS.md) for the latest offline checks.
 
 | # | milestone | |
 |---|---|---|

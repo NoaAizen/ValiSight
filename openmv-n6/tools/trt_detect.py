@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Selectable YOLOv8/YOLOv10/YOLO11 over TensorRT on the Jetson's GPU.
+"""Selectable YOLOv8/YOLOv10/YOLO11/YOLO26 over TensorRT on the Jetson's GPU.
 
 This is a drop-in for detect.Detector.
 
@@ -16,8 +16,9 @@ GPU compute 4.83 ms, end-to-end 5.19 ms including both copies. Against the
 
 Model choice. The installed yolov10n is the measured default; yolov8n and
 yolo11n use the same runtime contract after a static export with NMS included.
+YOLO26 uses its NMS-free one-to-one head with the same decoded row layout.
 For a person at long range, the model choice is an accuracy change, not only a
-speed swap. Every accepted engine emits [1,max_det,6] suppressed boxes, so raw
+speed swap. Every accepted engine emits [1,max_det,6] decoded boxes, so raw
 Ultralytics prediction planes are rejected before inference.
 
 The input is a static 640x640. The visible frame is 640x400, so letterboxing
@@ -36,14 +37,10 @@ import time
 
 import numpy as np
 
-MODEL_DIR = os.path.expanduser("~/archive/radar/models")
-MODEL_FILES = {
-    "yolov10n": ("yolov10n.onnx", "yolov10n_fp16.engine"),
-    # YOLOv8/11 must be exported with nms=True, batch=1, imgsz=640 so their
-    # output is [1, max_det, 6], not the raw [1, 84, anchors] prediction plane.
-    "yolov8n": ("yolov8n_nms.onnx", "yolov8n_nms_fp16.engine"),
-    "yolo11n": ("yolo11n_nms.onnx", "yolo11n_nms_fp16.engine"),
-}
+MODEL_DIR = os.path.expanduser(os.environ.get(
+    "THERMAL_FUSION_MODEL_DIR", "~/archive/radar/models"))
+from detector_models import MODEL_FILES
+
 
 
 def model_paths(model):
@@ -57,9 +54,17 @@ def model_paths(model):
 
 def build_command(model):
     onnx, engine = model_paths(model)
-    return ["/usr/src/tensorrt/bin/trtexec", "--onnx=" + onnx,
+    command = ["/usr/src/tensorrt/bin/trtexec", "--onnx=" + onnx,
             "--saveEngine=" + engine, "--fp16",
             "--memPoolSize=workspace:1024", "--skipInference"]
+    if model == "yolo26n":
+        # Pure FP16 moved one smoke-image score by 0.106 on TRT 10.3.
+        # This exact mixed recipe passed ONNX parity; keep it reproducible.
+        head = "/model.23/one2one_cv3*:fp32,/model.23/Sigmoid:fp32"
+        command += ["--noTF32", "--builderOptimizationLevel=0",
+                    "--precisionConstraints=obey", "--layerPrecisions=" + head,
+                    "--layerOutputTypes=" + head]
+    return command
 
 
 ONNX, ENGINE = model_paths("yolov10n")
@@ -128,7 +133,7 @@ class _Cudart:
 
 
 def build_engine(model="yolov10n", verbose=False):
-    """Build this Jetson's engine from a static, NMS-included ONNX export."""
+    """Build this Jetson's engine from a static ONNX export with decoded boxes."""
     import subprocess
     onnx, engine = model_paths(model)
     cmd = build_command(model)
@@ -153,7 +158,8 @@ def validate_io_shapes(input_shape, output_shape):
             output_shape[2] != 6 or any(int(v) <= 0 for v in output_shape)):
         raise RuntimeError(
             f"expected NMS output [1,max_det,6], got {output_shape}; "
-            "export YOLOv8/YOLO11 with nms=True, batch=1, dynamic=False")
+            "export YOLOv8/YOLO11 with nms=True, or YOLO26 with "
+            "nms=False (Ultralytics 8.4.144); use batch=1, dynamic=False")
 
 
 class TrtDetector:
@@ -290,7 +296,7 @@ class TrtDetector:
     def __call__(self, img):
         """img: HxW gray or HxWx3 BGR. Returns [{cls,conf,x,y,w,h}], newest first."""
         h, w = img.shape[:2]
-        t0 = time.time()
+        t0 = time.perf_counter()
         scale, padx, pady = self.letterbox(img)
 
         self.cu.h2d(self._d_in, self._p_in, self._in_bytes, self._stream)
@@ -298,13 +304,24 @@ class TrtDetector:
             raise RuntimeError("TensorRT execute_async_v3 returned false")
         self.cu.d2h(self._p_out, self._d_out, self._out_bytes, self._stream)
         self.cu.sync(self._stream)
-        self.ms = (time.time() - t0) * 1e3
+        self.ms = (time.perf_counter() - t0) * 1e3
+        return self.decode((h, w), scale, padx, pady)
+
+    def decode(self, image_shape, scale, padx, pady):
+        """Decode end-to-end or NMS xyxy rows into original-image boxes."""
+        h, w = image_shape
 
         # [1,300,6] -> x0,y0,x1,y1,score,class in letterboxed pixels, already
-        # sorted by score and already suppressed. Everything below the gate is
-        # padding rows, so the first failing row ends the useful part.
+        # sorted by score, from embedded NMS or the one-to-one head. Filter
+        # confidence explicitly rather than relying on output row order.
         out = self.h_out[0]
-        keep = out[:, 4] >= self.conf
+        # Invalid model output must not become indices into sensor measurements.
+        valid = np.isfinite(out).all(axis=1)
+        out = out[valid]
+        keep = ((out[:, 4] >= self.conf) & (out[:, 4] <= 1)
+                & (out[:, 5] >= 0) & (out[:, 5] == np.floor(out[:, 5])))
+        if self.names is not None:
+            keep &= out[:, 5] < len(self.names)
         if self._class_ids is None and self.classes is not None:
             tbl = self.names or ()
             self._class_ids = np.array([i for i, n in enumerate(tbl)
@@ -360,7 +377,7 @@ class TrtDetector:
 def main():
     import argparse
     ap = argparse.ArgumentParser(
-        description="Build a registered static-NMS TensorRT detector engine")
+        description="Build a registered TensorRT detector with static decoded output")
     ap.add_argument("--build", required=True, choices=sorted(MODEL_FILES),
                     metavar="MODEL")
     ap.add_argument("--verbose", action="store_true")

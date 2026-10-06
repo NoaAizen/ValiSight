@@ -19,3 +19,11 @@ openmv-n6/perception/out/
 # labels. Source and reproducible pipeline code live under openmv-n6/; datasets
 # stay on the workstation/Drive rather than in Git history.
 /captures/
+
+# Local check caches and environment overrides
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.env
+.env.local

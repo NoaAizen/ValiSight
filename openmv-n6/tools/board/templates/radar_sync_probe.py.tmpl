@@ -1,0 +1,133 @@
+
+import pyb
+
+WITH_CAMERA = __CAM__
+
+# Header pins that pins_config.h does not claim. P10 is excluded on purpose:
+# the board drives it as CSI_FSYNC, so it is a source to jumper FROM, not a pin
+# to capture ON.
+PINS = ['P9', 'P11', 'P15', 'P16', 'P17', 'P18', 'P6_ADC']
+
+# Sixteen-bit timers wrap every few ms at a useful prescale, which is fine for
+# an interval but useless as a shared timebase, so part A asks the width rather
+# than assuming it. TIM1 is listed only to see it fail once the camera is up.
+TIMERS = [1, 2, 3, 4, 5, 8, 12, 13, 14, 15, 16, 17]
+
+cam = None
+if WITH_CAMERA:
+    import csi, time as _t
+    try:
+        rgb = csi.CSI(cid=0x7936)
+        rgb.reset()
+        rgb.pixformat(csi.GRAYSCALE)
+        rgb.framesize(csi.VGA)
+        cam = csi.CSI(cid=0x5435)
+        cam.reset(hard=False)
+        cam.pixformat(csi.GRAYSCALE)
+        cam.framesize(csi.QQVGA)
+        cam.ioctl(csi.IOCTL_LEPTON_SET_MODE, True, False)
+        _t.sleep_ms(2000)
+        cam.snapshot()
+        print("cameras up (PAG + Lepton)")
+    except Exception as e:
+        print("camera bring-up failed: %s -- probing without it" % e)
+        cam = None
+
+print("=" * 66)
+print("A: timer inventory -- width and source clock  (camera=%s)" % (cam is not None))
+print("=" * 66)
+# Ask for a wide period and read it back: a 16-bit timer keeps only the low
+# half. The request is 0x3FFFFFFF, not 0xFFFFFFFF -- MicroPython's small int is
+# 31-bit here and the larger value raises "overflow converting long int to
+# machine word" for EVERY timer, which reads as "no timers exist" rather than
+# as a bug in the probe.
+PROBE_PERIOD = 0x3FFFFFFF
+for t in TIMERS:
+    try:
+        tim = pyb.Timer(t, prescaler=0, period=PROBE_PERIOD)
+        real = tim.period()
+        print("TIM%-2d  width=%2d-bit  period_readback=0x%X  source=%d Hz"
+              % (t, 32 if real > 0xFFFF else 16, real, tim.source_freq()))
+        tim.deinit()
+    except Exception as e:
+        print("TIM%-2d  -- %s" % (t, e))
+
+print()
+print("=" * 66)
+print("B: which TIMER can capture on each free pin")
+print("=" * 66)
+# READ THIS BEFORE TRUSTING THE CHANNEL NUMBERS. pyb resolves the pin through
+# the alternate-function table, and an AF names a TIMER, not a channel -- so
+# channel() accepts ch=1..4 on a timer that physically has two. Measured here:
+# TIM15 accepted all four channels on P17. The timer column is evidence; the
+# channel column is a candidate list that only a real edge can settle.
+# af_list() is printed alongside because it is the board's own answer rather
+# than this probe's inference.
+for pin_name in PINS:
+    found = []
+    for t in TIMERS:
+        for ch in (1, 2, 3, 4):
+            tim = None
+            try:
+                tim = pyb.Timer(t, prescaler=399, period=0xFFFF)
+                tim.channel(ch, pyb.Timer.IC, pin=pyb.Pin(pin_name),
+                            polarity=pyb.Timer.RISING)
+                found.append("TIM%d_CH%d" % (t, ch))
+            except Exception:
+                pass
+            if tim is not None:
+                try:
+                    tim.deinit()
+                except Exception:
+                    pass
+    try:
+        afs = [str(a).split('.')[-1] for a in pyb.Pin(pin_name).af_list()]
+        afs = [a for a in afs if 'TIM' in a]
+    except Exception:
+        afs = []
+    print("%-7s %s" % (pin_name + ":",
+                       ", ".join(found) if found else "no IC route"))
+    print("        pin AFs naming a timer: %s" % (", ".join(afs) or "none"))
+
+print()
+print("=" * 66)
+print("C: two capture channels on ONE timer, at the same time")
+print("=" * 66)
+# Fill these in from part B: the pair must share a timer, or the two edges are
+# measured against two different clocks and the drift between them becomes yet
+# another thing to calibrate.
+PAIR = __PAIR__          # (timer, pin_a, channel_a, pin_b, channel_b)
+if PAIR is None:
+    print("SKIPPED -- pass --pair 'TIM,PINA,CHA,PINB,CHB' from part B's output")
+else:
+    t, pin_a, ch_a, pin_b, ch_b = PAIR
+    try:
+        PRESCALER = __PRESC__
+        tim = pyb.Timer(t, prescaler=PRESCALER - 1, period=0x3FFFFFFF)
+        a = tim.channel(ch_a, pyb.Timer.IC, pin=pyb.Pin(pin_a),
+                        polarity=pyb.Timer.RISING)
+        b = tim.channel(ch_b, pyb.Timer.IC, pin=pyb.Pin(pin_b),
+                        polarity=pyb.Timer.RISING)
+        print("SUCCESS: TIM%d holds both captures (%s ch%d, %s ch%d)"
+              % (t, pin_a, ch_a, pin_b, ch_b))
+        # Read the period BACK. A 16-bit timer silently keeps the low half of
+        # the request, so computing the wrap from what was ASKED FOR overstates
+        # it by 16384x -- which is the difference between "wraps every 9
+        # minutes, handle it as an exception" and "wraps three times per thermal
+        # frame, the whole timestamp is wrong".
+        period = tim.period()
+        tick_ns = 1e9 * PRESCALER / tim.source_freq()
+        print("  requested period 0x3FFFFFFF, hardware kept 0x%X" % period)
+        print("  tick = %.0f ns, wrap every %.1f ms"
+              % (tick_ns, (period + 1) * tick_ns / 1e6))
+        print("  counter now = %d (free-running)" % tim.counter())
+        print("  capture A = %d, capture B = %d (both meaningless until an"
+              " edge arrives)" % (a.capture(), b.capture()))
+        tim.deinit()
+    except Exception as e:
+        print("FAILED: %s" % e)
+        if cam is not None:
+            print("  -> with the camera up this is the conflict to expect;"
+                  " re-run part B and pick a timer the camera does not use")
+print()
+print("probe done")

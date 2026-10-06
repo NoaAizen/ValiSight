@@ -3,23 +3,64 @@ import os
 import sys
 import tempfile
 import unittest
+import numpy as np
 
 TOOLS = os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, os.path.abspath(TOOLS))
 
 import detect
 import trt_detect
+from detector_models import MODEL_FILES, export_options, selected_engine
 
 
 class DetectorModelTest(unittest.TestCase):
     def test_registered_models_have_distinct_artifacts(self):
         engines = set()
-        for model in ('yolov8n', 'yolov10n', 'yolo11n'):
+        for model in MODEL_FILES:
             onnx, engine = trt_detect.model_paths(model)
             self.assertTrue(onnx.endswith('.onnx'))
             self.assertTrue(engine.endswith('.engine'))
             engines.add(engine)
-        self.assertEqual(len(engines), 3)
+        self.assertEqual(len(engines), 8)
+
+    def test_yolo26_export_selects_decoded_one_to_one_head(self):
+        self.assertEqual(export_options('yolo26n'), {'nms': False})
+        self.assertEqual(export_options('yolo11n'), {'nms': True})
+        command = trt_detect.build_command('yolo26n')
+        self.assertIn('--precisionConstraints=obey', command)
+        self.assertIn('--noTF32', command)
+        self.assertTrue(trt_detect.model_paths('yolo26n')[1].endswith('_mixed.engine'))
+
+    def test_launcher_checks_selected_model_and_explicit_engine(self):
+        for args in (['--detect-model', 'yolo26n'], ['--detect-model=yolo26n']):
+            self.assertEqual(selected_engine(args), trt_detect.model_paths('yolo26n')[1])
+        self.assertEqual(selected_engine(['--detect', 'all', '--view', 'visible', '--detect-model=yolo26n',
+                                          '--detect-engine', '/tmp/custom model.engine']),
+                         '/tmp/custom model.engine')
+
+    def test_end_to_end_boxes_map_to_camera_and_reject_invalid_rows(self):
+        detector = object.__new__(trt_detect.TrtDetector)
+        detector.conf = 0.25
+        detector.names = detect.COCO
+        detector.classes = {'person'}
+        detector._class_ids = None
+        detector.h_out = np.array([[
+            [10, 130, 110, 230, .9, 0],  # y padding must be removed
+            [-10, 110, 650, 530, .8, 0],  # clamp to the full camera frame
+            [10, 130, 110, 230, .9, 2],  # another class
+            [10, 130, 110, 230, .1, 0],  # below threshold
+            [10, 0, 110, 100, .9, 0],  # entirely in padding
+            [float('nan'), 130, 110, 230, .9, 0],
+            [10, 130, 110, 230, .9, -1],
+            [10, 130, 110, 230, .9, 80],
+            [10, 130, 110, 230, .9, .5],
+        ]], dtype=np.float32)
+        self.assertEqual(detector.decode((400, 640), 1, 0, 120), [
+            {'cls': 'person', 'conf': .9, 'x': 10, 'y': 10, 'w': 100, 'h': 100},
+            {'cls': 'person', 'conf': .8, 'x': 0, 'y': 0, 'w': 640, 'h': 400},
+        ])
+        detector.h_out = np.array([[[5, 65, 55, 115, .9, 0]]], dtype=np.float32)
+        self.assertEqual(detector.decode((400, 640), .5, 0, 60)[0]['y'], 10)
 
     def test_build_command_is_argument_safe(self):
         cmd = trt_detect.build_command('yolo11n')

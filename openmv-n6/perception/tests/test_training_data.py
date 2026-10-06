@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """Regression checks for thermal framing and tri-state supervision."""
+import ast
+import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -15,7 +19,8 @@ from perception.dataset import LiveSession, THERMAL_PIXELS  # noqa: E402
 from perception.autolabel.thermal_check import to_uint8_equivalent  # noqa: E402
 from perception.export.export_shards import (              # noqa: E402
     LABEL_NEGATIVE, LABEL_POSITIVE, LABEL_UNKNOWN, label_state,
-    session_provenance, session_thermal_meta, write_training_bundle)
+    load_thermal_hard_negatives, session_provenance,
+    session_thermal_meta, write_training_bundle)
 from perception.export import export_shards                 # noqa: E402
 
 
@@ -86,6 +91,22 @@ class SupervisionTest(unittest.TestCase):
 
     def test_verified_empty_overrides_teacher_false_positive(self):
         self.assertEqual(label_state(True, verified_negative=True), LABEL_NEGATIVE)
+
+    def test_hard_negative_miner_uses_conf_shape_and_low_delta(self):
+        rows = [
+            {"i": 10, "conf": 1.0, "shape": True, "delta_c": 0.7},
+            {"i": 11, "conf": 0.8, "shape": True, "delta_c": 0.7},
+            {"i": 12, "conf": 1.0, "shape": False, "delta_c": 0.7},
+            {"i": 13, "conf": 1.0, "shape": True, "delta_c": 6.8},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "replay.jsonl")
+            with open(path, "w") as f:
+                for row in rows:
+                    f.write(json.dumps(row) + "\n")
+            got, meta = load_thermal_hard_negatives([f"smoke={path}"])
+        self.assertEqual(got["smoke"], {10})
+        self.assertEqual(meta["smoke"]["candidate_frames"], 1)
 
     def test_session_manifest_preserves_uint16_scale(self):
         with tempfile.TemporaryDirectory() as td:
@@ -183,6 +204,58 @@ class SupervisionTest(unittest.TestCase):
             # checkpoint into v3/models, and nothing anywhere said so.
             self.assertIn("EXPORT_NAME = 'v9'", notebook_text)
             self.assertNotIn("EXPORT_NAME = 'v2'", notebook_text)
+
+            # Exercise the real notebook preflight against the exported code.
+            # Looking only at students.py now sees compatibility imports, not
+            # the feature/loss implementations that the preflight verifies.
+            sync_cell = next(
+                ''.join(cell.get('source', ()))
+                for cell in notebook['cells']
+                if 'def sync_code(' in ''.join(cell.get('source', ())))
+            definitions = [
+                node for node in ast.parse(sync_cell).body
+                if isinstance(node, ast.FunctionDef) and node.name == 'sync_code'
+                or isinstance(node, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == 'REQUIRED'
+                        for t in node.targets)]
+            with tempfile.TemporaryDirectory() as local:
+                namespace = dict(DATA=local, REMOTE=td, shutil=shutil, ast=ast)
+                exec(compile(ast.Module(body=definitions, type_ignores=[]),
+                             '<colab-preflight>', 'exec'), namespace)
+                missing, _ = namespace['sync_code']()
+                self.assertEqual(missing, [])
+
+    def test_training_bundle_contains_transitive_local_imports(self):
+        # Colab receives only code/, not the checkout. Check the dependency
+        # closure without requiring PyTorch on the recording workstation.
+        with tempfile.TemporaryDirectory() as td:
+            write_training_bundle(td, 'dependency-check')
+            bundled = Path(td) / 'code'
+            source_root = Path(ROOT).resolve()
+            for path in bundled.rglob('*.py'):
+                relative = path.relative_to(bundled)
+                package = '.'.join(relative.parts[:-1])
+                for node in ast.walk(ast.parse(path.read_text())):
+                    modules = []
+                    if isinstance(node, ast.Import):
+                        modules = [alias.name for alias in node.names]
+                    elif isinstance(node, ast.ImportFrom):
+                        module = node.module or ''
+                        if node.level:
+                            module = importlib.util.resolve_name(
+                                '.' * node.level + module, package)
+                        modules = [module] + [
+                            module + '.' + alias.name for alias in node.names]
+                    for module in modules:
+                        if not module.startswith('perception'):
+                            continue
+                        base = Path(*module.split('.'))
+                        for candidate in (base.with_suffix('.py'),
+                                          base / '__init__.py'):
+                            if (source_root / candidate).is_file():
+                                self.assertTrue(
+                                    (bundled / candidate).is_file(),
+                                    f'{relative} imports missing {candidate}')
 
     def test_range_profile_is_exported_without_ra_or_rd(self):
         from unittest import mock

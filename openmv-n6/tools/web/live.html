@@ -1,0 +1,1470 @@
+<!doctype html><html lang=en><meta charset=utf-8>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<meta name=color-scheme content=dark><title>Thermal Fusion | Live monitor</title>
+<style>
+/* Two colour systems, deliberately disjoint. THERMAL/VISIBLE/RADAR name the
+   sensors and appear on data; OK/WARN/FAIL name trust and appear on status. The
+   old page used amber for both, so "this line is about the thermal camera" and
+   "this line is a warning" were the same colour. */
+:root{
+  --bg:#0c0e10;--panel:#141719;--panel2:#191d20;--line:#242a2f;
+  --txt:#e8edf2;--dim:#a6b2bf;--dimmer:#9aa7b5;
+  --thermal:#f0a860;--visible:#6cc8ff;--radar:#b98cff;--host:#8fa2b5;
+  --ok:#7fd39b;--ok-bd:#2c5a3e;
+  --warn:#f0c060;--warn-bd:#6d5220;--warn-bg:#211c11;
+  --fail:#ff7d7d;--fail-bd:#7a2f2f;--fail-bg:#241414;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+/* tabular-nums so a figure that changes every second does not shift the ones
+   beside it - a number that jitters horizontally is a number nobody reads */
+body{margin:0;background:var(--bg);color:var(--txt);font:13px/1.45 system-ui,-apple-system,
+Segoe UI,sans-serif;font-variant-numeric:tabular-nums;display:flex;flex-direction:column}
+b{font-weight:600}
+.mono{font-family:var(--mono)}
+
+/* --- trust bar: the only line you need before writing a number down */
+#trust{display:flex;align-items:center;gap:18px;flex-wrap:wrap;padding:9px 16px;
+border-bottom:1px solid var(--line);background:var(--panel)}
+#trust.ok{box-shadow:inset 3px 0 0 var(--ok)}
+#trust.warn{box-shadow:inset 3px 0 0 var(--warn);
+background:linear-gradient(90deg,#1d1a12,var(--panel) 320px)}
+#trust.fail{box-shadow:inset 3px 0 0 var(--fail);
+background:linear-gradient(90deg,#231414,var(--panel) 320px)}
+#verdict{display:flex;align-items:center;gap:9px;font-weight:650;letter-spacing:.06em;font-size:12px}
+#verdict .dot{width:9px;height:9px;border-radius:50%}
+#verdict small{font-weight:400;letter-spacing:0;color:var(--dim);font-size:11px}
+.ok #verdict{color:var(--ok)}.ok #verdict .dot{background:var(--ok);box-shadow:0 0 8px #7fd39b60}
+.warn #verdict{color:var(--warn)}.warn #verdict .dot{background:var(--warn);box-shadow:0 0 8px #f0c06060}
+.fail #verdict{color:var(--fail)}.fail #verdict .dot{background:var(--fail);
+box-shadow:0 0 10px #ff7d7d70;animation:pulse 1.4s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.45}}
+#qual{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;font-family:var(--mono)}
+#qual span{color:var(--dim)}
+#qual span i{font-style:normal;color:var(--txt)}
+#qual span.bad i{color:var(--warn)}
+/* The pose bar is sized for the one hand that actually uses it: the operator is
+   standing at the reflector holding a phone, not sitting at the host. Hence the
+   44px touch targets and a current-station readout big enough to confirm at
+   arm's length without zooming. */
+#posebar{display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap}
+#posebar input{flex:1 1 140px;min-width:0;height:44px;padding:0 12px;
+  font-family:var(--mono);font-size:16px;color:var(--txt);
+  background:var(--panel2);border:1px solid var(--line);border-radius:6px}
+#posebar button{height:44px;padding:0 18px;font-size:15px;font-family:inherit;
+  color:var(--bg);background:var(--visible);border:0;border-radius:6px}
+#posebar button.clear{background:var(--panel2);color:var(--dim);
+  border:1px solid var(--line)}
+#posenow{font-family:var(--mono);font-size:20px;font-weight:600;
+  min-width:5ch;color:var(--ok)}
+#posenow.none{color:var(--warn)}
+#posen{font-size:12px;color:var(--dim);font-family:var(--mono)}
+#brand{margin-left:auto;color:var(--dimmer);font-size:11px;letter-spacing:.08em}
+
+/* --- main split */
+#main{display:grid;grid-template-columns:minmax(0,1fr) 300px;gap:14px;padding:14px;
+align-items:start}
+body.field #main{grid-template-columns:minmax(0,1fr)}
+body.field aside,body.field #notes{display:none}
+#stage{display:flex;flex-direction:column;gap:12px;min-width:0}
+/* Sized so the health panel stays above the fold on a laptop: the picture is
+   what you look at, but the panel is what says whether to believe it, and a
+   viewer that hides the panel below a scroll is back to being a webcam. 88vh
+   is 55vh of height at this 1.6 aspect. */
+#wrap{position:relative;line-height:0;align-self:start;border:1px solid var(--line);
+border-radius:8px;overflow:hidden;background:#000;width:min(100%,1024px,88vh)}
+#streamstate{position:absolute;inset:0;z-index:4;display:flex;flex-direction:column;
+align-items:center;justify-content:center;gap:8px;background:#07090bba;line-height:1.35;
+text-align:center;pointer-events:none;backdrop-filter:blur(2px)}
+#streamstate[hidden]{display:none}
+#streamtitle{font:650 15px/1.2 var(--mono);letter-spacing:.08em;color:var(--warn)}
+#streamdetail{max-width:80%;font:12px/1.4 var(--mono);color:var(--txt)}
+/* The picture and the map, side by side. The picture says what is out there;
+   the map says where the rig was standing while it said it, and reading one
+   against the other is the whole point of the map layer - it cannot be done
+   with the map in the sidebar under four scrolls of numbers. The map keeps a
+   fixed column rather than matching the picture's height: square at 55vh it
+   would be wider than the picture it sits beside. It wraps under on a narrow
+   window, where a 250px map is worse than no map. */
+#viewrow{display:flex;gap:12px;align-items:flex-start;flex-wrap:wrap;min-width:0}
+#wrap{flex:0 1 auto}
+#mapside{display:none;flex:0 1 320px;min-width:250px;flex-direction:column;gap:8px;
+background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px}
+#mapside.on{display:flex}
+#mapside h5{margin:0;font-size:10.5px;font-weight:650;letter-spacing:.11em;
+color:var(--dim);text-transform:uppercase}
+#mapside canvas{width:100%;aspect-ratio:1;background:#0a0c0e;
+border:1px solid var(--line);border-radius:6px}
+#mapside.nowalls .hintline{opacity:.4}
+img{display:block;width:100%;height:auto}
+#ovl{position:absolute;inset:0;pointer-events:none}
+#read{position:absolute;padding:4px 8px;background:#000000d9;border:1px solid #5a636b;
+border-radius:5px;font:12px/1.3 var(--mono);pointer-events:none;white-space:nowrap;
+display:none;transform:translate(14px,14px)}
+#read.warn{border-color:var(--warn-bd);color:var(--warn)}
+
+/* the delta between two pinned points is what a finding rests on, so it gets a
+   card rather than being something you compute in your head off two hovers */
+#probes{position:absolute;left:10px;bottom:10px;display:flex;background:#000000cc;
+border:1px solid var(--line);border-radius:6px;font-family:var(--mono);overflow:hidden}
+#probes .p{padding:6px 11px;border-right:1px solid var(--line);line-height:1.25}
+#probes em{font-style:normal;display:block;font-size:10px;color:var(--dim);letter-spacing:.08em}
+#probes b{font-size:15px;font-weight:600}
+#probes .d{padding:6px 13px;background:#ffffff08}
+#probes .d b{font-size:17px;color:var(--thermal)}
+#probes .hint{padding:6px 11px;color:var(--dim);font-size:11px;align-self:center}
+#probes .flag{color:var(--warn);font-size:10px}
+
+/* --- sidebar */
+aside{display:flex;flex-direction:column;gap:10px;overflow:auto;min-height:0}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.card>h4{margin:0;padding:8px 12px;font-size:10.5px;font-weight:650;letter-spacing:.11em;
+color:var(--dim);text-transform:uppercase;border-bottom:1px solid var(--line);
+display:flex;align-items:center;gap:8px}
+.card>h4 .k{margin-left:auto;color:var(--dimmer);font-family:var(--mono);font-size:10px;
+border:1px solid var(--line);border-radius:3px;padding:0 4px;text-transform:none;letter-spacing:0}
+.card .body{padding:10px 12px;display:flex;flex-direction:column;gap:9px}
+.seg{display:flex;background:var(--panel2);border:1px solid var(--line);border-radius:6px;
+padding:2px;gap:2px}
+.seg button{flex:1;background:none;border:0;color:var(--dim);font:inherit;font-size:11.5px;
+padding:5px 2px;border-radius:4px;cursor:pointer;transition:background .12s,color .12s}
+.seg button:hover{color:var(--txt);background:#ffffff0a}
+.seg button.on{background:#2b3238;color:var(--txt);box-shadow:inset 0 0 0 1px #3a444c}
+#channel{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+#channel button{min-height:30px;line-height:1.2}
+#channel button:last-child{grid-column:1/-1}
+.seg.pal button.on{color:#0c0e10;font-weight:600}
+.seg.pal button[data-v=ironbow].on{background:linear-gradient(90deg,#5a1a70,#e05020,#ffd23c)}
+.seg.pal button[data-v=white].on{background:linear-gradient(90deg,#333,#fff)}
+.seg.pal button[data-v=black].on{background:linear-gradient(90deg,#fff,#333);color:#fff}
+.seg.pal button[data-v=gray].on{background:linear-gradient(90deg,#222,#bbb)}
+.sl{display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:center}
+.sl label{font-size:11.5px;color:var(--dim)}
+.sl output{font-family:var(--mono);font-size:11.5px}
+.sl input[type=range]{grid-column:1/-1;width:100%;height:16px;-webkit-appearance:none;
+background:none;margin:0}
+input[type=range]::-webkit-slider-runnable-track{height:3px;background:#2c3338;border-radius:2px}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:12px;
+margin-top:-4.5px;border-radius:50%;background:var(--txt);border:0;cursor:pointer}
+input[type=range]:hover::-webkit-slider-thumb{background:var(--visible)}
+input[type=range]::-moz-range-track{height:3px;background:#2c3338;border-radius:2px}
+input[type=range]::-moz-range-thumb{width:12px;height:12px;border:0;border-radius:50%;
+background:var(--txt)}
+.chk{display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer}
+.chk input{accent-color:#4d7f9e;width:14px;height:14px}
+.chk .sub{color:var(--dim);font-size:11px;margin-left:auto;font-family:var(--mono)}
+.num{display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--dim)}
+.num input{width:66px;background:var(--panel2);border:1px solid var(--line);border-radius:4px;
+color:var(--txt);font:12px var(--mono);padding:3px 6px}
+.num input:focus{outline:none;border-color:#3f5a6b}
+.hintline{font-size:11px;color:var(--dimmer);line-height:1.45}
+.nudge{display:grid;grid-template-columns:auto 1fr auto auto;gap:4px 7px;align-items:center;
+font-size:11.5px}
+.nudge label{color:var(--dim);font-family:var(--mono)}
+.nudge output{font-family:var(--mono);text-align:right}
+.nudge button{background:var(--panel2);border:1px solid var(--line);color:var(--dim);
+width:22px;height:20px;border-radius:4px;cursor:pointer;font:12px var(--mono);line-height:1}
+.nudge button:hover{color:var(--txt);border-color:#3c454c}
+
+/* --- clock strip */
+#clock,#socstrip{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+padding:10px 14px;display:flex;align-items:flex-start;gap:14px 20px;flex-wrap:wrap}
+.tag{font:10px/1.3 var(--mono);letter-spacing:.1em;color:var(--dimmer);border:1px solid var(--line);
+border-radius:4px;padding:3px 6px;align-self:center;white-space:pre}
+.btn{background:var(--panel2);color:inherit;border:1px solid var(--line);border-radius:6px;padding:4px 10px;font:inherit;cursor:pointer}
+.btn:disabled{opacity:.5;cursor:wait}
+.kvrow{display:grid;grid-template-columns:1fr 1fr;gap:6px 10px;margin-bottom:6px}
+.kv{display:flex;flex-direction:column;gap:1px;font-family:var(--mono)}
+.kv em{font-style:normal;font-size:10px;letter-spacing:.07em;color:var(--dim);text-transform:uppercase}
+.kv b{font-size:14px;font-weight:600}
+.kv .u{font-size:11px;color:var(--dim);font-weight:400}
+.kv.th b{color:var(--thermal)}.kv.vis b{color:var(--visible)}.kv.host b{color:var(--host)}
+.kv.bad b{color:var(--warn)}
+.spark{display:block;margin-top:1px}
+
+/* --- health, four groups */
+#health{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:10px;
+padding:0 14px 14px;align-items:start}
+.grp{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.grp>summary{list-style:none;cursor:pointer;padding:9px 12px;display:flex;align-items:center;
+gap:9px;font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);font-weight:650}
+.grp>summary::-webkit-details-marker{display:none}
+.grp>summary .dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
+.grp>summary .cnt{margin-left:auto;font-family:var(--mono);font-size:11px;letter-spacing:0;
+text-transform:none;color:var(--dimmer)}
+.grp>summary .chev{color:var(--dimmer);transition:transform .15s}
+.grp[open]>summary .chev{transform:rotate(90deg)}
+.grp.ok>summary .dot{background:var(--ok)}
+.grp.warn{border-color:var(--warn-bd)}
+.grp.warn>summary{color:var(--warn)}.grp.warn>summary .dot{background:var(--warn)}
+.grp.fail{border-color:var(--fail-bd);background:var(--fail-bg)}
+.grp.fail>summary{color:var(--fail)}.grp.fail>summary .dot{background:var(--fail)}
+.checks{padding:2px 10px 10px;display:flex;flex-direction:column}
+.chk-row{display:grid;grid-template-columns:8px 94px 1fr;gap:8px;align-items:baseline;
+padding:5px 2px;border-top:1px solid #ffffff08;font-size:11.5px}
+.chk-row i{width:6px;height:6px;border-radius:50%;align-self:center;font-style:normal}
+.chk-row .n{font-weight:600;font-size:11px}
+.chk-row .t{color:var(--dim);font-family:var(--mono);font-size:11px;line-height:1.4}
+.chk-row.ok i{background:var(--ok-bd)}.chk-row.ok .n{color:#9db4a6}
+.chk-row.warn i{background:var(--warn)}.chk-row.warn .n{color:var(--warn)}.chk-row.warn .t{color:#cbb184}
+.chk-row.fail i{background:var(--fail)}.chk-row.fail .n{color:var(--fail)}.chk-row.fail .t{color:#e5a8a8}
+
+/* --- detections */
+.detrow{display:flex;gap:8px;flex-wrap:wrap;min-height:0}
+.det{display:flex;align-items:center;gap:9px;border:1px solid var(--line);background:var(--panel);
+border-radius:6px;padding:4px 10px;font-size:11.5px}
+.det.unreg{border-color:var(--warn-bd);background:var(--warn-bg)}
+.det .cls{font-weight:650}
+.det .m{font-family:var(--mono);color:var(--dim)}
+.det .c{font-family:var(--mono);color:var(--thermal);font-weight:600}
+.det .flag{font-family:var(--mono);font-size:10px;color:var(--warn);letter-spacing:.05em}
+
+/* --- notes */
+#notes{padding:0 14px 20px;max-width:78em;color:#8e8579;font-size:12px;line-height:1.6}
+#notes details{border-top:1px solid var(--line);padding:9px 0}
+#notes summary{cursor:pointer;color:var(--dim);font-size:11.5px}
+#notes summary:hover{color:var(--txt)}
+#notes p{margin:8px 0 0}
+#notes b{color:#b6ab99}
+kbd{font:11px var(--mono);border:1px solid var(--line);border-bottom-width:2px;border-radius:3px;
+padding:1px 5px;color:var(--dim);background:var(--panel2)}
+@media(max-width:1100px){#health{grid-template-columns:repeat(2,1fr)}
+#main{grid-template-columns:minmax(0,1fr)}}
+
+/* Operator layout: live readings first, calibration controls on demand. */
+body{font-size:14px;line-height:1.55}
+[hidden]{display:none!important}
+a{color:var(--visible)}
+:focus-visible{outline:3px solid var(--visible)!important;outline-offset:3px}
+.skip{position:absolute;top:-80px;left:16px;z-index:20;background:var(--panel2);padding:12px}
+.skip:focus{top:12px}
+#apphead{display:flex;align-items:center;justify-content:space-between;gap:16px;
+padding:18px 24px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+#apphead h1{font-size:20px;letter-spacing:-.03em;margin:0}
+#apphead p{margin:2px 0 0;color:var(--dim);font-size:13px}
+.actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+#trust{padding:12px 24px}
+#brand{display:none}
+#main{grid-template-columns:minmax(0,1fr) 350px;gap:20px;padding:20px 24px}
+#stage{gap:16px}
+#wrap{width:100%;max-width:1100px;flex:1 1 480px;align-self:auto}
+#mapside{min-width:0;flex-basis:280px}
+.sectionhead{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.sectionhead h2{font-size:16px;margin:0;font-weight:600}
+.badge{font:12px var(--mono);padding:5px 10px;border:1px solid var(--line);border-radius:20px;color:var(--visible)}
+.btn,.seg button,.nudge button{min-height:44px}
+.btn{padding:8px 14px}
+a.btn{text-decoration:none}
+.btn:hover{background:#28313a;border-color:#586d80}
+.btn[aria-pressed=true]{background:#203b4e;border-color:var(--visible)}
+.card{border-radius:12px;min-width:0;overflow:hidden}
+.card>h4,.card>summary{font-size:13px;letter-spacing:.02em;text-transform:none;color:var(--txt);padding:14px 16px}
+.card>summary{cursor:pointer;font-weight:600}
+.card[open]>summary{border-bottom:1px solid var(--line)}
+.card .body{padding:16px;gap:12px}
+.seg{flex-wrap:wrap;gap:4px}
+.seg button{font-size:13px;padding:8px;min-width:64px}
+.seg button.on{background:#243d50;box-shadow:inset 0 0 0 1px var(--visible)}
+#channel button{min-height:48px}
+.sl label,.sl output,.chk,.num{font-size:13px}
+.sl input[type=range]{height:36px}
+input[type=range]::-webkit-slider-thumb{width:20px;height:20px;margin-top:-8.5px}
+input[type=range]::-moz-range-thumb{width:20px;height:20px}
+.chk{min-height:40px;flex-wrap:wrap}
+.chk input{width:20px;height:20px;flex-shrink:0}
+.num input{min-height:40px;font-size:14px}
+.nudge button{width:44px;font-size:18px}
+.hintline{font-size:12px;line-height:1.65;overflow-wrap:anywhere}
+.help{border-top:1px solid var(--line);padding-top:10px}
+.help summary{cursor:pointer;color:var(--dim);padding:6px 0;font-size:12px}
+#ai_live_status{font-size:14px;font-weight:600}
+#ai_live_frames{font-family:var(--mono)}
+#ai_live_decisions{line-height:1.85}
+#ai_live_detections{font:12px/1.8 var(--mono);background:var(--bg);padding:12px;border-radius:8px;overflow-wrap:anywhere}
+.metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
+.metric{padding:14px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.metric span{display:block;font-size:12px;color:var(--dim)}
+.metric strong{display:block;font:600 24px/1.5 var(--mono);margin-top:4px}
+.metric small{color:var(--dim);font-size:11px}
+#clock,#socstrip{padding:16px;gap:16px 24px}
+.kv b{font-size:16px}.kv em{font-size:11px}
+#clocksvg{max-width:100%;height:auto}
+#health{padding:0 24px 20px;grid-template-columns:repeat(auto-fit,minmax(min(100%,300px),1fr))}
+.grp>summary{min-height:48px;font-size:12px}.chk-row .t{font-size:12px;overflow-wrap:anywhere}
+#notes{padding:0 24px 24px}#notes summary{font-size:13px;min-height:40px}
+#command_status{margin:0;color:var(--warn);font-size:13px}
+#probecontrols{display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;color:var(--dim)}
+#probecontrols input{width:72px;min-height:40px;background:var(--panel);color:var(--txt);
+border:1px solid var(--line);border-radius:6px;padding:6px}
+body.field #advanced,body.field #probecontrols{display:none}
+@media(min-width:1500px){#main{grid-template-columns:minmax(0,1fr) 380px}}
+@media(max-width:1100px){#main{grid-template-columns:minmax(0,1fr)}
+aside{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));align-items:start}}
+@media(max-width:600px){#apphead,#trust{padding:14px 16px}#main{padding:16px;gap:16px}
+aside{display:flex}.metrics{grid-template-columns:repeat(2,minmax(0,1fr))}
+#health{padding:0 16px 16px}#notes{padding:0 16px 20px}
+#verdict{flex-wrap:wrap}#vsub{width:100%}.chk .sub{margin-left:0}
+#mapside{flex-basis:100%}#probes .p,#probes .d{padding:5px}#probes b{font-size:12px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+</style>
+
+<a class=skip href=#stage>Skip to live view</a>
+<header id=apphead>
+  <div><h1>Thermal Fusion</h1><p>Live monitoring &middot; thermal, visible &amp; radar</p></div>
+  <div class=actions>
+    <button class=btn id=focusmode aria-pressed=false>Focus view</button>
+    <a class=btn href=#aicard>AI status</a>
+    <a class=btn href=#displaycontrols>Display controls</a>
+    <a class=btn href=#health>System health</a>
+    <a class=btn href=#notes>Help &amp; shortcuts</a>
+  </div>
+</header>
+<div id=trust>
+  <div id=verdict><span class=dot></span><span id=vtext>connecting</span>
+    <small id=vsub></small></div>
+  <div id=qual></div>
+  <div id=posebar hidden>
+    <span id=posenow class=none>&mdash;</span>
+    <input id=poseid aria-label="Recording station" placeholder="station, e.g. N04" autocomplete=off
+           autocapitalize=characters spellcheck=false>
+    <button id=posego>stamp</button>
+    <button id=poseclr class=clear>clear</button>
+    <span id=posen></span>
+  </div>
+  <div id=brand>THERMAL + VISIBLE FUSION &middot; LIVE</div>
+</div>
+
+<main id=main>
+  <section id=stage tabindex=-1 aria-label="Live monitoring">
+    <div class=sectionhead><h2>Live view</h2><span class=badge id=current_channel>Connecting</span></div>
+    <p id=command_status role=status hidden></p>
+    <div class=metrics aria-label="Live summary">
+      <div class=metric><span>Stream rate</span><strong id=summary_fps>&ndash;</strong><small>received frames / second</small></div>
+      <div class=metric><span>Confirmed locks</span><strong id=summary_locks>&ndash;</strong><small>currently measured tracks</small></div>
+      <div class=metric><span>Thermal candidates</span><strong id=summary_thermal>&ndash;</strong><small>accepted by thermal AI</small></div>
+      <div class=metric><span>Frame age</span><strong id=summary_age>&ndash;</strong><small id=summary_freshness>waiting for a frame</small></div>
+    </div>
+    <div id=viewrow>
+      <div id=wrap>
+        <img id=im src="/stream" alt="Live sensor view. Use the pixel coordinate controls below to pin temperature probes.">
+        <svg id=ovl viewBox="0 0 640 400" preserveAspectRatio=none></svg>
+        <div id=streamstate hidden><div id=streamtitle></div><div id=streamdetail></div></div>
+        <div id=read></div>
+        <div id=probes></div>
+      </div>
+
+      <!-- Shown only when live.py was started with --map: without the layer the
+           canvas has nothing to draw and an empty square beside the picture
+           reads as a broken map rather than an absent one. -->
+      <div id=mapside>
+        <h5>map &middot; top-down</h5>
+        <canvas id=topdown width=420 height=420 role=img aria-label="Top-down map of radar returns and position estimates"></canvas>
+        <div class=hintline>north up, 60 m: <b style=color:#9aa>map walls</b>,
+          <b style=color:var(--warn)>returns at the prior</b>,
+          <b style=color:#5cf>returns at the fix</b>. If the amber dots are not on
+          grey lines, the prior is wrong; if the blue ones are not, the fix is.</div>
+      </div>
+    </div>
+    <form id=probecontrols>
+      <span>Pin temperature probe</span>
+      <label for=probe_x>X</label><input id=probe_x type=number min=0 max=639 value=320 required>
+      <label for=probe_y>Y</label><input id=probe_y type=number min=0 max=399 value=200 required>
+      <button class=btn type=submit>Pin point</button>
+      <button class=btn type=button id=clearprobes>Clear probes</button>
+    </form>
+    <div class=detrow id=dets aria-label="Visible detections"></div>
+    <div id=ai_slot></div>
+    <details id=advanced><summary>Frame timing &amp; host performance</summary>
+    <div id=clock>
+      <div class=tag>BOARD
+&amp; LINK</div>
+      <svg id=clocksvg width=420 height=46></svg>
+      <div class="kv th"><em>thermal</em><b id=k_th>&ndash;</b>
+        <svg class=spark id=sp_th width=90 height=16></svg></div>
+      <div class="kv vis" id=kv_sk><em>visible skew</em><b id=k_sk>&ndash;</b>
+        <svg class=spark id=sp_sk width=90 height=16></svg></div>
+      <div class=kv><em>link</em><b id=k_fps>&ndash;</b>
+        <svg class=spark id=sp_fps width=90 height=16></svg></div>
+      <div class=kv><em>board heap</em><b id=k_heap>&ndash;</b>
+        <svg class=spark id=sp_heap width=90 height=16></svg></div>
+      <div class=kv><em>coverage</em><b id=k_cov>&ndash;</b>
+        <svg class=spark id=sp_cov width=90 height=16></svg></div>
+      <div class=kv><em>last ffc</em><b id=k_ffc>&ndash;</b></div>
+      <!-- Scene light. On the BOARD strip beside coverage rather than in the
+           sidebar: it is a property of the frame that just arrived, and it is
+           read together with what the detector said about that frame. -->
+      <div class=kv id=kv_light><em>scene light</em><b id=k_light>&ndash;</b></div>
+      <div class=kv id=kv_load><em>sensor load</em><b id=k_load>&ndash;</b></div>
+      <div class=kv><em>frame band</em><b id=k_band>&ndash;</b></div>
+      <!-- --raw16 only. Deliberately next to the frame band, because reading
+           the two together is what shows the difference: same scene, one of
+           them through the 8-bit window. -->
+      <div class=kv id=kv_raw style=display:none><em>scene 16-bit</em>
+        <b id=k_raw>&ndash;</b></div>
+    </div>
+
+    <!-- The machine the viewer runs on. A separate strip rather than more items
+         on the clock: those are the board's numbers and these are this host's,
+         and one row of figures that mixes the two is a row nobody can read. -->
+    <div id=socstrip style=display:none>
+      <div class=tag>HOST
+SOC</div>
+      <div class="kv host" id=kv_cpu><em>cpu</em><b id=k_cpu>&ndash;</b>
+        <svg class=spark id=sp_cpu width=90 height=16></svg></div>
+      <div class="kv host"><em>gpu</em><b id=k_gpu>&ndash;</b>
+        <svg class=spark id=sp_gpu width=90 height=16></svg></div>
+      <div class="kv host" id=kv_mem><em>memory</em><b id=k_mem>&ndash;</b>
+        <svg class=spark id=sp_mem width=90 height=16></svg></div>
+      <div class="kv host" id=kv_tj><em>soc temp</em><b id=k_tj>&ndash;</b>
+        <svg class=spark id=sp_tj width=90 height=16></svg></div>
+      <div class="kv host"><em>power</em><b id=k_pw>&ndash;</b>
+        <svg class=spark id=sp_pw width=90 height=16></svg></div>
+      <div class="kv host"><em>cpu clock</em><b id=k_clk>&ndash;</b></div>
+    </div>
+    </details>
+  </section>
+
+  <aside aria-label="Display and sensor controls">
+    <div class=card id=displaycontrols>
+      <h4>Display channel <span class=k>1-5</span></h4>
+      <div class=body>
+        <div class=seg id=channel></div>
+        <div class=hintline>display channels choose the sensor product. The
+          thermal/radar/fusion switches in the AI card are evidence layers,
+          not additional display modes.</div>
+        <label class=chk><input type=checkbox id=outline> thermal footprint
+          <span class=sub id=s_cov></span></label>
+        <label class=chk><input type=checkbox id=boxes checked> detection boxes
+          <span class=sub id=s_det></span></label>
+      </div>
+    </div>
+
+    <div class=card id=fusionviewcard>
+      <h4>fusion / calibration view</h4>
+      <div class=body>
+        <div class=seg id=view></div>
+        <div class=sl><label for=mix>thermal weight &mdash; mix/operator</label><output id=o_mix>60</output>
+          <input type=range id=mix min=0 max=100 value=60></div>
+      </div>
+    </div>
+
+    <details class=card>
+      <summary>Image adjustments</summary>
+      <div class=body>
+        <div class=sl><label for=visible_detail>Visible clarity</label><output id=o_visible_detail>40</output>
+          <input type=range id=visible_detail min=0 max=100 value=40></div>
+        <div class=sl><label for=thermal_detail>Thermal clarity</label><output id=o_thermal_detail>35</output>
+          <input type=range id=thermal_detail min=0 max=100 value=35></div>
+        <div class=hintline>Display enhancement only. Set clarity to 0 for the original
+          display. Visible clarity improves local contrast and edges; thermal clarity
+          refines thermal-only channels. It does not add sensor resolution or change
+          temperature readings. The visible source currently carries grayscale.</div>
+        <div class=sl><label for=gain>detail gain</label><output id=o_gain>200</output>
+          <input type=range id=gain min=0 max=512 value=200></div>
+        <div class=sl><label for=eps>guided-filter eps</label><output id=o_eps>200</output>
+          <input type=range id=eps min=1 max=1000 value=200></div>
+        <div class=sl><label for=radius>guided-filter radius</label><output id=o_radius>4</output>
+          <input type=range id=radius min=1 max=8 value=4></div>
+        <div class=sl><label for=agc>scene agc &permil; <span id=agcwarn></span></label>
+          <output id=o_agc>0</output>
+          <input type=range id=agc min=0 max=100 value=0></div>
+      </div>
+    </details>
+
+    <details class=card>
+      <summary>Temperature calibration</summary>
+      <div class=body>
+        <div class="seg pal" id=pal></div>
+        <div class=num><span>emissivity &epsilon;</span>
+          <input aria-label="Emissivity" type=number id=emis value=1 step=0.01 min=0.05 max=1></div>
+        <div class=num><span>reflected &deg;C</span>
+          <input aria-label="Reflected temperature in Celsius" type=number id=refl value=20 step=1></div>
+        <div class=hintline>bright metal is &asymp;0.10 and reads tens of degrees cold
+          at &epsilon;=1</div>
+      </div>
+    </details>
+
+    <div class=card id=radarcard style=display:none>
+      <h4>radar <span class=k>iwr1843</span></h4>
+      <div class=body>
+        <label class=chk><input type=checkbox id=radar checked> overlay
+          <span class=sub id=s_radar></span></label>
+        <label class=chk><input type=checkbox id=whisker checked> elevation whisker
+          <span class=sub>2-element</span></label>
+        <div class=nudge id=nudge></div>
+        <div class=hintline>the whisker is the honest width of the elevation
+          uncertainty &mdash; the bare dot flatters a two-element aperture</div>
+      </div>
+    </div>
+
+    <div class=card id=mapcard style=display:none>
+      <h4>map <span class=k>yael / mapinit</span></h4>
+      <div class=body>
+        <div class=kvrow>
+          <div class=kv><em>geoid</em><b id=m_geoid>&ndash;</b></div>
+          <div class=kv><em>ground</em><b id=m_ground>&ndash;</b></div>
+          <div class=kv><em>surface</em><b id=m_surface>&ndash;</b></div>
+          <div class=kv><em>ego alt &sigma;</em><b id=m_sigma>&ndash;</b></div>
+        </div>
+        <div class=hintline id=m_stages></div>
+        <div class=hintline id=m_text></div>
+        <div class=kvrow style="margin-top:8px">
+          <div class=kv><em>fix</em><b id=m_fix>&ndash;</b></div>
+          <div class=kv><em>heading</em><b id=m_head>&ndash;</b></div>
+          <div class=kv><em>nav horizon</em><b id=m_nav>&ndash;</b></div>
+          <div class=kv><em>ego speed</em><b id=m_speed>&ndash;</b></div>
+        </div>
+        <div class=hintline id=m_fixtext></div>
+        <div class=hintline id=m_navtext></div>
+        <div class=sl><label for=heading>heading prior</label><output id=o_heading>&ndash;</output>
+          <input type=range id=heading min=0 max=359 value=0></div>
+        <div style="display:flex;gap:8px;align-items:center;margin:6px 0">
+          <button id=btn_fix class=btn>fix from walls</button>
+          <span class=sub id=m_fixage></span>
+        </div>
+        <div class=hintline>orthometric heights against EGM2008 for the
+          <b>--map</b> position. <i>calibration</i> is skipped without
+          constraints; <i>pose_init</i> at startup is skipped because the
+          radar has not reported yet &mdash; <b>fix from walls</b> runs
+          it on the live returns, and the top-down beside the picture is
+          where you check the answer. Full JSON on
+          <a href=/map target=_blank>/map</a>.</div>
+      </div>
+    </div>
+
+    <div class=card id=aicard>
+      <h4>AI activity &amp; detections <span class=k>e t r c s l</span></h4>
+      <div class=body>
+        <div id=ai_live_status class=hintline>Waiting for live status...</div>
+        <div id=ai_live_frames class=hintline></div>
+        <div id=ai_live_decisions class=hintline></div>
+        <div id=ai_live_detections style="max-height:260px;overflow:auto"></div>
+        <div class=hintline>Live status updates every second. T = thermal, R = radar,
+          TR = accepted thermal/radar agreement, D = visible detector.
+          Accepted candidates are not necessarily confirmed person locks.</div>
+        <label class=chk><input type=checkbox id=lock checked> lock on people
+          <span class=sub id=s_lock></span></label>
+        <label class=chk><input type=checkbox id=evidence> student evidence
+          <span class=sub>debug overlays</span></label>
+        <label class=chk><input type=checkbox id=silhouette>
+          thermal outline <span class=sub id=s_ai_sil></span></label>
+        <div id=aistudents style=display:none>
+        <label class=chk><input type=checkbox id=ai_thermal checked> thermal
+          <span class=sub id=s_ai_t></span></label>
+        <label class=chk><input type=checkbox id=ai_radar checked> radar
+          <span class=sub id=s_ai_r></span></label>
+        <label class=chk><input type=checkbox id=ai_fusion checked> fusion
+          <span class=sub id=s_ai_f></span></label>
+        <div class=sl><label for=conf_thermal>thermal confidence</label><output id=o_conf_thermal>0.50</output>
+          <input type=range id=conf_thermal min=50 max=99 value=50></div>
+        <div class=sl><label for=conf_radar>radar confidence</label><output id=o_conf_radar>0.50</output>
+          <input type=range id=conf_radar min=50 max=99 value=50></div>
+        <details class=help><summary>How AI layers and person locks work</summary>
+        <div class=hintline><b>student evidence</b> reveals the intermediate
+          T/R/TR boxes and rejected static-candidate ticks for model debugging.
+          It is hidden by default; inference, fusion and person lock keep running. The sliders hide candidates, they
+          do not stop the engines: the count beside each channel reads
+          <i>shown of found</i>, so a quiet scene and a slider parked too high
+          never look the same. They cannot go below the threshold the engines
+          were started with (&minus;&minus;student-conf).</div>
+        <div class=hintline><b>lock</b> keeps a person between frames instead
+          of deciding again every frame: seen twice, they get an id (P1) and
+          are held through the frames no sensor found them in, for up to 1.5 s,
+          carried on their own velocity. A held box is amber and dashed and
+          says <i>coast 0.4s</i> &mdash; it is where somebody probably is, not
+          where anybody saw them. The letters after the id are the sensors
+          confirming it right now: D detector, T thermal, R radar, F fusion.
+          A channel switched off still feeds the lock &mdash; hiding a channel
+          hides its boxes, it does not make the viewer forget what it saw.</div>
+        <div class=hintline>a candidate the <b>detector</b> has never seen has
+          to MOVE before it is drawn as a person. In the lobby this rig sits in,
+          a lit glass door reads 31.7&deg;C and a person reads 30.9&deg;C
+          &mdash; the same temperature, so nothing radiometric can tell them
+          apart, and a door has never moved. Those candidates are counted as
+          <i>static</i> beside the lock rather than dropped silently: something
+          warm and motionless is not nobody.</div>
+        <div class=hintline>with <b>thermal outline</b> on, the thermal channel
+          draws a smoothed warm boundary, and fusion draws a ring around it.
+          This is a thermal estimate, not a person segmentation mask; warm
+          furniture may overlap a person. Partial, fragmented or poorly
+          supported shapes fall back
+          to a rectangle: a full rectangle above 0.75, four corner
+          ticks below. orange = thermal student, cyan = radar
+          student, white = the same person in both. The pair is made on the horizontal
+          only (&plusmn;50 px): radar elevation comes from two elements and
+          says almost nothing about which box a return belongs to. A fused box
+          carries the range, which is the one thing the picture cannot show,
+          and its components keep their colour but drop their own labels.</div>
+        <div class=hintline>fusion keeps running the channel it needs even when
+          that channel's own boxes are switched off &mdash; switching one off
+          hides it, agreement still needs both.</div>
+        </details>
+        </div>
+      </div>
+    </div>
+  </aside>
+</main>
+
+<section id=health aria-label="System health"></section>
+
+<div id=notes>
+  <details><summary>How to read this page</summary>
+  <p><b>The trust bar</b> is the only thing to check before writing a number down.
+  <span style="color:#f0c060">Amber</span> means the readings are usable but qualified
+  &mdash; the qualification changes how to read them, it is not a nag to clear.
+  <span style="color:#ff7d7d">Red</span> means do not record anything. All green is not a
+  claim that the measurement is accurate; it is a claim that none of the failures this code
+  can see are happening.</p></details>
+
+  <details><summary>Hover readings, pinned probes, and the delta</summary>
+  <p>Hover for a reading. The number comes from the thermal frame behind that pixel &mdash;
+  before the AGC and before the guided filter, which borrows the visible camera's edges to
+  sharpen the picture and must not be quoted off. Absolute accuracy is &plusmn;5&deg;C at
+  best. The board runs the Lepton in <b>high gain</b> since 2026-08-09; before that it was
+  silently in low gain, whose specified accuracy is the greater of &plusmn;10&deg;C or 10%,
+  so any reading quoted off a frame recorded earlier than that carries the looser number.
+  The <b>&Delta;</b> between two pinned points of the same material in one frame is far
+  better than either, and is what a finding should rest on &mdash; provided neither point is
+  clipped, neither sits on a rebuilt row, and no shutter event separates them. Click the
+  image to pin a probe; readings keep working in every view.</p></details>
+
+  <details><summary>Judging registration</summary>
+  <p>The fused view cannot tell you whether the warp is right: the guided filter puts crisp
+  edges in the right places even when the thermal layer is offset, so a misregistered frame
+  still looks sharp &mdash; it just colours the wrong side of the edge. Use <b>blink</b> (the
+  eye catches motion far better than offset), <b>mix</b> to judge how far off it is, or
+  <b>edges</b>, which draws the thermal layer's own edges over the plain visible image: where
+  the warp is right they land on the object's outline. <b>thermal footprint</b> outlines where
+  the thermal camera stops seeing at all &mdash; outside it the grey is not a cold reading, it
+  is no reading.</p></details>
+
+  <details><summary>Operator view</summary>
+  <p><b>operator</b> keeps visible luminance and uses the registered thermal layer
+  mainly for colour. Its weight adapts to local visible contrast and the footprint
+  fades into plain grey at the edge. It is easier to watch than <b>fused</b>, but its
+  rendered colour is not a temperature scale; use the probe and detection labels
+  for measurements.</p></details>
+
+  <details><summary>The clock</summary>
+  <p>One thermal period drawn to scale, with the moment the visible frame was actually grabbed
+  marked inside it. Both timestamps come off the board's own clock; arrival times on this host
+  have been through a 4KB-chunked CDC write, a 500ms stall retry and the host's scheduler, and
+  measure the link rather than the sensors. The grey band at the right is the spread of the
+  thermal interval, which on this part is a three-valued delta function (113/114/115 ms) &mdash;
+  so a wide band there is a real anomaly, not ordinary jitter.</p></details>
+
+  <details><summary>Keys</summary>
+  <p><kbd>1</kbd>-<kbd>5</kbd> channel &middot; <kbd>f</kbd> field mode (hide everything but the
+  stream and the health) &middot; <kbd>o</kbd> footprint &middot; <kbd>b</kbd> boxes &middot;
+  <kbd>t</kbd> thermal ai &middot; <kbd>r</kbd> radar ai &middot; <kbd>c</kbd> fusion &middot;
+  <kbd>s</kbd> thermal outline &middot; <kbd>l</kbd> lock &middot;
+  <kbd>x</kbd> clear probes</p></details>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;');
+const set = async (q) => {
+  try {
+    const r = await fetch('/set?' + q, {signal: AbortSignal.timeout(5000)});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    $('command_status').hidden = true;
+    return r;
+  } catch (err) {
+    $('command_status').textContent = 'Setting not confirmed. Check the connection and try again.';
+    $('command_status').hidden = false;
+    return null;
+  }
+};
+$('ai_slot').appendChild($('aicard'));
+function toggleFocus() {
+  const focused = document.body.classList.toggle('field');
+  $('focusmode').setAttribute('aria-pressed', String(focused));
+  $('focusmode').textContent = focused ? 'Show controls' : 'Focus view';
+}
+$('focusmode').onclick = toggleFocus;
+$('heading').oninput = (e) => { $('o_heading').textContent = e.target.value + '\u00b0'; };
+$('heading').onchange = (e) => set('heading=' + e.target.value);
+$('btn_fix').onclick = async () => {
+  $('btn_fix').disabled = true; $('m_fixage').textContent = 'solving\u2026';
+  try { await fetch('/mapfix'); } catch (e) {}
+  $('btn_fix').disabled = false; drawTopdown();
+};
+
+// The pose stamp. Deliberately NOT optimistic: the readout only changes after
+// the server answers, because the whole point of the control is to tell an
+// operator standing at the target whether the frames now going to disk carry
+// the id. A bar that showed 'N04' on click would show it on a 409 too.
+async function stamp(id) {
+  const r = await fetch('/pose?' + (id === null ? 'clear=1' : 'id=' + encodeURIComponent(id)));
+  const d = await r.json();
+  if (!r.ok) { $('posenow').textContent = d.error || 'failed'; return; }
+  $('poseid').value = '';
+  $('poseid').blur();
+  applyPose({id: d.pose, stamped: d.stamped, frames: d.first_frame});
+}
+function applyPose(p) {
+  $('posebar').hidden = !p;
+  if (!p) return;
+  $('posenow').textContent = p.id || '\u2014';
+  $('posenow').className = p.id ? '' : 'none';
+  $('posen').textContent = p.stamped + ' stamped \u00b7 frame ' + p.frames;
+}
+
+// ------------------------------------------------------------------ controls
+// Wired once, then initialised from /ui's cfg rather than from the values in the
+// HTML: the page is not the source of truth for what the pipeline is doing, and
+// --gain 220 used to draw a slider parked at 200 over a pipeline running at 220.
+const SLIDERS = ['gain','eps','radius','agc','mix','visible_detail','thermal_detail'];
+for (const k of SLIDERS) {
+  const el = $(k);
+  el.oninput = () => { $('o_' + k).textContent = el.value; set(k + '=' + el.value); };
+}
+for (const k of ['emis','refl'])
+  $(k).onchange = () => set('emissivity=' + $('emis').value + '&reflected=' + $('refl').value);
+for (const [id, param] of [['outline','outline'],['boxes','boxes'],
+                           ['radar','radar'],['whisker','whisker'],
+                           ['ai_thermal','ai_thermal'],['ai_radar','ai_radar'],
+                           ['ai_fusion','ai_fusion'],['silhouette','silhouette'],
+                           ['evidence','evidence'],['lock','lock']])
+  $(id).onchange = (e) => set(param + '=' + (e.target.checked ? 1 : 0));
+
+// Sent as a fraction, drawn as one, but an <input type=range> only counts in
+// integers - so the slider is in percent and nothing else in the page is.
+for (const k of ['conf_thermal', 'conf_radar']) {
+  const el = $(k);
+  el.oninput = () => {
+    $('o_' + k).textContent = (el.value / 100).toFixed(2);
+    set(k + '=' + (el.value / 100));
+  };
+}
+
+$('posego').onclick = () => { const v = $('poseid').value.trim(); if (v) stamp(v); };
+$('poseclr').onclick = () => stamp(null);
+$('poseid').onkeydown = (e) => { if (e.key === 'Enter') $('posego').click(); };
+
+function seg(boxId, names, param, onpick) {
+  const box = $(boxId);
+  const items = names.map(n => typeof n === 'string' ? {id:n,label:n} : n);
+  box.innerHTML = items.map(n => '<button data-v="' + n.id + '">' + n.label + '</button>').join('');
+  box.onclick = (e) => {
+    if (e.target.tagName !== 'BUTTON') return;
+    pick(boxId, e.target.dataset.v);
+    set(param + '=' + e.target.dataset.v);
+    if (onpick) onpick(e.target.dataset.v);
+  };
+}
+function pick(boxId, v) {
+  for (const b of $(boxId).children) {
+    const selected = b.dataset.v === v;
+    b.className = selected ? 'on' : '';
+    b.setAttribute('aria-pressed', String(selected));
+  }
+}
+function applyChannel(v) {
+  $('fusionviewcard').style.display = v === 'fusion' ? '' : 'none';
+  $('current_channel').textContent = (CHANNELS.find(c => c.id === v) || {}).label || v;
+}
+let CHANNELS = [];
+const VIEWS = ['fused','visible','blink','mix','edges','operator'];
+seg('view', VIEWS, 'view');
+seg('pal', ['ironbow','white','black','gray'], 'palette');
+
+// The radar extrinsics. Nudges rather than free text: these are being adjusted
+// against a live image, and the question being asked is always "is it better or
+// worse than a moment ago", never "what if it were 7.3 degrees".
+const NUDGE = [['yaw','&deg;',0.2],['pitch','&deg;',0.2],['roll','&deg;',0.2],
+               ['tx',' mm',5],['ty',' mm',5],['tz',' mm',5]];
+const rstate = {};
+$('nudge').innerHTML = NUDGE.map(([k,u]) =>
+  '<label>' + k + '</label><output id="o_' + k + '">-</output>'
+  + '<button aria-label="Decrease ' + k + '" data-k="' + k + '" data-d="-1">-</button>'
+  + '<button aria-label="Increase ' + k + '" data-k="' + k + '" data-d="1">+</button>').join('');
+$('nudge').onclick = (e) => {
+  const k = e.target.dataset && e.target.dataset.k;
+  if (!k) return;
+  const step = NUDGE.find(n => n[0] === k)[2] * Number(e.target.dataset.d);
+  rstate[k] = Math.round((rstate[k] + step) * 100) / 100;
+  $('o_' + k).textContent = rstate[k] + (k[0] === 't' ? ' mm' : '\u00b0');
+  set(k + '=' + rstate[k]);
+};
+
+// ------------------------------------------------------------------ readings
+// The image is scaled to fit, so client coords have to be mapped back to the
+// 640x400 the pipeline actually indexes - otherwise the reading is off by the
+// zoom factor and silently wrong rather than obviously broken.
+const im = $('im'), read = $('read'), ovl = $('ovl');
+function pixel(e) {
+  const r = im.getBoundingClientRect();
+  if (!im.naturalWidth) return [0, 0, 0, 0];   // no frame decoded yet
+  return [Math.round((e.clientX - r.left) * im.naturalWidth / r.width),
+          Math.round((e.clientY - r.top) * im.naturalHeight / r.height),
+          e.clientX - r.left, e.clientY - r.top];
+}
+let pending = false, last = 0;
+im.onmousemove = async (e) => {
+  const [x, y, lx, ly] = pixel(e);
+  read.style.left = lx + 'px'; read.style.top = ly + 'px';
+  if (pending || performance.now() - last < 80) return;      // ~12 Hz is plenty
+  pending = true; last = performance.now();
+  try {
+    const d = await (await fetch('/temp?x=' + x + '&y=' + y)).json();
+    read.style.display = 'block';
+    read.className = d.repaired ? 'warn' : '';
+    read.textContent = d.valid
+      ? d.c.toFixed(1) + ' \u00b0C' + (d.repaired ? '  rebuilt row' : '')
+      : 'no thermal';
+  } finally { pending = false; }
+};
+im.onmouseleave = () => { read.style.display = 'none'; };
+
+// Two pins at a time, A then B then back to A. Two is not a limitation: the
+// delta is a statement about a PAIR of points on the same material, and a list
+// of six probes invites averaging things that are not comparable.
+let probes = [];
+$('clearprobes').onclick = () => { probes = []; refreshProbes(); };
+$('probecontrols').onsubmit = (e) => {
+  e.preventDefault();
+  const x = Number($('probe_x').value), y = Number($('probe_y').value);
+  if (!im.naturalWidth || !Number.isInteger(x) || !Number.isInteger(y)
+      || x < 0 || y < 0 || x >= im.naturalWidth || y >= im.naturalHeight) return;
+  probes = probes.length >= 2 ? [{x, y}] : probes.concat([{x, y}]);
+  refreshProbes();
+};
+im.onclick = (e) => {
+  const [x, y] = pixel(e);
+  if (!im.naturalWidth) return;
+  probes = probes.length >= 2 ? [{x, y}] : probes.concat([{x, y}]);
+  refreshProbes();
+};
+addEventListener('keydown', (e) => {
+  if (e.ctrlKey || e.altKey || e.metaKey || e.repeat
+      || e.target.closest('input,textarea,select,button,a,summary,[contenteditable=true]')) return;
+  if (e.key === 'x') { probes = []; refreshProbes(); }
+  if (e.key === 'f') toggleFocus();
+  if (e.key === 'o') { $('outline').click(); }
+  if (e.key === 'b') { $('boxes').click(); }
+  if (e.key === 'e') { $('evidence').click(); }
+  if (e.key === 't') { $('ai_thermal').click(); }
+  if (e.key === 'r') { $('ai_radar').click(); }
+  if (e.key === 'c') { $('ai_fusion').click(); }
+  if (e.key === 's') { $('silhouette').click(); }
+  if (e.key === 'l') { $('lock').click(); }
+  const i = Number(e.key) - 1;
+  if (i >= 0 && i < CHANNELS.length) {
+    pick('channel', CHANNELS[i].id); applyChannel(CHANNELS[i].id);
+    set('channel=' + CHANNELS[i].id);
+  }
+});
+
+async function refreshProbes() {
+  for (const p of probes) {
+    const d = await (await fetch('/temp?x=' + p.x + '&y=' + p.y)).json();
+    p.c = d.valid ? d.c : null;
+    p.repaired = !!d.repaired;
+  }
+  const NAME = ['A','B'], COL = ['#ffffff','#8fd0ff'];
+  ovl.innerHTML = probes.map((p, i) =>
+    '<g stroke="' + COL[i] + '" fill="none" stroke-width="1.4">'
+    + '<circle cx="' + p.x + '" cy="' + p.y + '" r="9"/>'
+    + '<line x1="' + (p.x - 13) + '" y1="' + p.y + '" x2="' + (p.x - 4) + '" y2="' + p.y + '"/>'
+    + '<line x1="' + (p.x + 4) + '" y1="' + p.y + '" x2="' + (p.x + 13) + '" y2="' + p.y + '"/>'
+    + '<line x1="' + p.x + '" y1="' + (p.y - 13) + '" x2="' + p.x + '" y2="' + (p.y - 4) + '"/>'
+    + '<line x1="' + p.x + '" y1="' + (p.y + 4) + '" x2="' + p.x + '" y2="' + (p.y + 13) + '"/>'
+    + '<text x="' + (p.x + 13) + '" y="' + (p.y + 4) + '" fill="' + COL[i] + '" stroke="none"'
+    + ' font-family="ui-monospace,monospace" font-size="12">' + NAME[i]
+    + (p.c === null ? '' : ' ' + p.c.toFixed(1)) + '</text></g>').join('');
+
+  if (!probes.length) {
+    $('probes').innerHTML = '<div class=hint>click the image to pin a probe</div>';
+    return;
+  }
+  let html = probes.map((p, i) =>
+    '<div class=p><em>PROBE ' + NAME[i] + '</em><b>'
+    + (p.c === null ? '--' : p.c.toFixed(1)) + '</b>'
+    + (p.repaired ? ' <span class=flag>rebuilt</span>' : '') + '</div>').join('');
+  if (probes.length === 2 && probes[0].c !== null && probes[1].c !== null) {
+    const dc = probes[0].c - probes[1].c;
+    // The delta is only the trustworthy number while both ends are trustworthy.
+    // A rebuilt row is a linear ramp spliced into real data, so a probe sitting
+    // on one is not a measurement of the scene - say so beside the delta rather
+    // than three paragraphs down the page.
+    const dirty = probes.some(p => p.repaired);
+    html += '<div class=d><em>' + '\u0394' + ' A-B</em><b>' + dc.toFixed(1)
+      + ' \u00b0C</b>' + (dirty ? '<span class=flag>rebuilt row</span>' : '') + '</div>';
+  }
+  $('probes').innerHTML = html + '<div class=hint><kbd>x</kbd> clears</div>';
+}
+refreshProbes();
+
+// ------------------------------------------------------------------ history
+// fps, skew, heap, coverage all drift rather than jump, and a single reading
+// hides drift entirely. The heap one is the point of the exercise: 12.4MB is not
+// interesting, 12.4MB where a minute ago it was 13.0MB is the early warning.
+const hist = {th: [], sk: [], fps: [], heap: [], cov: [],
+              cpu: [], gpu: [], mem: [], tj: [], pw: []};
+function push(k, v) {
+  if (v === null || v === undefined || !isFinite(v)) return;
+  hist[k].push(v);
+  if (hist[k].length > 60) hist[k].shift();
+}
+function spark(id, key, colour, lo, hi) {
+  const v = hist[key], W = 90, H = 16, el = $(id);
+  if (v.length < 2) { el.innerHTML = ''; return; }
+  const clamp = (t) => Math.max(0, Math.min(1, (t - lo) / (hi - lo)));
+  const pts = v.map((t, i) => (i / (v.length - 1) * (W - 2) + 1).toFixed(1) + ','
+                              + (H - 1 - clamp(t) * (H - 2)).toFixed(1));
+  el.innerHTML = '<polyline points="' + pts.join(' ') + '" fill="none" stroke="' + colour
+    + '" stroke-width="1.2" stroke-linejoin="round" opacity=".85"/>';
+}
+
+// ------------------------------------------------------------------ the clock
+function drawClock(t) {
+  const per = t.thermal_ms.median, X = 10, W = 330;
+  const frac = t.skew_frac === null ? 0 : Math.min(1, t.skew_frac);
+  const vx = X + W * frac, bad = t.skew_frac !== null && t.skew_frac > 0.25;
+  const jw = W * (t.thermal_ms.max - t.thermal_ms.min) / per;
+  $('clocksvg').innerHTML =
+    '<rect x="' + X + '" y="16" width="' + W + '" height="12" fill="#181c1f" stroke="#2a3136" rx="2"/>'
+    + '<rect x="' + X + '" y="16" width="' + (vx - X) + '" height="12" fill="'
+      + (bad ? '#4a3714' : '#173044') + '" rx="2"/>'
+    + '<rect x="' + (X + W - jw) + '" y="16" width="' + jw + '" height="12" fill="#2b3237"/>'
+    + '<line x1="' + X + '" y1="9" x2="' + X + '" y2="35" stroke="#f0a860" stroke-width="2"/>'
+    + '<line x1="' + vx + '" y1="9" x2="' + vx + '" y2="35" stroke="#6cc8ff" stroke-width="2"/>'
+    + '<line x1="' + (X + W) + '" y1="9" x2="' + (X + W) + '" y2="35" stroke="#f0a860"'
+      + ' stroke-width="2" stroke-dasharray="2 2"/>'
+    + '<text x="' + (X + 3) + '" y="45" fill="#f0a860" font-size="9.5"'
+      + ' font-family="ui-monospace,monospace">thermal grab</text>'
+    + '<text x="' + (vx + 4) + '" y="13" fill="#6cc8ff" font-size="9.5"'
+      + ' font-family="ui-monospace,monospace">visible</text>'
+    + '<text x="' + (X + W) + '" y="45" fill="#6b747c" font-size="9.5" text-anchor="end"'
+      + ' font-family="ui-monospace,monospace">' + per + ' ms period &#183; jitter '
+      + t.thermal_ms.min + '-' + t.thermal_ms.max + '</text>';
+}
+
+// ------------------------------------------------------------------ health
+// The same checks health() already produces, grouped by the question each group
+// answers. Grouping is the whole point: thirteen flat pills read as thirteen
+// equal facts, and "8.7 fps" is not equal to "the sensor went unserviced".
+const GROUPS = [
+  ['link', ['stream','framing','jpeg','render']],
+  ['sensor', ['cadence','pairing','thermal load','ffc','tearing','dead rows','board heap']],
+  ['measurement', ['registration','coverage','range','clipping','agc','emissivity']],
+  ['perception', ['channel','detect','radar','ai','recording']],
+  ['host', ['host cpu','host memory','host thermal','host power']],
+  ['map', ['map']],
+];
+const RANK = {ok: 0, warn: 1, fail: 2}, LVL = ['ok','warn','fail'];
+// Which groups the operator has opened by hand. Rebuilding the panel every
+// second must not slam shut a group somebody is reading.
+const opened = {};
+$('health').onclick = (e) => {
+  const d = e.target.closest('details');
+  if (d) setTimeout(() => { opened[d.dataset.g] = d.open; }, 0);
+};
+function drawHealth(checks) {
+  const by = {};
+  for (const c of checks) by[c.name] = c;
+  const seen = new Set();
+  const groups = GROUPS.map(([name, names]) => {
+    const cs = names.map(n => by[n]).filter(Boolean);
+    cs.forEach(c => seen.add(c.name));
+    return [name, cs];
+  });
+  // Anything health() grows later lands here rather than vanishing off the page.
+  const rest = checks.filter(c => !seen.has(c.name));
+  if (rest.length) groups.push(['other', rest]);
+
+  $('health').innerHTML = groups.map(([name, cs]) => {
+    if (!cs.length) return '<details class="grp ok" data-g="' + name + '">'
+      + '<summary><span class=dot style=background:#2f363c></span>' + name
+      + '<span class=cnt>nothing to report</span><span class=chev>&rsaquo;</span></summary></details>';
+    const worst = LVL[Math.max.apply(null, cs.map(c => RANK[c.level]))];
+    const bad = cs.filter(c => c.level !== 'ok').length;
+    // Not-ok groups open themselves; ok groups stay shut unless opened by hand.
+    const open = (opened[name] !== undefined) ? opened[name] : worst !== 'ok';
+    return '<details class="grp ' + worst + '" data-g="' + name + '"' + (open ? ' open' : '') + '>'
+      + '<summary><span class=dot></span>' + name + '<span class=cnt>'
+      + (bad ? bad + ' of ' + cs.length : cs.length + ' ok')
+      + '</span><span class=chev>&rsaquo;</span></summary><div class=checks>'
+      + cs.map(c => '<div class="chk-row ' + c.level + '"><i></i><span class=n>' + c.name
+          + '</span><span class=t>' + esc(c.text) + '</span></div>').join('')
+      + '</div></details>';
+  }).join('');
+}
+
+// ------------------------------------------------------------------ poll
+const VERDICT = {
+  ok: ['SYSTEM READY', 'no active faults detected'],
+  warn: ['CHECK STATUS', 'review the highlighted system checks'],
+  fail: ['DO NOT RECORD', 'a critical check failed; review system health'],
+};
+let inited = false;
+function initControls(cfg) {
+  CHANNELS = cfg.channels || [];
+  seg('channel', CHANNELS, 'channel', applyChannel);
+  for (const k of SLIDERS) { $(k).value = cfg[k]; $('o_' + k).textContent = cfg[k]; }
+  $('emis').value = cfg.emissivity;
+  $('refl').value = cfg.reflected;
+  $('outline').checked = cfg.outline;
+  $('boxes').checked = cfg.boxes;
+  $('lock').checked = cfg.lock;
+  pick('channel', cfg.channel);
+  applyChannel(cfg.channel);
+  pick('view', cfg.view);
+  pick('pal', cfg.palette);
+  if (cfg.ai) {
+    $('aistudents').style.display = '';
+    $('ai_thermal').checked = cfg.ai.thermal.on;
+    $('ai_radar').checked = cfg.ai.radar.on;
+    $('ai_fusion').checked = cfg.ai.fusion.on;
+    $('evidence').checked = cfg.ai.evidence;
+    $('silhouette').checked = cfg.ai.silhouette;
+    for (const [k, c] of [['conf_thermal', cfg.ai.thermal],
+                          ['conf_radar', cfg.ai.radar]]) {
+      $(k).min = Math.round(100 * cfg.ai.floor);
+      $(k).value = Math.round(100 * c.conf);
+      $('o_' + k).textContent = c.conf.toFixed(2);
+    }
+  }
+  if (cfg.radar) {
+    $('radarcard').style.display = '';
+    $('radar').checked = cfg.radar.on;
+    $('whisker').checked = cfg.radar.whisker;
+    for (const [k] of NUDGE) {
+      rstate[k] = cfg.radar[k];
+      $('o_' + k).textContent = rstate[k] + (k[0] === 't' ? ' mm' : '\u00b0');
+    }
+  }
+  inited = true;
+}
+
+function drawMap(m) {
+  const card = $('mapcard'), side = $('mapside');
+  if (!m) { card.style.display = 'none'; side.className = ''; return; }
+  card.style.display = '';
+  side.className = 'on';
+  const num = (v, u, f) => (v === null || v === undefined) ? '\u2013'
+      : v.toFixed(f) + '<span class=u> ' + u + '</span>';
+  const loc = m.location ? m.location.latitude_deg.toFixed(5) + ', '
+      + m.location.longitude_deg.toFixed(5) : '';
+  if (m.pending) {
+    $('m_stages').textContent = 'initialising at ' + loc + ' \u2026';
+    $('m_text').textContent = '';
+    return;
+  }
+  const g = m.geoid || {}, pr = m.priors || {}, alt = m.ego_altitude_prior || {};
+  $('m_geoid').innerHTML = num(g.undulation_m, 'm', 2);
+  $('m_ground').innerHTML = num(pr.ground_elevation_m, 'm', 1);
+  $('m_surface').innerHTML = num(pr.surface_elevation_m, 'm', 1);
+  $('m_sigma').innerHTML = num(alt.sigma_m, 'm', 1);
+  const st = (m.stages || []).map(s => s.name + ': ' + s.status).join(' \u00b7 ');
+  $('m_stages').innerHTML = (m.ok ? '<b>ok</b> ' : '<b style=color:var(--warn)>FAILED</b> ')
+      + esc(loc) + (st ? ' \u2014 ' + esc(st) : '');
+  $('m_text').textContent = m.error ? m.error
+      : (pr.overture_path ? 'buildings: ' + pr.overture_path.split('/').pop() : '');
+}
+let topdownTimer = null;
+function drawFix(d) {
+  const prior = d.map_prior, fx = d.map_fix, nav = d.nav;
+  if (!prior) return;
+  if (document.activeElement !== $('heading') && prior.heading_deg !== null) {
+    $('heading').value = Math.round(prior.heading_deg);
+    $('o_heading').textContent = Math.round(prior.heading_deg) + '\u00b0';
+  }
+  const p = fx && fx.pose;
+  if (!fx) { $('m_fix').textContent = '\u2013'; $('m_fixtext').textContent =
+      prior.heading_deg === null ? 'set a heading prior, then fix from walls' : 'not solved yet'; }
+  else if (!p) { $('m_fix').innerHTML = '<span style=color:var(--warn)>none</span>';
+      $('m_fixtext').textContent = fx.error || ''; }
+  else {
+    $('m_fix').innerHTML = (p.accepted ? '<span style=color:#5cf>ok</span>'
+        : '<span style=color:var(--warn)>rejected</span>')
+        + '<span class=u> \u0394 ' + p.dx_m.toFixed(1) + ' E ' + p.dy_m.toFixed(1) + ' N</span>';
+    $('m_head').innerHTML = p.heading_deg.toFixed(1) + '<span class=u>\u00b0 \u00b1' + p.sigma_heading_deg.toFixed(1) + '</span>';
+    const bad = (fx.checks || []).filter(c => !c.passed).map(c => c.name.replace(/^walls\./, '') + ': ' + c.detail);
+    $('m_fixtext').textContent = (p.accepted ? '' : bad.join(' \u00b7 ') + ' \u2014 ')
+        + 'inliers ' + Math.round(100 * p.inlier_fraction) + '% of ' + p.n_returns
+        + ', \u03c3 ' + p.sigma_horizontal_m.toFixed(1) + ' m, ' + fx.solve_s + ' s';
+  }
+  if (fx && fx.t) $('m_fixage').textContent = Math.round((Date.now() / 1000) - fx.t) + ' s ago';
+  if (nav && !nav.error) {
+    $('m_nav').innerHTML = nav.horizon_1m_s + '<span class=u> s to 1 m</span>';
+    $('m_speed').innerHTML = nav.speed_mps.toFixed(2) + '<span class=u> m/s</span>';
+    $('m_navtext').textContent = nav.regime + ', heading \u03c3 ' + nav.heading_sigma_deg
+        + '\u00b0: ' + nav.error_60s_m + ' m after 60 s'
+        + (nav.dominant ? ', mostly ' + nav.dominant : '')
+        + (nav.rests_on_assumption ? ' (rests on an ASSUMED constant)' : '')
+        + '; inertial-only would hold ' + nav.horizon_1m_inertial_s + ' s';
+  } else if (nav) { $('m_navtext').textContent = nav.error; }
+}
+// An empty square beside the picture is indistinguishable from a broken one,
+// and the reason used to be a 40-character slice in #667 at the top-left corner
+// - the one place nobody looks, cut mid-module-path. Centred, wrapped, and in
+// the warn colour, because a top-down that cannot draw is a finding.
+function tdMessage(g, W, H, lead, detail) {
+  g.textAlign = 'center';
+  g.fillStyle = '#f0c060';
+  g.font = '600 13px system-ui,-apple-system,sans-serif';
+  g.fillText(lead, W / 2, H / 2 - 16);
+  g.fillStyle = '#79838d';
+  g.font = '11px ui-monospace,Menlo,Consolas,monospace';
+  let line = '', y = H / 2 + 6;
+  for (const w of String(detail || '').split(/\s+/).filter(Boolean)) {
+    const t = line ? line + ' ' + w : w;
+    if (line && g.measureText(t).width > W - 36) { g.fillText(line, W / 2, y); y += 15; line = w; }
+    else line = t;
+  }
+  if (line) g.fillText(line, W / 2, y);
+  g.textAlign = 'start';
+}
+async function drawTopdown() {
+  let td;
+  try { td = await (await fetch('/topdown')).json(); } catch (e) { return; }
+  const c = $('topdown'), g = c.getContext('2d'), W = c.width, H = c.height;
+  const side = $('mapside');
+  // The legend promises walls and dots. While there are none it is a
+  // description of a picture that is not on screen, so it goes quiet.
+  const quiet = on => { if (side) side.classList.toggle('nowalls', !!on); };
+  g.clearRect(0, 0, W, H);
+  if (!td || td.error || !td.edges) {
+    quiet(true);
+    // Two different situations, and the fix differs: no --map is configuration,
+    // anything else is the wall layer failing with the reason it gives.
+    const cfg = td && /no map layer/.test(td.error || '');
+    tdMessage(g, W, H, cfg ? 'no map layer' : 'top-down unavailable',
+              (td && td.error) || 'no answer from /topdown');
+    return;
+  }
+  quiet(!td.edges.length);
+  const R = td.radius_m, k = (W / 2) / R;
+  const X = x => W / 2 + x * k, Y = y => H / 2 - y * k;
+  g.strokeStyle = '#1e2429'; g.lineWidth = 1;
+  for (let r = 10; r <= R; r += 10) { g.beginPath(); g.arc(W/2, H/2, r * k, 0, 2 * Math.PI); g.stroke(); }
+  g.strokeStyle = '#9aa'; g.lineWidth = 1.5;
+  for (const [x0, y0, x1, y1] of td.edges) { g.beginPath(); g.moveTo(X(x0), Y(y0)); g.lineTo(X(x1), Y(y1)); g.stroke(); }
+  const rig = (p, col) => {
+    if (!p || p.heading_deg === null || p.heading_deg === undefined) return;
+    const h = p.heading_deg * Math.PI / 180;
+    g.strokeStyle = col; g.lineWidth = 2; g.beginPath();
+    g.moveTo(X(p.x), Y(p.y)); g.lineTo(X(p.x + 6 * Math.sin(h)), Y(p.y + 6 * Math.cos(h))); g.stroke();
+    g.beginPath(); g.arc(X(p.x), Y(p.y), 3, 0, 2 * Math.PI); g.fillStyle = col; g.fill();
+    if (p.sigma_m) { g.setLineDash([3, 3]); g.beginPath(); g.arc(X(p.x), Y(p.y), p.sigma_m * k, 0, 2 * Math.PI); g.stroke(); g.setLineDash([]); }
+  };
+  const dots = (pts, col) => { g.fillStyle = col; for (const [x, y] of pts) { g.beginPath(); g.arc(X(x), Y(y), 2.5, 0, 2 * Math.PI); g.fill(); } };
+  dots(td.returns_at_prior, '#e0a030'); rig(td.prior, '#e0a030');
+  if (td.fix) { dots(td.returns_at_fix, '#5cf'); rig(td.fix, td.fix.accepted ? '#5cf' : '#c55'); }
+  g.fillStyle = '#667'; g.font = '11px sans-serif';
+  g.fillText('N', W / 2 - 4, 12); g.fillText(td.n_walls + ' returns', 8, H - 8);
+  // Buildings loaded, none within the radius: the rings and the returns are
+  // still worth drawing, but nothing here can confirm the prior.
+  if (!td.edges.length) tdMessage(g, W, H, 'no map walls in ' + td.radius_m + ' m',
+      'the priors loaded but hold no footprint within the radius, so the fix has nothing to match');
+}
+function drawAiLive(d) {
+  const a = d.ai_diagnostics, f = d.frames, t = d.timing;
+  const age = a ? Math.max(0, d.server_time - a.t) : null;
+  const stale = f.age_s === null || f.age_s > 1 || (age !== null && age > 1);
+  const status = $('ai_live_status');
+  status.textContent = (stale ? 'WAITING / STALE RESULTS' : 'LIVE')
+    + (!d.cfg.ai ? ' | student engines unavailable' : !a ? ' | waiting for AI cycle'
+      : ' | AI cycle ' + a.cycle + ' | ' + a.ms.toFixed(1) + ' ms'
+        + ' | result age ' + age.toFixed(1) + ' s')
+    + (a && a.error ? ' | ERROR: ' + a.error : '');
+  status.style.color = a && a.error ? 'var(--fail)' : stale ? 'var(--warn)' : 'var(--ok)';
+  $('ai_live_frames').textContent = 'Frames received: ' + f.received
+    + ' | age: ' + (f.age_s === null ? 'none yet' : f.age_s.toFixed(1) + ' s')
+    + ' | host: ' + t.host_fps + ' fps | thermal: ' + (t.thermal_fps ?? '-')
+    + ' fps | dropped batches: ' + f.batch_drops
+    + ' | sensor stalls: ' + t.stalls;
+  const lines = [];
+  if (a) {
+    for (const [key, label] of [['thermal', 'T'], ['radar', 'R']]) {
+      lines.push(label + ': ' + a.decisions[key] + ' | found ' + a.found[key]
+        + ', accepted ' + a[key].length + ', filtered '
+        + Math.max(0, a.found[key] - a[key].length));
+    }
+    lines.push('Filtered = warm-up, confidence floor or duplicate suppression.');
+    lines.push('TR: ' + a.fusion.length + ' accepted, ' + a.rejected.length + ' rejected');
+  }
+  const dd = d.detections;
+  lines.push('D: ' + dd.list.length + ' accepted, ' + dd.rejected.length + ' rejected'
+    + ' | age: ' + (dd.age_s === null ? 'no result' : dd.age_s + ' s')
+    + ' | processing: ' + (dd.ms ?? '-') + ' ms');
+  lines.push('Locks: ' + d.tracks.filter(x => !x.coasting).length + ' confirmed, '
+    + d.tracks.filter(x => x.coasting).length + ' coasting, '
+    + d.tracks_static.length + ' static candidates suppressed');
+  $('ai_live_decisions').style.whiteSpace = 'pre-line';
+  $('ai_live_decisions').textContent = lines.join('\n');
+  const rows = [];
+  const append = (label, list) => list.forEach(x => {
+    rows.push(label + ' | ' + (x.cls || 'person') + ' | '
+      + (Number.isFinite(x.conf) ? Math.round(x.conf * 100) + '%' : '-')
+      + ' | box ' + [x.x, x.y, x.w, x.h].join(', ')
+      + (x.radar_m == null ? '' : ' | ' + x.radar_m.toFixed(1) + ' m')
+      + (label === 'T' && !x.vis ? ' | cannot map to visible image' : '')
+      + (x.rejected ? ' | rejected: ' + x.rejected : ''));
+  });
+  if (a) {
+    append('T', a.thermal); append('R', a.radar); append('TR', a.fusion);
+    append('TR rejected', a.rejected);
+  }
+  append('D', dd.list);
+  $('ai_live_detections').style.whiteSpace = 'pre-line';
+  $('ai_live_detections').textContent = rows.join('\n') || 'No detection results';
+}
+
+async function poll() {
+  let d;
+  try {
+    const response = await fetch('/ui', {signal: AbortSignal.timeout(5000)});
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    d = await response.json();
+  } catch (err) {
+    $('trust').className = 'fail';
+    $('vtext').textContent = 'VIEWER DISCONNECTED';
+    $('vsub').textContent = 'the page cannot reach live.py - is it still running?';
+    $('ai_live_status').textContent = 'DISCONNECTED - displayed results are old';
+    $('ai_live_status').style.color = 'var(--fail)';
+    for (const id of ['summary_fps', 'summary_locks', 'summary_thermal', 'summary_age']) $(id).textContent = '-';
+    $('summary_freshness').textContent = 'connection lost';
+    return;
+  }
+  if (!inited) initControls(d.cfg);
+
+  const [vt, vs] = VERDICT[d.worst];
+  $('trust').className = d.worst;
+  $('vtext').textContent = vt;
+  $('vsub').textContent = vs;
+
+  // The MJPEG endpoint keeps the last good frame on screen while the reader is
+  // recovering.  That is preferable to a broken image icon, but only if the
+  // operator can see that the pixels are stale rather than live.
+  const ss = d.stream_status;
+  $('streamstate').hidden = !ss;
+  if (ss) {
+    $('streamtitle').textContent = ss.title;
+    $('streamdetail').textContent = ss.detail || '';
+  }
+
+  // The facts that qualify every number on screen, in one place. They used to be
+  // spread across /stat, a health pill and the word UNREGISTERED on each box.
+  const cfg = d.cfg, q = [];
+  $('summary_fps').textContent = d.timing.host_fps.toFixed(1);
+  $('summary_locks').textContent = d.stream_status || d.frames.age_s === null
+    ? '-' : d.tracks.filter(t => !t.coasting).length;
+  const aiAge = d.ai_diagnostics ? d.server_time - d.ai_diagnostics.t : null;
+  $('summary_thermal').textContent = !cfg.ai || aiAge === null || aiAge > 1
+    || d.ai_diagnostics.decisions.thermal !== 'processed'
+    ? '-' : d.ai_diagnostics.thermal.length;
+  $('summary_age').textContent = d.frames.age_s === null ? '-' : d.frames.age_s.toFixed(1) + ' s';
+  $('summary_freshness').textContent = d.frames.age_s === null ? 'waiting for a frame'
+    : d.stream_status ? d.stream_status.title.toLowerCase() : 'receiving frames';
+  $('summary_age').style.color = d.stream_status || d.frames.age_s === null ? 'var(--warn)' : 'var(--ok)';
+  drawAiLive(d);
+  q.push(['warp', cfg.warped ? 'calibrated' : 'PLACEHOLDER', !cfg.warped]);
+  q.push(['agc', cfg.agc ? cfg.agc + '\u2030 - tone is scene-relative' : 'off', !!cfg.agc]);
+  q.push(['\u03b5', cfg.emissivity.toFixed(2) + ' / refl ' + Math.round(cfg.reflected)
+          + ' \u00b0C', cfg.emissivity < 1]);
+  q.push(['range', cfg.range[1] > cfg.range[0]
+          ? cfg.range[0] + '-' + cfg.range[1] + ' \u00b0C' : 'none', cfg.range[1] <= cfg.range[0]]);
+  if (d.recording) q.push(['rec', d.recording, false]);
+  // Recording with no pose_id is flagged, not merely blank: unlabelled frames
+  // are the failure this control exists to prevent, and it is silent otherwise.
+  if (d.pose) q.push(['pose', d.pose.id || 'UNLABELLED', !d.pose.id]);
+  $('qual').innerHTML = q.map(([k, v, bad]) =>
+    '<span class="' + (bad ? 'bad' : '') + '">' + k + ' <i>' + esc(v) + '</i></span>').join('');
+
+  // Skipped while the operator is mid-entry: the poll runs every second and
+  // would otherwise wipe a half-typed station id under their thumb.
+  if (document.activeElement !== $('poseid')) applyPose(d.pose);
+
+  drawHealth(d.checks);
+  drawMap(d.map);
+  drawFix(d);
+  if (d.map && !topdownTimer) { topdownTimer = setInterval(drawTopdown, 1000); drawTopdown(); }
+
+  // --- the clock and the traces
+  const t = d.timing;
+  if (t.thermal_ms) {
+    drawClock(t);
+    push('th', t.thermal_ms.median);
+    $('k_th').innerHTML = t.thermal_ms.median + '<span class=u> ms &#183; '
+      + t.thermal_fps + ' fps</span>';
+    if (t.skew_ms) {
+      push('sk', t.skew_ms.median);
+      $('kv_sk').className = 'kv vis' + (t.skew_frac > 0.25 ? ' bad' : '');
+      $('k_sk').innerHTML = '+' + t.skew_ms.median + '<span class=u> ms &#183; '
+        + Math.round(100 * t.skew_frac) + '% of a frame</span>';
+    }
+  }
+  push('fps', t.host_fps);
+  $('k_fps').innerHTML = t.host_fps.toFixed(1) + '<span class=u> fps</span>';
+  $('k_ffc').innerHTML = t.ffc_ago_s === null ? 'none yet'
+    : t.ffc_ago_s + '<span class=u> s ago &#183; ' + t.ffcs + '</span>';
+  // Load reaching the sensor. On screen even when it is zero: this is the number
+  // that decides whether more host work is affordable, and it is worth watching
+  // go up rather than discovering afterwards.
+  $('kv_load').className = 'kv' + (t.starved || t.stalls ? ' bad' : '');
+  $('k_load').innerHTML = t.starved
+    ? 'STARVED ' + t.starved + 'x<span class=u> worst ' + t.last_starve_ms + ' ms</span>'
+    : t.stalls ? t.stalls + '<span class=u> write stall(s)</span>'
+    : '<span style=color:#7fd39b>unstarved</span>';
+
+  if (d.heap_free !== null && d.heap_free !== undefined) {
+    const mb = d.heap_free / (1 << 20);
+    push('heap', mb);
+    $('k_heap').innerHTML = mb.toFixed(1) + '<span class=u> MB'
+      + (d.restarts ? ' &#183; ' + d.restarts + ' restart(s)' : '') + '</span>';
+  }
+  if (d.coverage !== null && d.coverage !== undefined) {
+    push('cov', 100 * d.coverage);
+    $('k_cov').innerHTML = Math.round(100 * d.coverage) + '<span class=u> %</span>';
+    $('s_cov').textContent = Math.round(100 * d.coverage) + '%';
+  }
+  if (d.light) {
+    // "blind" is a warn and not a fail: the rig is working exactly as designed,
+    // it simply has no light. What would be a fail is showing 0 boxes without
+    // saying so.
+    $('kv_light').className = 'kv' + (d.light.state === 'lit' ? '' : ' bad');
+    $('k_light').innerHTML = (d.light.state === 'blind' ? 'BLIND'
+        : d.light.state === 'dim' ? 'part-lit' : 'lit')
+      + '<span class=u> &#183; ' + (100 * d.light.lit).toFixed(1) + '% lit</span>';
+  }
+  $('k_band').innerHTML = d.stats.valid
+    ? d.stats.min.toFixed(1) + '<span class=u>..</span>' + d.stats.max.toFixed(1)
+      + '<span class=u> \u00b0C &#183; \u0394 ' + d.stats.delta.toFixed(1) + '</span>'
+    : '<span class=u>no thermal coverage</span>';
+  if (d.raw_stats) {
+    $('kv_raw').style.display = '';
+    $('k_raw').innerHTML = d.raw_stats.min.toFixed(2)
+      + '<span class=u>..</span>' + d.raw_stats.max.toFixed(2)
+      + '<span class=u> \u00b0C &#183; \u0394 ' + d.raw_stats.delta.toFixed(2)
+      + '</span>';
+  } else {
+    $('kv_raw').style.display = 'none';
+  }
+  $('agcwarn').innerHTML = cfg.agc
+    ? '<span style=color:#f0c060>scene-relative</span>' : '';
+
+  // --- the host. The same subject as the starve counter above, seen from the
+  // other end: that one says the sensor went unserviced, this one says why, and
+  // it is the half that moves first.
+  const s = d.soc;
+  if (s) {
+    $('socstrip').style.display = '';
+    if (s.cpu_pct !== null) {
+      push('cpu', s.cpu_pct);
+      $('kv_cpu').className = 'kv host' + (s.cpu_pct > 85 ? ' bad' : '');
+      $('k_cpu').innerHTML = Math.round(s.cpu_pct) + '<span class=u>% of ' + s.ncpu
+        + ' cores' + (s.self_pct === null ? ''
+            : ' &#183; ' + Math.round(s.self_pct) + '% mine') + '</span>';
+    }
+    if (s.gpu_pct !== null) {
+      push('gpu', s.gpu_pct);
+      $('k_gpu').innerHTML = Math.round(s.gpu_pct) + '<span class=u>%</span>';
+    }
+    if (s.mem_total_mb) {
+      push('mem', s.mem_avail_mb);
+      $('kv_mem').className = 'kv host' + (s.mem_avail_mb < 600 ? ' bad' : '');
+      $('k_mem').innerHTML = (s.mem_avail_mb / 1024).toFixed(1) + '<span class=u> GB free of '
+        + (s.mem_total_mb / 1024).toFixed(1) + '</span>';
+    }
+    if (s.t_max !== null) {
+      push('tj', s.t_max);
+      // Headroom, not the raw temperature: 84 C is alarming on a part that trips
+      // at 90 and unremarkable on one that trips at 105.
+      const head = s.t_crit ? s.t_crit - s.t_max : null;
+      $('kv_tj').className = 'kv host' + (head !== null && head < 8 ? ' bad' : '');
+      $('k_tj').innerHTML = Math.round(s.t_max) + '<span class=u> &#176;C'
+        + (head === null ? '' : ' &#183; ' + Math.round(head) + ' to trip') + '</span>';
+    }
+    if (s.power_w) {
+      push('pw', s.power_w);
+      $('k_pw').innerHTML = s.power_w.toFixed(1) + '<span class=u> W</span>';
+    }
+    if (s.freq_mhz)
+      $('k_clk').innerHTML = s.freq_mhz + '<span class=u>/' + s.freq_max_mhz + ' MHz</span>';
+    spark('sp_cpu', 'cpu', '#8fa2b5', 0, 100);
+    spark('sp_gpu', 'gpu', '#8fa2b5', 0, 100);
+    spark('sp_mem', 'mem', '#8fa2b5', 0, s.mem_total_mb || 1);
+    spark('sp_tj', 'tj', '#8fa2b5', 20, s.t_crit || 100);
+    spark('sp_pw', 'pw', '#8fa2b5', 0, 20);
+  }
+
+  spark('sp_th', 'th', '#f0a860', 108, 120);
+  spark('sp_sk', 'sk', '#6cc8ff', 0, 40);
+  spark('sp_fps', 'fps', '#7fd39b', 0, 9.5);
+  spark('sp_heap', 'heap', '#7fd39b', 0, 26);
+  spark('sp_cov', 'cov', '#9aa4ad', 0, 100);
+
+  // --- detections. A box you have to squint at is not a reading you would write
+  // down, and the peak location matters as much as the value: "this motor is
+  // warm" and "this motor's near bearing is warm" are different findings.
+  const dd = d.detections;
+  $('s_det').textContent = dd.list.length + (dd.ms ? ' \u00b7 ' + Math.round(dd.ms) + 'ms' : '');
+  $('dets').innerHTML = dd.list.map(x =>
+    '<div class="det' + (dd.warped ? '' : ' unreg') + '">'
+    + '<span class=cls>' + esc(x.cls) + '</span>'
+    + '<span class=m>' + Math.round(100 * x.conf) + '%</span>'
+    + (x.max_c !== undefined
+        ? '<span class=c>' + x.max_c.toFixed(1) + ' \u00b0C</span>'
+          + '<span class=m>peak @' + x.max_x + ',' + x.max_y + '</span>'
+        : '<span class=m>no thermal in box</span>')
+    + (x.body_heat === false ? '<span class=flag>NO BODY HEAT</span>' : '')
+    + (x.repaired ? '<span class=flag>REBUILT ROW</span>' : '')
+    + (dd.warped ? '' : '<span class=flag>UNREGISTERED</span>')
+    + '</div>').join('');
+
+  // --- the ai channels. The count is the point of the sub-label, but 'off'
+  // and 'cannot draw' have to be told apart from 'nobody there': all three look
+  // like a zero, and only one of them is news about the scene.
+  if (cfg.ai) {
+    const chan = (id, c) => {
+      const el = $(id);
+      const hidden = (c.found === undefined) ? 0 : c.found - c.n;
+      el.textContent = !c.ready ? 'unavailable'
+        : !c.on ? 'off'
+        : hidden > 0 ? c.n + ' of ' + c.found
+        : c.n + (c.n === 1 ? ' box' : ' boxes');
+      el.style.color = !c.ready ? '#f0c060' : (c.on && c.n) ? '#7fd39b' : '';
+    };
+    chan('s_ai_t', cfg.ai.thermal);
+    chan('s_ai_r', cfg.ai.radar);
+    chan('s_ai_f', cfg.ai.fusion);
+    $('s_ai_sil').textContent = cfg.ai.silhouette ? 'shape' : 'boxes';
+  }
+
+  // A coasting lock is not a lock that is working; it has to read differently.
+  const held = d.tracks.filter(t => !t.coasting).length;
+  const coast = d.tracks.length - held;
+  const stat = (d.tracks_static || []).length;
+  $('s_lock').textContent = !cfg.lock ? 'off'
+    : !d.tracks.length && !stat ? 'nothing locked'
+    : (d.tracks.length ? held + ' locked' : 'none')
+      + (coast ? ' \u00b7 ' + coast + ' coasting' : '')
+      + (stat ? ' \u00b7 ' + stat + ' static' : '');
+  // What the rig is doing under the lock. Silent while it is still, because
+  // that is the ordinary case; explicit when it is turning, and explicit when
+  // the frame was too busy to read - then the lock is back to assuming still.
+  const eg = d.ego;
+  if (eg) {
+    const mag = Math.sqrt(eg.du * eg.du + eg.dv * eg.dv);
+    $('s_lock').textContent += eg.response < 0.7 ? ' \u00b7 rig unread'
+      : mag >= 1.5 ? ' \u00b7 rig ' + mag.toFixed(0) + ' px/f' : '';
+  }
+  $('s_lock').style.color = !cfg.lock ? '' : coast && !held ? '#f0c060'
+    : held ? '#7fd39b' : '';
+
+  if (probes.length) refreshProbes();
+}
+// Wait for each refresh before scheduling another; a slow host must not build
+// an unbounded queue of requests or apply older responses over newer ones.
+async function refreshLoop() {
+  try { await poll(); }
+  finally { setTimeout(refreshLoop, 1000); }
+}
+refreshLoop();
+</script>
+</html>

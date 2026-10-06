@@ -298,6 +298,21 @@ def threading_and_detection(y, thermal):
           live.Renderer._reject_person_geometry(
               {"cls": "person", "x": 180, "y": 0, "w": 260, "h": 400})
           is None)
+    close = {"cls": "person", "conf": .94, "x": 190, "y": 0, "w": 449, "h": 394}
+    check("the observed clipped close-up person is retained",
+          live.Renderer._reject_person_geometry(close) is None)
+    check("a clipped close-up does not gain instant detector trust",
+          live.Renderer._detector_source(close) == "det_weak")
+    check("the mirrored close-up is retained with the same weak evidence",
+          live.Renderer._close_clipped_person(dict(close, x=0)))
+    check("high confidence cannot make a near-full-frame doorway admissible",
+          live.Renderer._reject_person_geometry(
+              {"cls": "person", "conf": .99, "x": 8, "y": 2, "w": 613, "h": 392})
+          is not None)
+    check("ordinary confident person boxes still vouch immediately",
+          live.Renderer._detector_source(
+              {"cls": "person", "conf": .94, "x": 180, "y": 0, "w": 260, "h": 400})
+          == "det")
     pipe = live.Pipeline(Args())
     state, work = {}, live.Latest()
 
@@ -625,6 +640,13 @@ def ai_channels(thermal):
                   "vis": (180, 50, 160, 300)}
     state["student_thermal"], state["student_fused"] = [static_det], []
     r.th2vis = _HumanLut()
+    original_temp_region = pipe.temp_region
+    # 30 C background (code 127.5 in the student's 0:60 input), 36 C body.
+    # Keep the unit test independent of the recorded frame's exact contents.
+    thermal = np.full((live.TH_H, live.TH_W), 128, np.uint8).tobytes()
+    pipe.temp_region = lambda *_args: {
+        "min": 30.0, "max": 36.0, "mean": 33.0, "samples": 500,
+        "max_x": 0, "max_y": 0, "repaired": 0}
     r.lock = live.tracking.Tracker()
     early_static = []
     for i in range(live.tracking.STATIC_SHAPE_HITS):
@@ -639,8 +661,29 @@ def ai_channels(thermal):
           "tracks %s" % [t.as_dict(900.5) for t in seated])
     check("the thermal cold-start verdict is explained in the AI result",
           static_det.get("human_shape") is True
+          and static_det.get("radiometric_body") is True
+          and static_det.get("delta_c") >= live.Renderer.THERMAL_LOCK_MIN_DELTA_C
           and static_det.get("shape_metrics", {}).get("reason")
           == "human thermal shape")
+
+    # This is the recorded smoke/lamp failure in numbers: V6 confidence 1.00
+    # and a body-like contour, but only 0.7 C above the scene. It may remain a
+    # grey diagnostic candidate; it may not create a green person lock.
+    smoke = dict(static_det)
+    state["student_thermal"] = [smoke]
+    pipe.temp_region = lambda *_args: {
+        "min": 25.8, "max": 30.7, "mean": 26.4, "samples": 500,
+        "max_x": 0, "max_y": 0, "repaired": 0}
+    r.lock = live.tracking.Tracker()
+    for i in range(live.tracking.STATIC_SHAPE_HITS + 2):
+        smoke_tracks = r.lock.update(
+            r._lock_observations(thermal), 905.0 + i * 0.114)
+    check("a high-confidence smoke shape below the heat-delta gate cannot lock",
+          smoke_tracks == [] and r.lock.all() == []
+          and smoke.get("human_shape") is True
+          and smoke.get("radiometric_body") is False
+          and smoke.get("delta_c") < live.Renderer.THERMAL_LOCK_MIN_DELTA_C,
+          "delta %s C" % smoke.get("delta_c"))
 
     doorway = dict(static_det)
     state["student_thermal"] = [doorway]
@@ -653,6 +696,7 @@ def ai_channels(thermal):
           rejected_static == [] and r.lock.all() == []
           and doorway.get("human_shape") is False,
           doorway.get("shape_metrics", {}).get("reason", "no verdict"))
+    pipe.temp_region = original_temp_region
 
     # If both students drop while a proven person stands, the current thermal
     # shape inside that existing track becomes hold-only evidence. It is not a
@@ -699,6 +743,11 @@ def ai_channels(thermal):
     check("what was hidden is still counted, so a quiet scene and a high "
           "slider do not look alike",
           state["student_seen"]["thermal"] == 2)
+    diag = state["student_diagnostics"]
+    check("live diagnostics distinguish filtered candidates and disabled radar",
+          diag["found"]["thermal"] == 2 and len(diag["thermal"]) == 1
+          and diag["decisions"]["thermal"] == "processed"
+          and diag["decisions"]["radar"] == "off" and diag["ms"] >= 0)
     pipe.ai_conf_thermal = 0.5
     th.dets = [{"x": 10, "y": 10, "w": 10, "h": 20, "conf": 0.8}]
 
@@ -711,7 +760,14 @@ def ai_channels(thermal):
           "found %d, shown %d" % (state["student_seen"]["thermal"],
                                   len(state["student_thermal"])))
     th.primed = True
+    check("live diagnostics explain thermal warm-up suppression",
+          state["student_diagnostics"]["decisions"]["thermal"]
+          == "warming up temporal history")
+    state["student_error"] = "previous cycle failed"
     draw()
+    check("successful AI cycle clears the previous inference error",
+          state["student_diagnostics"]["error"] is None
+          and state["student_error"] is None)
     check("once the chain is primed the boxes come back",
           len(state["student_thermal"]) == 1)
 
@@ -836,6 +892,36 @@ def ai_channels(thermal):
     r.stop.set()
 
 
+def outline_quality():
+    box = (30, 10, 100, 180)
+    mask = np.zeros((210, 160), np.uint8)
+    cv2.circle(mask, (80, 32), 16, 1, -1)
+    cv2.rectangle(mask, (53, 48), (107, 119), 1, -1)
+    cv2.rectangle(mask, (55, 116), (74, 183), 1, -1)
+    cv2.rectangle(mask, (87, 116), (105, 183), 1, -1)
+    # One-pixel tendril onto nearby furniture should disappear in display.
+    mask[80, 107:130] = 1
+    original = mask.copy()
+    rgb = np.zeros((*mask.shape, 3), np.uint8)
+    check("a coherent full-height thermal shape gets an outline",
+          live.Renderer._draw_shape(rgb, mask, (0, 255, 0), 2, box=box))
+    check("outline cleaning removes thin background tendrils",
+          not rgb[76:85, 120:130].any())
+    check("outline cleaning leaves the measurement mask unchanged",
+          np.array_equal(mask, original))
+    partial = mask.copy()
+    partial[:115] = 0
+    rgb[:] = 0
+    check("legs-only thermal patches fall back without painting a false outline",
+          not live.Renderer._draw_shape(rgb, partial, (0, 255, 0), 2, box=box)
+          and not rgb.any())
+    fragmented = np.zeros_like(mask)
+    fragmented[20:180, 40:60] = 1
+    fragmented[20:180, 95:115] = 1
+    check("two competing thermal components fall back to the detection box",
+          not live.Renderer._draw_shape(rgb, fragmented, (0, 255, 0), 2, box=box))
+
+
 def lock_mode():
     """The lock: identity between frames, and a coast that says it is one.
 
@@ -922,6 +1008,9 @@ def lock_mode():
           and held[0].held_by == {"thermal"},
           "track %s held by %s" % (held[0].id if held else "lost",
                                     sorted(held[0].held_by) if held else []))
+    check("thermal-only hold clears the last radar range",
+          held and held[0].radar_m is None,
+          "range %s" % (held[0].radar_m if held else "lost"))
 
     now += tracking.MAX_COAST_S
     check("a coast that outlives its budget is dropped, not kept forever",
@@ -1379,6 +1468,7 @@ def main():
     check("registered thermal plane is not empty", treg.ptp() > 0,
           "range %d..%d" % (treg.min(), treg.max()))
 
+    pipe.thermal_detail = 0
     thermogram = pipe.thermal_image()
     check("the thermal product is a registered full-size colour frame",
           thermogram.shape == (live.OUT_H, live.OUT_W, 3)
@@ -1404,6 +1494,7 @@ def main():
           live.CHANNELS == ("thermal", "rgb_radar", "thermal_radar", "fusion", "ai"))
     pipe.outline = False
     pipe.view = "fused"
+    pipe.visible_detail = 0
     channel_fused = pipe.process(y, thermal).copy()
     products = {}
     for channel_name in live.CHANNELS:
@@ -1416,6 +1507,32 @@ def main():
           and np.array_equal(products["ai"][..., 0], yarr))
     check("the fusion product keeps the configured fusion base",
           np.array_equal(products["fusion"], channel_fused))
+    before_temp = pipe.temp_at(320, 200)
+    before_grid = pipe.treg_grid().copy()
+    before_y = yarr.copy()
+    pipe.visible_detail, pipe.thermal_detail = 40, 35
+    enhanced_visible = live.display_visible(pipe, yarr)
+    enhanced_thermal = pipe.thermal_image()
+    check("clarity changes both displays without changing sensor values or temperature",
+          not np.array_equal(enhanced_visible, yarr)
+          and not np.array_equal(enhanced_thermal, thermogram)
+          and np.array_equal(yarr, before_y)
+          and np.array_equal(pipe.treg_grid(), before_grid)
+          and pipe.temp_at(320, 200) == before_temp)
+    check("enhanced thermal still marks uncovered pixels as no reading",
+          not (~cover_full).any() or np.all(enhanced_thermal[~cover_full] == 24))
+    flat = np.full((40, 40), 100, np.uint8)
+    flat[::2, ::2] += 1
+    check("detail boost leaves flat areas and one-code noise alone",
+          np.array_equal(live.display_sharpen(flat, 100), flat))
+    edge = np.full((40, 40), 80, np.uint8)
+    edge[:, 20:] = 160
+    edge = cv2.GaussianBlur(edge, (5, 5), 0.9)
+    sharper = live.display_sharpen(edge, 100)
+    check("detail boost increases a soft edge with bounded halos",
+          np.max(np.abs(sharper.astype(int) - edge.astype(int))) <= 6
+          and int(sharper[20, 21]) - int(sharper[20, 18])
+              > int(edge[20, 21]) - int(edge[20, 18]))
     check("only sensor-fusion products request raw radar drawing",
           [live.live_channels.get(c).raw_radar for c in live.CHANNELS]
           == [False, True, True, True, False]
@@ -1754,8 +1871,8 @@ def main():
         check("/set can turn the overlay off", pipe.show_detections is False)
         get("/set?boxes=1")
 
-        check("the AI product defaults to silhouettes without debug evidence",
-              pipe.ai_evidence is False and pipe.ai_silhouette is True)
+        check("the AI product defaults to clean boxes without debug evidence",
+              pipe.ai_evidence is False and pipe.ai_silhouette is False)
         get("/set?evidence=1")
         check("/set can reveal student evidence without changing the engines",
               pipe.ai_evidence is True
@@ -1904,6 +2021,7 @@ def main():
     failure_reporting()
     threading_and_detection(y, thermal)
     ai_channels(thermal)
+    outline_quality()
     lock_mode()
     ego_motion(HANDWAVE3)
     raw16_channel(thermal, meta)

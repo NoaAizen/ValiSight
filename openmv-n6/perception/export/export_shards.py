@@ -45,6 +45,10 @@ Usage:
     python3 perception/export/export_shards.py --sessions live-20260812-100507 \
         [--out-name v2] [--frames-per-shard 256] [--no-rgb] [--val SESS ...] \
         [--verified-negative EMPTY_SESS ...]
+
+For mixed smoke/dark sessions, mine V6's low-delta false candidates first and
+pass the replay explicitly instead of marking the whole occupied session empty:
+    --thermal-hard-negative smoke_dark=smoke_dark/thermal_v6_replay.jsonl
 """
 import argparse
 import glob
@@ -81,6 +85,55 @@ def label_state(has_positive, verified_negative=False):
     if verified_negative:
         return LABEL_NEGATIVE
     return LABEL_POSITIVE if has_positive else LABEL_UNKNOWN
+
+
+def load_thermal_hard_negatives(specs, conf=0.90, max_delta_c=3.0):
+    """Read V6 replay JSONL and return candidate frame ids per session.
+
+    This flag is training emphasis, never a label. Frames remain positive,
+    negative or unknown according to the independently supplied annotations;
+    unknown frames are still masked from loss. That distinction is what makes
+    an occupied smoke recording safe to mine without calling the real person
+    background.
+    """
+    result, provenance = {}, {}
+    for spec in specs:
+        if "=" not in spec:
+            raise SystemExit(
+                f"--thermal-hard-negative {spec!r}: expected SESSION=JSONL")
+        sess, path = spec.split("=", 1)
+        sess, path = sess.strip(), os.path.expanduser(path.strip())
+        if not os.path.isabs(path):
+            path = os.path.join(CAPTURES, path)
+        if sess in result:
+            raise SystemExit(
+                f"--thermal-hard-negative: duplicate session {sess!r}")
+        frames = set()
+        try:
+            with open(path, encoding="utf-8") as f:
+                for line_no, line in enumerate(f, 1):
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    if (float(row.get("conf", 0.0)) >= conf
+                            and bool(row.get("shape", False))
+                            and row.get("delta_c") is not None
+                            and float(row["delta_c"]) < max_delta_c):
+                        frames.add(int(row["i"]))
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise SystemExit(
+                f"--thermal-hard-negative {sess}: cannot read {path}: {exc}")
+        result[sess] = frames
+        provenance[sess] = {
+            "source": os.path.abspath(path),
+            "confidence_min": conf,
+            "delta_c_lt": max_delta_c,
+            "shape_required": True,
+            "candidate_frames": len(frames),
+        }
+        print(f"[export] {sess}: mined {len(frames)} low-delta V6 hard-"
+              f"negative frame(s) from {path}")
+    return result, provenance
 
 
 def load_teacher(sess):
@@ -169,7 +222,7 @@ def load_heatmaps(sess):
 
 def export_session(sess, teacher, coco_boxes, keep_rgb,
                    teacher_available=True, verified_negative=False,
-                   radar_unusable=False, occupied=()):
+                   radar_unusable=False, occupied=(), hard_negative=()):
     """One session -> iterator of per-frame dicts, in time order.
 
     A generator rather than a list on purpose: multi5 alone is ~25k paired
@@ -266,6 +319,7 @@ def export_session(sess, teacher, coco_boxes, keep_rgb,
         row['thermal_label_state'] = np.int8(
             label_state(bool(th_rows), frame_negative))
         row['teacher_available'] = np.bool_(teacher_available)
+        row['thermal_hard_negative'] = np.bool_(tr.i in hard_negative)
         for key, flag in (('range_angle', 'ra_valid'),
                           ('range_doppler', 'rd_valid'),
                           ('range_profile', 'rp_valid')):
@@ -351,7 +405,8 @@ def write_shards(rows, sess, out_dir, per_shard, keep_rgb):
     previously recomputed from the full in-memory session list.
     """
     paths, buf = [], []
-    stats = {'frames': 0, 'n_lab': 0, 'n_neg': 0, 'thermal_dtypes': set()}
+    stats = {'frames': 0, 'n_lab': 0, 'n_neg': 0, 'n_hard': 0,
+             'n_hard_supervised': 0, 'thermal_dtypes': set()}
 
     def flush():
         arrs = {k: np.stack([f[k] for f in buf])
@@ -365,6 +420,10 @@ def write_shards(rows, sess, out_dir, per_shard, keep_rgb):
         stats['frames'] += 1
         stats['n_lab'] += int(int(row['n_th_boxes']) > 0)
         stats['n_neg'] += int(int(row['thermal_label_state']) == 0)
+        stats['n_hard'] += int(bool(row.get('thermal_hard_negative', False)))
+        stats['n_hard_supervised'] += int(
+            bool(row.get('thermal_hard_negative', False))
+            and int(row['thermal_label_state']) >= 0)
         stats['thermal_dtypes'].add(str(row['thermal'].dtype))
         buf.append(row)
         if len(buf) == per_shard:
@@ -378,6 +437,13 @@ TRAINING_CODE_FILES = (
     'perception/__init__.py',
     'perception/student_data.py',
     'perception/students.py',
+    'perception/models/__init__.py',
+    'perception/models/features.py',
+    'perception/models/students.py',
+    'perception/learning/__init__.py',
+    'perception/learning/data.py',
+    'perception/learning/losses.py',
+    'perception/learning/engine.py',
     'perception/train_students.py',
     'perception/export_students_onnx.py',
     # The public-dataset converter travels with the bundle because the
@@ -518,6 +584,11 @@ def main():
     ap.add_argument('--negative-audit', action='store_true',
                     help='report per-frame occupancy for the --verified-'
                          'negative sessions and exit, exporting nothing')
+    ap.add_argument('--thermal-hard-negative', action='append', default=[],
+                    metavar='SESS=JSONL',
+                    help='repeatable V6 thermal replay to mine: conf>=0.90, '
+                         'human shape and delta<3C mark a frame for extra '
+                         'no-object loss; this never creates labels')
     ap.add_argument('--radar-unusable', nargs='*', default=[], metavar='SESS',
                     help='sessions whose RADAR must not be used as evidence, '
                          'while their thermal still is. The case this exists '
@@ -539,6 +610,8 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     coco_boxes = load_coco_boxes()
     keep_rgb = not a.no_rgb
+    hard_negatives, hard_negative_meta = load_thermal_hard_negatives(
+        a.thermal_hard_negative)
 
     manifest = {
         'version': a.out_name,
@@ -560,6 +633,7 @@ def main():
                    'th_boxes': 'grade-A only, thermal px, [x,y,w,h,delta]',
                    'radar_label_state': '-1 unknown, 0 verified negative, 1 positive',
                    'thermal_label_state': '-1 unknown, 0 verified negative, 1 positive',
+                   'thermal_hard_negative': 'training emphasis only; never a label',
                    'max_boxes': MAX_BOXES},
         'split': {'train': [], 'val': []},
         'sessions': {},
@@ -567,7 +641,8 @@ def main():
 
     verified_negative = set(a.verified_negative)
     radar_unusable = set(a.radar_unusable)
-    unknown = (radar_unusable | verified_negative | set(a.val)) - set(a.sessions)
+    unknown = (radar_unusable | verified_negative | set(a.val)
+               | set(hard_negatives)) - set(a.sessions)
     if unknown:
         raise SystemExit('not in --sessions: %s' % ', '.join(sorted(unknown)))
 
@@ -592,7 +667,8 @@ def main():
             teacher_available=teacher_available,
             verified_negative=sess in verified_negative,
             radar_unusable=sess in radar_unusable,
-            occupied=occupancy.get(sess, ()))
+            occupied=occupancy.get(sess, ()),
+            hard_negative=hard_negatives.get(sess, ()))
         shards, stats = write_shards(rows, sess, out_dir, a.frames_per_shard,
                                      keep_rgb)
         if not stats['frames']:
@@ -606,6 +682,9 @@ def main():
             'shards': shards, 'frames': stats['frames'],
             'frames_with_gradeA': n_lab,
             'verified_negative_frames': n_neg,
+            'thermal_hard_negative_frames': stats['n_hard'],
+            'thermal_hard_negative_supervised_frames':
+                stats['n_hard_supervised'],
             'provenance': session_provenance(sess, sess in radar_unusable),
             **thermal_meta,
         }
@@ -615,6 +694,9 @@ def main():
         # split that was half occupied.
         if sess in occupancy_stats:
             manifest['sessions'][sess]['negative_gate'] = occupancy_stats[sess]
+        if sess in hard_negative_meta:
+            manifest['sessions'][sess]['thermal_hard_negative'] = \
+                hard_negative_meta[sess]
         which = 'val' if sess in a.val else 'train'
         manifest['split'][which].append(sess)
         print(f'[export] {sess}: {stats["frames"]} frames ({n_lab} with grade-A '

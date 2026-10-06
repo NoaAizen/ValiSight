@@ -1,0 +1,28 @@
+
+out = sys.stdout.buffer
+CHUNK = 4096
+
+
+def emit(name, img):
+    sys.stdout.write("#FRAME %s %d %d %d\n" % (name, img.width(), img.height(), img.size()))
+    m = memoryview(img.bytearray())
+    off, n = 0, len(m)
+    while off < n:
+        out.write(m[off:off + CHUNK])
+        off += CHUNK
+
+
+sys.stdout.write("#META %s\n" % str({
+    "tmin": TMIN, "tmax": TMAX, "rgb_w": rgb.width(), "rgb_h": rgb.height(),
+    "burst": __BURST__,
+}).replace("'", '"'))
+
+for i in range(__NPAIRS__):
+    t = lep.snapshot()
+    sys.stdout.write("#PAIR %d %d\n" % (i, time.ticks_ms()))
+    emit("thermal", t)
+    for b in range(__BURST__):
+        emit("rgb%d" % b, rgb.snapshot())
+    # No gc.collect() here either - it wedges the Lepton. See good_snapshot().
+sys.stdout.write("#DONE\n")
+gc.collect()
