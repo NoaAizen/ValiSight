@@ -21,13 +21,20 @@ VALID_RANGE_M = (2.0, 8.6)   # 2026-08-18 calibration (was 1.5-3.5)
 
 
 class RadarProjector:
-    def __init__(self, calib_json=None, extrinsics_json=None):
+    def __init__(self, calib_json=None, extrinsics_json=None, camera='rgb'):
+        # camera='thermal' -> K_th/dist_th + T_thermal_radar.json (COMPOSED from
+        # T_camera_radar and the stereo R,t by tools/calib/compose_thermal_radar.py)
+        if camera not in ('rgb', 'thermal'):
+            raise ValueError("camera must be 'rgb' or 'thermal', got %r" % camera)
+        self.camera = camera
+        default_ext = 'T_camera_radar.json' if camera == 'rgb' else 'T_thermal_radar.json'
         with open(calib_json or os.path.join(ART, 'calib.json')) as f:
             c = json.load(f)
-        with open(extrinsics_json or os.path.join(ART, 'T_camera_radar.json')) as f:
+        with open(extrinsics_json or os.path.join(ART, default_ext)) as f:
             e = json.load(f)
-        self.K = np.asarray(c['K_rgb'], dtype=np.float64)
-        self.dist = np.asarray(c['dist_rgb'], dtype=np.float64)
+        kk, dk = ('K_rgb', 'dist_rgb') if camera == 'rgb' else ('K_th', 'dist_th')
+        self.K = np.asarray(c[kk], dtype=np.float64)
+        self.dist = np.asarray(c[dk], dtype=np.float64)
         self.R = np.asarray(e['R'], dtype=np.float64)
         self.t = np.asarray(e['t_m'], dtype=np.float64)
         self.valid_range_m = tuple(e.get('valid_range_m', VALID_RANGE_M))

@@ -80,3 +80,20 @@ warm-up        : radar die 46-50 C throughout (already at operating temperature)
   fit median 5.9 px, HOLDOUT median 13.4 px (1.47 deg) -> V3 acceptance (0.72 deg) NOT met. Files: ~/ValiSight_noa/calib_2026-08-18/
   Lessons: 14 cm TCR is threshold-limited (11-15 dB) beyond 3 m off-axis; aim (mouth at radar) worth 12 dB; radar az quantised ~1.8 deg;
   radar restart (re-send cfg) recovers marginal detections; el filter drops ~25% of frames of low/edge targets.
+
+=== 2026-08-19 cfg change (Noa) ===
+radar_people.cfg CFAR range+doppler threshold 15 -> 10 dB (same as radar_people_cfar10_TEST.cfg).
+Old cfg frozen as radar_people_cfar15_2026-08-18.cfg (sha256 b3e4a561...); T_camera_radar.json /
+radar_rgb_2026-08-18.json / T_thermal_radar.json were fitted with the OLD threshold.
+Point cloud is denser now -> re-validate with a walking person before relying on them; if
+T_camera_radar changes, re-run tools/calib/compose_thermal_radar.py.
+
+=== 2026-08-19 afternoon - radar firmware surprise ===
+Radar was reflashed to mmWave SDK 03.06.02.00 in the morning (Jetson update day) but kept
+RUNNING the old image until the first power cycle (~14:30). The new demo REQUIRES calibData
+before sensorStart (old firmware: "not recognized") and DROPS CHARACTERS on long CLI lines
+sent in one burst (compRangeBiasAndRxChanPhase, 232 chars) -> demo latches into
+"partial configuration cannot be undone" = power cycle needed. Fixes: calibData 0 0 0 added
+to all radar_people*.cfg (new sha 1d4761e0b6d8...), send_radar_cfg.py now writes 16-byte
+chunks / 20 ms. NOTE: new firmware help lists comp table as 16 values; our 25-value line
+answers Done - phase compensation SHOULD be re-verified (TCR at tape distance) next chance.

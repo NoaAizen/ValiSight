@@ -1,0 +1,70 @@
+{
+ "R": [
+  [
+   -0.022237335143685942,
+   -0.9997517891823553,
+   0.001364167286902334
+  ],
+  [
+   -0.01611997320156167,
+   -0.0010057737407996072,
+   -0.9998695589341459
+  ],
+  [
+   0.99962275253702,
+   -0.022256424822095354,
+   -0.01609360632208003
+  ]
+ ],
+ "t_m": [
+  -0.017416630426031008,
+  0.07581304515164881,
+  0.02654228623563713
+ ],
+ "yaw_deg": -1.2743760956833052,
+ "pitch_deg": 0.9236464353910749,
+ "camera": "thermal",
+ "image_size": [
+  160,
+  120
+ ],
+ "convention": "p_T = R @ p_R + t; radar x fwd y left z up; thermal x right y down z fwd (OpenCV)",
+ "formulation": "COMPOSED, not solved: T_thermal_radar = T_thermal_rgb (calib.json stereo R,t) o T_rgb_radar (T_camera_radar.json). Inherits both error budgets; radar z/elevation remains unusable exactly as in T_camera_radar.json.",
+ "valid_range_m": [
+  2.0,
+  8.6
+ ],
+ "sources": {
+  "T_camera_radar": {
+   "source": "radar_rgb_2026-08-18.json (22 fit + 6 holdout stations, 2026-08-18)",
+   "yaw_deg": -0.06299880274262508,
+   "holdout_du_median_px": 15.383135809742356,
+   "radar_cfg_sha256": "b3e4a561b8de34ea0e3e9023a4acb370eb23098446dcfce6fa5449c2908625f7"
+  },
+  "stereo_rgb_thermal": {
+   "file": "calib.json",
+   "rms_stereo_px": 1.1194412672218168,
+   "rms_th_px": 0.4293063324211277,
+   "baseline_mm": 28.105337922559166,
+   "t_m": [
+    -0.017240544559438447,
+    0.0005237548733826018,
+    0.022190072642239538
+   ]
+  }
+ },
+ "self_check_chain_err_px": 1.0577306321652256e-12,
+ "example_3m_boresight": {
+  "rgb_uv": [
+   306.98527356696167,
+   212.26849091890904
+  ],
+  "thermal_uv": [
+   75.07243735098868,
+   60.947612756615975
+  ]
+ },
+ "expected_scatter_deg_note": "radar->RGB holdout ~1.5-1.7 deg (az quantisation) + stereo ~0.4 deg at 160x120 -> ~2 deg; 1 thermal px = 0.36 deg (f_th~159 px).",
+ "K_source": "calib-artifacts/calib.json K_th/dist_th (Hagai, 2026-08-18)",
+ "dv_note": "v calibrated via pitch from stations at antenna height (radar z := 0). For targets NOT at antenna height the radar z is still unusable on this rig - projected v is only correct near antenna height / far range."
+}

@@ -41,7 +41,16 @@ _FAILURES = ('Error', 'not recognized')
 
 def send_line(ser, line, timeout=2.0):
     ser.reset_input_buffer()                     # drop anything stale
-    ser.write((line + '\n').encode())
+    # Chunked write with a breather: the SDK 3.6.2 firmware (flashed 2026-08-19)
+    # drops characters on long lines sent in one burst - compRangeBiasAndRxChanPhase
+    # (232 chars) never answered Done, which latched the demo into the unrecoverable
+    # "partial configuration" state (power cycle needed). 16 bytes / 20 ms is slow
+    # enough for the CLI task and adds <0.5 s to a whole cfg.
+    data = (line + '\n').encode()
+    for i in range(0, len(data), 16):
+        ser.write(data[i:i + 16])
+        ser.flush()
+        time.sleep(0.02)
     t0 = time.time()
     resp = ''
     while time.time() - t0 < timeout:

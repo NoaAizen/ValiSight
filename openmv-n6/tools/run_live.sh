@@ -117,8 +117,12 @@ stop_viewer
 # The IWR1843 emits nothing at all until it is configured, so skipping this
 # makes a healthy radar look like a dead link.
 if [ "${SKIP_CFG:-0}" != "1" ]; then
-    echo "sending chirp config${RADAR_CFG:+ ($RADAR_CFG)}..."
-    python3 "$HERE/send_radar_cfg.py" ${RADAR_CFG:+"$RADAR_CFG"} --port "$RADAR_CLI" >/dev/null \
+    # Default to the person config (CFAR 10 dB since 2026-08-19) - send_radar_cfg.py's
+    # own default is radar_10hz.cfg, the CALIBRATION config, which is not what a
+    # live session wants and silently undoes the CFAR decision.
+    RADAR_CFG="${RADAR_CFG:-$ROOT/radar/configs/radar_people.cfg}"
+    echo "sending chirp config ($RADAR_CFG)..."
+    python3 "$HERE/send_radar_cfg.py" "$RADAR_CFG" --port "$RADAR_CLI" >/dev/null \
         || { echo "chirp config failed - rerun send_radar_cfg.py by hand to see why" >&2; exit 1; }
 fi
 
@@ -175,8 +179,8 @@ if [ -f "$CAL" ]; then
 import json, sys
 c = json.load(open(sys.argv[1]))
 t = c.get("t_m", [0, 0, 0])                      # metres in the file, mm in /set
-print("yaw=%.4f&tx=%.1f&ty=%.1f&tz=%.1f"
-      % (c.get("yaw_deg", 0.0), t[0]*1000, t[1]*1000, t[2]*1000))
+print("yaw=%.4f&pitch=%.4f&tx=%.1f&ty=%.1f&tz=%.1f"
+      % (-c.get("yaw_deg", 0.0), -c.get("pitch_deg", 0.0), t[0]*1000, t[1]*1000, t[2]*1000))
 PY
 )"
     curl -s -o /dev/null --max-time 5 "http://localhost:$HTTP/set?$QS" \
