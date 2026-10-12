@@ -130,11 +130,14 @@ check('in-frame points are drawn', drawn == 2, '(drawn %d)' % drawn)
 check('the off-frame point is counted, not drawn', off == 1, '(off %d)' % off)
 check('something actually reached the pixels', img.any())
 
+# v=0 is drawn as room clutter (tiny, no whisker, no trust marker) on
+# purpose, so the whisker and hollow/filled checks need a moving subject.
+walk = 0.3   # moving (>0.05) but inside the trusted band (<0.6*vmax)
 img2 = np.zeros((H, W, 3), np.uint8)
-radar_overlay.annotate(img2, [pt(3.0, 0.0, 0.0)], proj, show_whisker=False)
+radar_overlay.annotate(img2, [pt(3.0, 0.0, 0.0, v=walk)], proj, show_whisker=False)
 lit_no_whisker = int((img2.sum(axis=2) > 0).sum())
 img3 = np.zeros((H, W, 3), np.uint8)
-radar_overlay.annotate(img3, [pt(3.0, 0.0, 0.0)], proj, show_whisker=True)
+radar_overlay.annotate(img3, [pt(3.0, 0.0, 0.0, v=walk)], proj, show_whisker=True)
 check('the whisker adds vertical extent',
       int((img3.sum(axis=2) > 0).sum()) > lit_no_whisker)
 
@@ -142,7 +145,7 @@ img4 = np.zeros((H, W, 3), np.uint8)
 radar_overlay.annotate(img4, [pt(3.0, 0.0, 0.0, v=0.95 * vmax)], proj,
                        show_whisker=False, label_nearest=False)
 filled = np.zeros((H, W, 3), np.uint8)
-radar_overlay.annotate(filled, [pt(3.0, 0.0, 0.0, v=0.0)], proj,
+radar_overlay.annotate(filled, [pt(3.0, 0.0, 0.0, v=walk)], proj,
                        show_whisker=False, label_nearest=False)
 # Hollow vs filled is the visual claim of trust. If they ever draw the same, a
 # suspect detection is indistinguishable from a trusted one.
